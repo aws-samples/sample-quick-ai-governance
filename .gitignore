@@ -1,0 +1,26 @@
+# =============================================================================
+# Amazon Quick - Best Practices
+#
+# Scoped to the currently published module:
+#   governance-agent-hours-monitor  (Bash helper scripts + CloudFormation)
+#
+# That module produces no local build artifacts, so the rules below are just
+# OS / editor / secret hygiene. As additional modules are made ready, add
+# their own ignore rules back here (e.g. Node.js, Python, AWS SAM builds).
+# =============================================================================
+
+# ---- OS ---------------------------------------------------------------------
+.DS_Store
+
+# ---- Editors / IDEs ---------------------------------------------------------
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.sw?
+
+# ---- Environment / secrets --------------------------------------------------
+# The scripts authenticate via AWS profiles / AWS_PROFILE, not .env files, but
+# keep these ignored so stray credentials are never committed.
+.env
+.env.*
+!.env.example
