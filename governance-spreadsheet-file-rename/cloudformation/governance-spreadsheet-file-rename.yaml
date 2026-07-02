@@ -1,0 +1,212 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Amazon Quick spreadsheet-file auto-rename automation. Deploys a Lambda that
+  renames datasets created from uploaded Microsoft Excel (.xlsx) files by
+  prefixing the dataset name (default "xls-"), triggered by EventBridge events
+  from Amazon Quick. All resources are named "<ResourcePrefix>-*" (default
+  quick-governance-spreadsheet-file-rename-*). The stack targets the account it
+  is deployed into via AWS::AccountId (resolved from your credentials/profile),
+  so there is no account ID to pass; the Amazon Quick subscription must live in
+  that same account. Deploy via scripts/apply-governance-spreadsheet-file-rename.sh
+  or "sam deploy" (see the module README for full usage).
+
+Parameters:
+  ResourcePrefix:
+    Type: String
+    Default: 'quick-governance-spreadsheet-file-rename'
+    Description: >
+      Prefix applied to every AWS resource name created by this stack.
+      Resources are named <prefix>-fn, -role, -policy, -rule, -errors.
+      Must satisfy the strictest of the involved naming rules (Lambda
+      function name, IAM role name): 1-64 chars, [A-Za-z0-9_-].
+    AllowedPattern: '^[A-Za-z0-9_-]{1,55}$'
+    ConstraintDescription: >
+      1-55 chars, letters/digits/underscore/hyphen (leaves headroom for the
+      "-policy"/"-errors" suffixes within the 64-char Lambda/IAM limit).
+
+  Prefix:
+    Type: String
+    Default: 'xls-'
+    Description: Prefix to prepend to renamed dataset names.
+    MinLength: 1
+    MaxLength: 32
+
+  TargetFormat:
+    Type: String
+    Default: 'XLSX'
+    AllowedValues: [CSV, TSV, CLF, ELF, XLSX, JSON]
+    Description: Upload format to act on (per Amazon Quick UploadSettings).
+
+  AlsoOnUpdate:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >
+      If true, the EventBridge rule also matches the
+      "QuickSight DataSet Updated" detail-type in addition to
+      "QuickSight DataSet Created".
+
+  FunctionTimeoutSeconds:
+    Type: Number
+    Default: 60
+    MinValue: 5
+    MaxValue: 900
+
+  FunctionMemoryMb:
+    Type: Number
+    Default: 256
+    MinValue: 128
+    MaxValue: 10240
+
+  ReservedConcurrency:
+    Type: Number
+    Default: 5
+    MinValue: 0
+    MaxValue: 1000
+    Description: >
+      Reserved concurrent executions for the renamer Lambda. Set low to
+      protect Amazon Quick API throttling limits. Set to 0 to disable the
+      function without deleting it.
+
+  LogRetentionDays:
+    Type: Number
+    Default: 90
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096, 1827, 2192, 2557, 2922, 3288, 3653]
+    Description: CloudWatch Logs retention (in days) for the function's log group.
+
+Conditions:
+  IncludeUpdateEvent: !Equals [!Ref AlsoOnUpdate, 'true']
+
+Resources:
+
+  RenamerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ResourcePrefix}-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: !Sub '${ResourcePrefix}-policy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: DescribeRenameAndIngestDatasets
+                Effect: Allow
+                Action:
+                  - quicksight:DescribeDataSet
+                  - quicksight:UpdateDataSet
+                  - quicksight:CreateIngestion
+                Resource: !Sub 'arn:${AWS::Partition}:quicksight:${AWS::Region}:${AWS::AccountId}:dataset/*'
+              - Sid: PassUploadedFileDataSource
+                Effect: Allow
+                Action:
+                  - quicksight:PassDataSource
+                Resource: !Sub 'arn:${AWS::Partition}:quicksight:${AWS::Region}:${AWS::AccountId}:datasource/*'
+      Tags:
+        - Key: Purpose
+          Value: !Ref ResourcePrefix
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  RenamerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ResourcePrefix}-fn'
+      RetentionInDays: !Ref LogRetentionDays
+
+  RenamerFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: RenamerLogGroup
+    Properties:
+      FunctionName: !Sub '${ResourcePrefix}-fn'
+      Description: Auto-renames Amazon Quick datasets created from XLSX uploads.
+      Runtime: python3.14
+      Architectures:
+        - arm64
+      Handler: app.lambda_handler
+      CodeUri: ../lambda/
+      Role: !GetAtt RenamerRole.Arn
+      Timeout: !Ref FunctionTimeoutSeconds
+      MemorySize: !Ref FunctionMemoryMb
+      ReservedConcurrentExecutions: !Ref ReservedConcurrency
+      Environment:
+        Variables:
+          QS_ACCOUNT_ID: !Ref AWS::AccountId
+          PREFIX: !Ref Prefix
+          TARGET_FORMAT: !Ref TargetFormat
+      Events:
+        DatasetEvents:
+          Type: EventBridgeRule
+          Properties:
+            RuleName: !Sub '${ResourcePrefix}-rule'
+            Pattern:
+              source:
+                - aws.quicksight
+              detail-type: !If
+                - IncludeUpdateEvent
+                - - QuickSight DataSet Created
+                  - QuickSight DataSet Updated
+                - - QuickSight DataSet Created
+      Tags:
+        Purpose: !Ref ResourcePrefix
+        ManagedBy: CloudFormation
+
+  RenamerErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ResourcePrefix}-errors'
+      AlarmDescription: >
+        Triggers when the spreadsheet-file-rename Lambda has at least one error in 5 min.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref RenamerFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+Outputs:
+  ResourcePrefix:
+    Description: Prefix shared by every AWS resource created by this stack.
+    Value: !Ref ResourcePrefix
+    Export:
+      Name: !Sub '${AWS::StackName}-ResourcePrefix'
+
+  FunctionName:
+    Description: Name of the spreadsheet-file-rename Lambda function.
+    Value: !Ref RenamerFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-FunctionName'
+
+  FunctionArn:
+    Description: ARN of the spreadsheet-file-rename Lambda function.
+    Value: !GetAtt RenamerFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-FunctionArn'
+
+  RoleArn:
+    Description: ARN of the Lambda execution role.
+    Value: !GetAtt RenamerRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-RoleArn'
+
+  LogGroupName:
+    Description: CloudWatch Logs log group for the function.
+    Value: !Ref RenamerLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-LogGroupName'
+
+  TailLogsCommand:
+    Description: Convenience command to tail Lambda logs after deployment.
+    Value: !Sub 'aws logs tail /aws/lambda/${RenamerFunction} --since 10m --follow --region ${AWS::Region}'
