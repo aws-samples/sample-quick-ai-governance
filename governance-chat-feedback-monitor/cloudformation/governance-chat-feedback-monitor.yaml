@@ -1,0 +1,611 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Amazon Quick chat and feedback monitor. Delivers the regional CHAT_LOGS and
+  FEEDBACK_LOGS vended-log feeds to an encrypted CloudWatch Logs log group and
+  creates a CloudWatch dashboard for messages, users, agent and flow usage,
+  response status, and Useful or Not Useful feedback. A minimal daily Lambda
+  refreshes an agent ID-to-name lookup table for dashboard enrichment. Log
+  delivery is not retroactive. Assumes Quick is in the same AWS account.
+
+# Prerequisites (not created by this stack):
+#   * Amazon Quick AI features enabled (Enterprise or Professional subscription).
+#   * The deploying principal must hold the IAM permission
+#     quicksight:AllowVendedLogDeliveryForResource on the Quick account.
+#
+# Chat logs contain prompts, responses, resource names, and attachment metadata.
+# Restrict access to the log group and dashboard according to your data policy.
+# Vended-log delivery is regional; deploy once in each active Quick Region.
+
+Parameters:
+  ResourcePrefix:
+    Type: String
+    Default: quick-governance-chat-feedback-monitor
+    Description: Prefix applied to named resources.
+    AllowedPattern: '^[a-z0-9-]{1,40}$'
+    ConstraintDescription: 1-40 lowercase letters, digits, or hyphens.
+
+  LogGroupName:
+    Type: String
+    Default: /aws/vendedlogs/quick/chat-feedback
+    Description: CloudWatch Logs log group receiving chat and feedback events.
+    AllowedPattern: '^[\.\-_/#A-Za-z0-9]+$'
+
+  LogRetentionDays:
+    Type: Number
+    Default: 90
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096, 1827, 2192, 2557, 2922, 3288, 3653]
+    Description: Retention in days for prompts, responses, and feedback.
+
+  EnableKmsEncryption:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Encrypt the log group with a dedicated customer managed KMS key.
+
+  AgentLookupTableName:
+    Type: String
+    Default: quick_agent_catalog
+    AllowedPattern: '^[A-Za-z0-9_]{1,256}$'
+    Description: CloudWatch Logs lookup table refreshed daily with Quick agent names.
+
+  CreateChatDeliverySource:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Create CHAT_LOGS source; set false to reuse an existing source.
+
+  ExistingChatDeliverySourceName:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^[\w-]{1,60}$'
+    Description: Existing CHAT_LOGS source name when creation is disabled.
+
+  CreateFeedbackDeliverySource:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Create FEEDBACK_LOGS source; set false to reuse an existing source.
+
+  ExistingFeedbackDeliverySourceName:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^[\w-]{1,60}$'
+    Description: Existing FEEDBACK_LOGS source name when creation is disabled.
+
+Conditions:
+  WithKms: !Equals [!Ref EnableKmsEncryption, 'true']
+  CreateChatSource: !Equals [!Ref CreateChatDeliverySource, 'true']
+  ReuseChatSource: !Equals [!Ref CreateChatDeliverySource, 'false']
+  CreateFeedbackSource: !Equals [!Ref CreateFeedbackDeliverySource, 'true']
+  ReuseFeedbackSource: !Equals [!Ref CreateFeedbackDeliverySource, 'false']
+
+Resources:
+  LogsKey:
+    Type: AWS::KMS::Key
+    Condition: WithKms
+    Properties:
+      Description: !Sub 'Encrypts ${ResourcePrefix} conversation and feedback logs'
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: EnableAccountAdministration
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: AllowCloudWatchLogsUse
+            Effect: Allow
+            Principal:
+              Service: !Sub 'logs.${AWS::Region}.amazonaws.com'
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: '*'
+            Condition:
+              ArnLike:
+                kms:EncryptionContext:aws:logs:arn: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${LogGroupName}'
+          - Sid: AllowVendedLogDeliveryUse
+            Effect: Allow
+            Principal:
+              Service: delivery.logs.amazonaws.com
+            Action:
+              - kms:GenerateDataKey
+              - kms:Decrypt
+            Resource: '*'
+            Condition:
+              StringEquals:
+                kms:EncryptionContext:SourceArn: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*'
+      Tags:
+        - Key: Purpose
+          Value: !Ref ResourcePrefix
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  LogsKeyAlias:
+    Type: AWS::KMS::Alias
+    Condition: WithKms
+    Properties:
+      AliasName: !Sub 'alias/${ResourcePrefix}'
+      TargetKeyId: !Ref LogsKey
+
+  InteractionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Ref LogGroupName
+      RetentionInDays: !Ref LogRetentionDays
+      KmsKeyId: !If [WithKms, !GetAtt LogsKey.Arn, !Ref 'AWS::NoValue']
+      Tags:
+        - Key: Purpose
+          Value: !Ref ResourcePrefix
+        - Key: DataClassification
+          Value: Sensitive
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  MessageCountMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref InteractionLogGroup
+      FilterName: !Sub '${ResourcePrefix}-messages'
+      FilterPattern: '{ $.logType = "CHAT_LOGS" }'
+      MetricTransformations:
+        - MetricNamespace: QuickGovernance/ChatFeedback
+          MetricName: !Sub '${ResourcePrefix}-Messages'
+          MetricValue: '1'
+          Unit: Count
+
+  UsefulCountMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref InteractionLogGroup
+      FilterName: !Sub '${ResourcePrefix}-useful'
+      FilterPattern: '{ $.logType = "FEEDBACK_LOGS" && $.feedback_type = "Useful" }'
+      MetricTransformations:
+        - MetricNamespace: QuickGovernance/ChatFeedback
+          MetricName: !Sub '${ResourcePrefix}-Useful'
+          MetricValue: '1'
+          Unit: Count
+
+  NotUsefulCountMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref InteractionLogGroup
+      FilterName: !Sub '${ResourcePrefix}-not-useful'
+      FilterPattern: '{ $.logType = "FEEDBACK_LOGS" && $.feedback_type = "Not Useful" }'
+      MetricTransformations:
+        - MetricNamespace: QuickGovernance/ChatFeedback
+          MetricName: !Sub '${ResourcePrefix}-NotUseful'
+          MetricValue: '1'
+          Unit: Count
+
+  ChatDeliverySource:
+    Type: AWS::Logs::DeliverySource
+    Condition: CreateChatSource
+    Properties:
+      Name: !Sub '${ResourcePrefix}-chat-source'
+      LogType: CHAT_LOGS
+      ResourceArn: !Sub 'arn:${AWS::Partition}:quicksight:${AWS::Region}:${AWS::AccountId}:account/${AWS::AccountId}'
+      Tags:
+        - Key: Purpose
+          Value: !Ref ResourcePrefix
+
+  FeedbackDeliverySource:
+    Type: AWS::Logs::DeliverySource
+    Condition: CreateFeedbackSource
+    Properties:
+      Name: !Sub '${ResourcePrefix}-feedback-source'
+      LogType: FEEDBACK_LOGS
+      ResourceArn: !Sub 'arn:${AWS::Partition}:quicksight:${AWS::Region}:${AWS::AccountId}:account/${AWS::AccountId}'
+      Tags:
+        - Key: Purpose
+          Value: !Ref ResourcePrefix
+
+  ChatDeliveryDestination:
+    Type: AWS::Logs::DeliveryDestination
+    Properties:
+      Name: !Sub '${ResourcePrefix}-chat-cwl'
+      DeliveryDestinationType: CWL
+      DestinationResourceArn: !GetAtt InteractionLogGroup.Arn
+      Tags:
+        - Key: Purpose
+          Value: !Ref ResourcePrefix
+
+  FeedbackDeliveryDestination:
+    Type: AWS::Logs::DeliveryDestination
+    Properties:
+      Name: !Sub '${ResourcePrefix}-feedback-cwl'
+      DeliveryDestinationType: CWL
+      DestinationResourceArn: !GetAtt InteractionLogGroup.Arn
+      Tags:
+        - Key: Purpose
+          Value: !Ref ResourcePrefix
+
+  ChatDeliveryWithNewSource:
+    Type: AWS::Logs::Delivery
+    Condition: CreateChatSource
+    DependsOn: ChatDeliverySource
+    Properties:
+      DeliverySourceName: !Sub '${ResourcePrefix}-chat-source'
+      DeliveryDestinationArn: !GetAtt ChatDeliveryDestination.Arn
+      Tags:
+        - Key: Purpose
+          Value: !Ref ResourcePrefix
+
+  ChatDeliveryWithExistingSource:
+    Type: AWS::Logs::Delivery
+    Condition: ReuseChatSource
+    Properties:
+      DeliverySourceName: !Ref ExistingChatDeliverySourceName
+      DeliveryDestinationArn: !GetAtt ChatDeliveryDestination.Arn
+      Tags:
+        - Key: Purpose
+          Value: !Ref ResourcePrefix
+
+  FeedbackDeliveryWithNewSource:
+    Type: AWS::Logs::Delivery
+    Condition: CreateFeedbackSource
+    DependsOn: FeedbackDeliverySource
+    Properties:
+      DeliverySourceName: !Sub '${ResourcePrefix}-feedback-source'
+      DeliveryDestinationArn: !GetAtt FeedbackDeliveryDestination.Arn
+      Tags:
+        - Key: Purpose
+          Value: !Ref ResourcePrefix
+
+  FeedbackDeliveryWithExistingSource:
+    Type: AWS::Logs::Delivery
+    Condition: ReuseFeedbackSource
+    Properties:
+      DeliverySourceName: !Ref ExistingFeedbackDeliverySourceName
+      DeliveryDestinationArn: !GetAtt FeedbackDeliveryDestination.Arn
+      Tags:
+        - Key: Purpose
+          Value: !Ref ResourcePrefix
+
+  AgentLookupFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ResourcePrefix}-agent-name-resolver'
+      RetentionInDays: 14
+      Tags:
+        - Key: Purpose
+          Value: !Ref ResourcePrefix
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  AgentLookupFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: agent-lookup-refresh
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ListQuickAgents
+                Effect: Allow
+                Action: quicksight:ListAgents
+                Resource: '*'
+              - Sid: ManageLookupTable
+                Effect: Allow
+                Action:
+                  - logs:CreateLookupTable
+                  - logs:UpdateLookupTable
+                  - logs:DeleteLookupTable
+                  - logs:DescribeLookupTables
+                Resource: '*'
+              - Sid: WriteFunctionLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub '${AgentLookupFunctionLogGroup.Arn}:*'
+      Tags:
+        - Key: Purpose
+          Value: !Ref ResourcePrefix
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  AgentLookupFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: AgentLookupFunctionLogGroup
+    Properties:
+      FunctionName: !Sub '${ResourcePrefix}-agent-name-resolver'
+      Description: Refreshes the Quick agent ID-to-name CloudWatch Logs lookup table.
+      Runtime: python3.14
+      Architectures: [arm64]
+      Handler: index.handler
+      MemorySize: 128
+      Timeout: 900
+      Role: !GetAtt AgentLookupFunctionRole.Arn
+      Environment:
+        Variables:
+          AWS_ACCOUNT_ID: !Ref 'AWS::AccountId'
+          LOOKUP_TABLE_NAME: !Ref AgentLookupTableName
+      Code:
+        ZipFile: |
+          import boto3
+          import csv, io, json, os, urllib.request
+          from urllib.parse import urlencode
+          from botocore.auth import SigV4Auth
+          from botocore.awsrequest import AWSRequest
+
+          logs = boto3.client("logs")
+          session = boto3.Session()
+          account_id = os.environ["AWS_ACCOUNT_ID"]
+          table_name = os.environ["LOOKUP_TABLE_NAME"]
+          region = os.environ["AWS_REGION"]
+
+          def find_table(name):
+              try:
+                  response = logs.describe_lookup_tables(
+                      lookupTableNamePrefix=name, maxResults=100)
+              except Exception as error:
+                  code = getattr(error, "response", {}).get("Error", {}).get("Code")
+                  if code == "ResourceNotFoundException":
+                      return None
+                  raise
+              return next((item for item in response.get("lookupTables", [])
+                           if item["lookupTableName"] == name), None)
+
+          def delete_table(name):
+              table = find_table(name)
+              if table:
+                  logs.delete_lookup_table(lookupTableArn=table["lookupTableArn"])
+
+          def list_agents():
+              token = None
+              credentials = session.get_credentials().get_frozen_credentials()
+              while True:
+                  params = {"max-results": 100}
+                  if token:
+                      params["next-token"] = token
+                  url = (f"https://quicksight.{region}.amazonaws.com/accounts/"
+                         f"{account_id}/agents?{urlencode(params)}")
+                  request = AWSRequest(method="GET", url=url)
+                  SigV4Auth(credentials, "quicksight", region).add_auth(request)
+                  http = urllib.request.Request(
+                      url, headers=dict(request.prepare().headers), method="GET")
+                  with urllib.request.urlopen(http, timeout=60) as stream:
+                      response = json.load(stream)
+                  yield from ((agent["AgentId"], agent["Name"])
+                              for agent in response.get("AgentSummaries", []))
+                  token = response.get("NextToken")
+                  if not token:
+                      break
+
+          def refresh_table():
+              rows = list(list_agents())
+              output = io.StringIO()
+              writer = csv.writer(output, lineterminator="\n")
+              writer.writerow(["agent_id", "agent_name"])
+              writer.writerows(sorted(rows))
+              body = output.getvalue()
+              table = find_table(table_name)
+              if table:
+                  logs.update_lookup_table(
+                      lookupTableArn=table["lookupTableArn"], tableBody=body)
+                  arn = table["lookupTableArn"]
+              else:
+                  created = logs.create_lookup_table(
+                      lookupTableName=table_name, tableBody=body)
+                  arn = created["lookupTableArn"]
+              return {"AgentCount": len(rows), "LookupTableArn": arn}
+
+          def respond(event, context, status, data, physical_id, reason=None):
+              body = json.dumps({
+                  "Status": status,
+                  "Reason": reason or ("See CloudWatch Logs: " + context.log_stream_name),
+                  "PhysicalResourceId": physical_id,
+                  "StackId": event["StackId"],
+                  "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"],
+                  "Data": data})
+              request = urllib.request.Request(
+                  event["ResponseURL"], data=body.encode("utf-8"), method="PUT",
+                  headers={"content-type": "", "content-length": str(len(body))})
+              urllib.request.urlopen(request, timeout=30).read()
+
+          def handler(event, context):
+              is_custom = "RequestType" in event
+              physical_id = event.get("PhysicalResourceId", "lookup-table:" + table_name)
+              try:
+                  if is_custom and event["RequestType"] == "Delete":
+                      delete_table(event.get("ResourceProperties", {}).get(
+                          "LookupTableName", table_name))
+                      result = {"Deleted": True}
+                  else:
+                      result = refresh_table()
+                      old_name = event.get("OldResourceProperties", {}).get("LookupTableName")
+                      if old_name and old_name != table_name:
+                          delete_table(old_name)
+                  if is_custom:
+                      respond(event, context, "SUCCESS", result, physical_id)
+                  return result
+              except Exception as error:
+                  if is_custom:
+                      respond(event, context, "FAILED",
+                              {"Error": str(error)[:1000]}, physical_id,
+                              str(error)[:1000])
+                      return
+                  raise
+      Tags:
+        - Key: Purpose
+          Value: !Ref ResourcePrefix
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  AgentLookupInitializer:
+    Type: Custom::QuickAgentLookup
+    Properties:
+      ServiceToken: !GetAtt AgentLookupFunction.Arn
+      LookupTableName: !Ref AgentLookupTableName
+      ResolverVersion: '2'
+
+  AgentLookupSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ResourcePrefix}-agent-name-daily'
+      Description: Refreshes Quick agent friendly names daily at 06:00 GMT-3.
+      ScheduleExpression: cron(0 9 * * ? *)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt AgentLookupFunction.Arn
+          Id: AgentLookupFunction
+          RetryPolicy:
+            MaximumEventAgeInSeconds: 3600
+            MaximumRetryAttempts: 2
+
+  AgentLookupSchedulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref AgentLookupFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt AgentLookupSchedule.Arn
+
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    DependsOn: AgentLookupInitializer
+    Properties:
+      DashboardName: !Sub '${ResourcePrefix}-dashboard'
+      DashboardBody: !Sub |
+        {
+          "start":"-P30D",
+          "periodOverride":"auto",
+          "widgets":[
+            {
+              "type":"text","x":0,"y":0,"width":24,"height":2,
+              "properties":{"markdown":"# Amazon Quick chat and feedback\nUse the dashboard time picker to control every widget. **Sensitive:** tables can contain prompts, responses, feedback comments, resource names, and attachment metadata. Metric totals begin when this stack is deployed; log widgets reflect retained events."}
+            },
+            {
+              "type":"metric","x":0,"y":2,"width":8,"height":5,
+              "properties":{
+                "title":"Messages (selected range)","view":"singleValue","region":"${AWS::Region}",
+                "stat":"Sum","setPeriodToTimeRange":true,
+                "metrics":[["QuickGovernance/ChatFeedback","${ResourcePrefix}-Messages",{"label":"Messages"}]]
+              }
+            },
+            {
+              "type":"metric","x":8,"y":2,"width":8,"height":5,
+              "properties":{
+                "title":"Thumbs up - Useful (selected range)","view":"singleValue","region":"${AWS::Region}",
+                "stat":"Sum","setPeriodToTimeRange":true,
+                "metrics":[["QuickGovernance/ChatFeedback","${ResourcePrefix}-Useful",{"label":"Useful"}]]
+              }
+            },
+            {
+              "type":"metric","x":16,"y":2,"width":8,"height":5,
+              "properties":{
+                "title":"Thumbs down - Not Useful (selected range)","view":"singleValue","region":"${AWS::Region}",
+                "stat":"Sum","setPeriodToTimeRange":true,
+                "metrics":[["QuickGovernance/ChatFeedback","${ResourcePrefix}-NotUseful",{"label":"Not Useful"}]]
+              }
+            },
+            {
+              "type":"log","x":0,"y":7,"width":12,"height":6,
+              "properties":{
+                "title":"Users sending the most messages - highest to lowest","region":"${AWS::Region}","view":"table",
+                "query":"SOURCE '${LogGroupName}' | filter logType = \"CHAT_LOGS\" | stats count(*) as message_count by user_arn, user_type | sort message_count desc | limit 100"
+              }
+            },
+            {
+              "type":"log","x":12,"y":7,"width":12,"height":6,
+              "properties":{
+                "title":"Most-used agents by name - highest to lowest","region":"${AWS::Region}","view":"table",
+                "query":"SOURCE '${LogGroupName}' | filter logType = \"CHAT_LOGS\" | lookup ${AgentLookupTableName} agent_id OUTPUT agent_name | fields coalesce(agent_name, agent_id) as resolved_agent_name, agent_id | stats count(*) as message_count by resolved_agent_name, agent_id | sort message_count desc | display resolved_agent_name, message_count, agent_id | limit 100"
+              }
+            },
+            {
+              "type":"log","x":0,"y":13,"width":12,"height":6,
+              "properties":{
+                "title":"Message status trend","region":"${AWS::Region}","view":"timeSeries","stacked":false,
+                "query":"SOURCE '${LogGroupName}' | filter logType = \"CHAT_LOGS\" | stats count(*) as messages by bin(1d), status_code"
+              }
+            },
+            {
+              "type":"log","x":12,"y":13,"width":12,"height":6,
+              "properties":{
+                "title":"Feedback trend","region":"${AWS::Region}","view":"timeSeries","stacked":false,
+                "query":"SOURCE '${LogGroupName}' | filter logType = \"FEEDBACK_LOGS\" | stats count(*) as feedback by bin(1d), feedback_type"
+              }
+            },
+            {
+              "type":"log","x":0,"y":19,"width":12,"height":6,
+              "properties":{
+                "title":"Feedback reasons","region":"${AWS::Region}","view":"table",
+                "query":"SOURCE '${LogGroupName}' | filter logType = \"FEEDBACK_LOGS\" | stats count(*) as feedback by feedback_type, feedback_reason | sort feedback desc | limit 100"
+              }
+            },
+            {
+              "type":"log","x":12,"y":19,"width":12,"height":6,
+              "properties":{
+                "title":"Blocked and unanswered messages","region":"${AWS::Region}","view":"table",
+                "query":"SOURCE '${LogGroupName}' | filter logType = \"CHAT_LOGS\" and status_code != \"success\" | fields @timestamp, user_arn, status_code, agent_id, flow_id, user_message | sort @timestamp desc | limit 1000"
+              }
+            },
+            {
+              "type":"log","x":0,"y":25,"width":24,"height":8,
+              "properties":{
+                "title":"Latest user messages and Quick responses - up to 10,000","region":"${AWS::Region}","view":"table",
+                "query":"SOURCE '${LogGroupName}' | filter logType = \"CHAT_LOGS\" | fields @timestamp, user_arn, user_type, agent_id, flow_id, status_code, message_scope, user_message, system_text_message, conversation_id, user_message_id, system_message_id | sort @timestamp desc | limit 10000"
+              }
+            },
+            {
+              "type":"log","x":0,"y":33,"width":24,"height":8,
+              "properties":{
+                "title":"Latest feedback details - up to 10,000","region":"${AWS::Region}","view":"table",
+                "query":"SOURCE '${LogGroupName}' | filter logType = \"FEEDBACK_LOGS\" | fields @timestamp, user_arn, user_type, feedback_type, feedback_reason, feedback_details, conversation_id, user_message_id, system_message_id | sort @timestamp desc | limit 10000"
+              }
+            }
+          ]
+        }
+
+Outputs:
+  AgentLookupTableName:
+    Description: CloudWatch Logs lookup table refreshed daily with Quick agent names.
+    Value: !Ref AgentLookupTableName
+
+  AgentLookupFunctionName:
+    Description: Daily Lambda function that refreshes the agent lookup table.
+    Value: !Ref AgentLookupFunction
+
+  ChatDeliverySourceName:
+    Description: CHAT_LOGS delivery source created or reused by this stack.
+    Value: !If [CreateChatSource, !Sub '${ResourcePrefix}-chat-source', !Ref ExistingChatDeliverySourceName]
+
+  FeedbackDeliverySourceName:
+    Description: FEEDBACK_LOGS delivery source created or reused by this stack.
+    Value: !If [CreateFeedbackSource, !Sub '${ResourcePrefix}-feedback-source', !Ref ExistingFeedbackDeliverySourceName]
+
+  LogGroupName:
+    Description: Log group receiving regional CHAT_LOGS and FEEDBACK_LOGS events.
+    Value: !Ref InteractionLogGroup
+
+  DashboardName:
+    Description: Name of the CloudWatch dashboard.
+    Value: !Sub '${ResourcePrefix}-dashboard'
+
+  DashboardUrl:
+    Description: Direct link to the CloudWatch dashboard.
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ResourcePrefix}-dashboard'
+
+  KmsKeyArn:
+    Condition: WithKms
+    Description: KMS key encrypting the log group.
+    Value: !GetAtt LogsKey.Arn
+
+  TailFeedCommand:
+    Description: Command to confirm chat and feedback events are arriving.
+    Value: !Sub "aws logs tail '${LogGroupName}' --since 1h --follow --region ${AWS::Region}"
