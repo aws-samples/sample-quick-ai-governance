@@ -1,0 +1,86 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Amazon Quick custom permissions profile that blocks sharing of Chat Agents,
+  Spaces, and Datasets. Creating the profile is handled here; attaching it to an
+  account, role, or user is a separate AWS CLI step (attaching is not yet a
+  CloudFormation property). The profile is created in the account this stack is
+  deployed into (AWS::AccountId).
+
+Parameters:
+  CustomPermissionsName:
+    Type: String
+    Default: quick-governance-block-sharing-profile
+    Description: >
+      Name of the custom permissions profile to create. 1-64 characters,
+      pattern ^[a-zA-Z0-9+=,.@_-]+$.
+    AllowedPattern: '^[a-zA-Z0-9+=,.@_-]+$'
+    MinLength: 1
+    MaxLength: 64
+
+  AlsoBlockDashboardSharing:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >
+      Set to true to additionally deny ShareDashboards. Useful when sharing via
+      dashboards is part of the data-exfiltration risk you want to close.
+
+  AlsoBlockAnalysesSharing:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Set to true to additionally deny ShareAnalyses.
+
+  AlsoBlockDataSourceSharing:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Set to true to additionally deny ShareDataSources.
+
+Conditions:
+  BlockDashboards:  !Equals [!Ref AlsoBlockDashboardSharing, 'true']
+  BlockAnalyses:    !Equals [!Ref AlsoBlockAnalysesSharing, 'true']
+  BlockDataSources: !Equals [!Ref AlsoBlockDataSourceSharing, 'true']
+
+Resources:
+
+  QuickGovernanceBlockSharingProfile:
+    Type: AWS::QuickSight::CustomPermissions
+    Properties:
+      AwsAccountId: !Ref AWS::AccountId
+      CustomPermissionsName: !Ref CustomPermissionsName
+      Capabilities:
+        # --- Core: block sharing of these three asset types ---
+        ShareChatAgents: DENY
+        ShareSpaces:     DENY
+        ShareDatasets:   DENY
+        # --- Optional extensions, gated by parameters ---
+        ShareDashboards:  !If [BlockDashboards,  DENY, !Ref 'AWS::NoValue']
+        ShareAnalyses:    !If [BlockAnalyses,    DENY, !Ref 'AWS::NoValue']
+        ShareDataSources: !If [BlockDataSources, DENY, !Ref 'AWS::NoValue']
+      Tags:
+        - Key: Purpose
+          Value: quick-governance-block-sharing
+        - Key: ManagedBy
+          Value: CloudFormation
+
+Outputs:
+  CustomPermissionsArn:
+    Description: ARN of the custom permissions profile.
+    Value: !GetAtt QuickGovernanceBlockSharingProfile.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-CustomPermissionsArn'
+
+  CustomPermissionsName:
+    Description: Name of the custom permissions profile (use this with the AWS CLI).
+    Value: !Ref CustomPermissionsName
+    Export:
+      Name: !Sub '${AWS::StackName}-CustomPermissionsName'
+
+  AttachAccountWideCommand:
+    Description: Command to attach this profile account-wide after deployment.
+    Value: !Sub >
+      aws quicksight update-account-custom-permission
+      --aws-account-id ${AWS::AccountId}
+      --custom-permissions-name ${CustomPermissionsName}
+      --region ${AWS::Region}
