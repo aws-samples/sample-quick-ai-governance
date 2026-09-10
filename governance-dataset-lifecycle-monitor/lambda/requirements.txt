@@ -1,0 +1,8 @@
+# The Lambda runtime's bundled boto3 predates the Quick Space/Agent APIs
+# (ListSpaces, ListSpaceResources, ListAgents, DescribeAgent) that the slow
+# loop uses for space -> dataset and agent -> space lineage. Bundle a pinned
+# boto3 that has them (verified against the botocore service model).
+# The collector feature-detects these APIs, so an older build still works —
+# it just skips space/agent lineage with a warning.
+boto3==1.43.91
+botocore==1.43.91

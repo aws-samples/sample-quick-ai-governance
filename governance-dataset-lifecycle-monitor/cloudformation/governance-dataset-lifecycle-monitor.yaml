@@ -1,0 +1,634 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Amazon Quick dataset lifecycle monitor. A scheduled collector Lambda scans
+  every dataset (no co-ownership required - IAM-authorized read-only APIs) and
+  publishes per-dataset sync health (last refresh status + typed failure
+  reason), sync duration (last + average, segmented by refresh type), and
+  last-observed-use evidence with confidence labels, to a CloudWatch Logs data
+  log group, a CloudWatch dashboard, low-cardinality fleet KPIs, and S3 JSONL
+  snapshots. Optional SNS alerts fire once per new refresh failure. Deploy via
+  scripts/apply-governance-dataset-lifecycle-monitor.sh or "sam deploy".
+
+# Prerequisites (NOT created by this stack):
+#   * Amazon Quick subscription in this same account/Region.
+#   * Nothing else: CloudTrail evidence uses the always-on 90-day Event
+#     history (no trail required); dashboard-view evidence uses the native
+#     AWS/QuickSight vended metrics.
+
+Parameters:
+  ResourcePrefix:
+    Type: String
+    Default: 'quick-governance-dataset-lifecycle'
+    Description: >
+      Prefix applied to every resource name. Also part of the S3 bucket name,
+      so keep it lowercase and DNS-safe.
+    AllowedPattern: '^[a-z0-9-]{1,40}$'
+    ConstraintDescription: 1-40 chars, lowercase letters, digits, hyphens.
+
+  DataLogGroupName:
+    Type: String
+    Default: '/quick-governance/dataset-lifecycle'
+    Description: >
+      CloudWatch Logs log group that stores one JSON event per dataset per
+      collector run (the system of record queried by the dashboard).
+
+  FastLoopSchedule:
+    Type: String
+    Default: 'rate(1 hour)'
+    Description: >
+      Schedule for the sync-health loop (ListIngestions sweep: last status,
+      failure reason, durations). rate() or cron() expression.
+
+  SlowLoopSchedule:
+    Type: String
+    Default: 'cron(15 3 * * ? *)'
+    Description: >
+      Schedule for the usage/lineage/capacity loop (dashboard lineage,
+      DashboardViewCount evidence, CloudTrail evidence, SPICE capacity).
+      Default daily at 03:15 UTC.
+
+  AlertEmail:
+    Type: String
+    Default: ''
+    Description: >
+      Email address for refresh-failure alerts and alarms. Leave empty to
+      deploy without SNS notifications. The subscription must be confirmed
+      from the inbox after deployment.
+
+  EnableCloudTrailEvidence:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: >
+      Merge CloudTrail Event history evidence (QueryDatabase, GetDashboard)
+      into last-observed-use. Uses the always-on 90-day Event history via
+      cloudtrail:LookupEvents; no trail is required.
+
+  ChatLogGroupName:
+    Type: String
+    Default: '/aws/vendedlogs/quick/chat-feedback'
+    AllowedPattern: '^$|^[\.\-_/#A-Za-z0-9]+$'
+    Description: >
+      Log group receiving the CHAT_LOGS vended feed (created by the Chat and
+      Feedback Monitor module, Pillar 2). When set, the slow loop scans it
+      for resources cited by Chat Agents or selected by users in chat and
+      turns them into agent-side usage evidence (AGENT_CITED_*). If the log
+      group does not exist the scan is skipped with a warning. Leave empty
+      to disable.
+
+  AgentScopeMediumMax:
+    Type: Number
+    Default: 10
+    MinValue: 1
+    MaxValue: 10000
+    Description: >
+      AGENT_CONVERSATION_SCOPE evidence (a conversation ran on an agent that
+      can reach the dataset) is MEDIUM confidence when the agent's reachable
+      dataset count is at or below this threshold, LOW above it. Smaller
+      values demand tighter agent scoping before the signal is trusted.
+
+  SpiceRatePerGBMonth:
+    Type: String
+    Default: '0.38'
+    AllowedPattern: '^[0-9]+(\.[0-9]+)?$'
+    Description: >
+      USD per SPICE GB-month used for the ESTIMATED_PURCHASED cost signal
+      (example us-east-1 rate; adjust to your Region/agreement). The output
+      is a managerial estimate, never an AWS invoice amount.
+
+  UnusedThresholdDays:
+    Type: Number
+    Default: 30
+    MinValue: 1
+    MaxValue: 455
+    Description: >
+      Days without observed use before a referenced dataset is counted in the
+      NO_OBSERVED_USE finding and the NoObservedUseDatasets KPI.
+
+  IngestionLookbackRuns:
+    Type: Number
+    Default: 50
+    MinValue: 5
+    MaxValue: 200
+    Description: Newest ingestions per dataset used to compute averages.
+
+  CloudTrailLookbackDays:
+    Type: Number
+    Default: 90
+    MinValue: 1
+    MaxValue: 90
+    Description: >
+      CloudTrail Event history lookback for the first scan (Event history
+      retains at most 90 days). Later scans are incremental.
+
+  LogRetentionDays:
+    Type: Number
+    Default: 90
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096, 1827, 2192, 2557, 2922, 3288, 3653]
+    Description: Retention (days) for the data log group and the Lambda log group.
+
+  SnapshotExpirationDays:
+    Type: Number
+    Default: 180
+    MinValue: 1
+    MaxValue: 3650
+    Description: Days before S3 JSONL snapshots expire (state/ objects are kept).
+
+  FunctionTimeoutSeconds:
+    Type: Number
+    Default: 900
+    MinValue: 60
+    MaxValue: 900
+
+  FunctionMemoryMb:
+    Type: Number
+    Default: 512
+    MinValue: 128
+    MaxValue: 10240
+
+Conditions:
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, '']]
+  HasChatLogGroup: !Not [!Equals [!Ref ChatLogGroupName, '']]
+
+Resources:
+
+  # ----- Storage: data log group (system of record) + S3 (state/snapshots) --
+
+  DataLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Ref DataLogGroupName
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Purpose
+          Value: !Ref ResourcePrefix
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  StateBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub '${ResourcePrefix}-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-snapshots
+            Status: Enabled
+            Prefix: 'snapshots/'
+            ExpirationInDays: !Ref SnapshotExpirationDays
+      Tags:
+        - Key: Purpose
+          Value: !Ref ResourcePrefix
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ----- Notifications (optional) --------------------------------------------
+
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Condition: HasAlertEmail
+    Properties:
+      TopicName: !Sub '${ResourcePrefix}-alerts'
+      Tags:
+        - Key: Purpose
+          Value: !Ref ResourcePrefix
+
+  AlertSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  # ----- Collector Lambda -----------------------------------------------------
+
+  CollectorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ResourcePrefix}-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: !Sub '${ResourcePrefix}-policy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: QuickSightListInventory
+                Effect: Allow
+                Action:
+                  - quicksight:ListDataSets
+                  - quicksight:ListDashboards
+                  - quicksight:ListTopics
+                  - quicksight:ListTopicsV2
+                  - quicksight:ListSpaces
+                  - quicksight:ListAgents
+                Resource: '*'
+              - Sid: QuickSightDatasetRead
+                Effect: Allow
+                Action:
+                  - quicksight:DescribeDataSet
+                  - quicksight:ListIngestions
+                Resource: !Sub 'arn:${AWS::Partition}:quicksight:${AWS::Region}:${AWS::AccountId}:dataset/*'
+              - Sid: QuickSightDashboardRead
+                Effect: Allow
+                Action:
+                  - quicksight:DescribeDashboard
+                Resource: !Sub 'arn:${AWS::Partition}:quicksight:${AWS::Region}:${AWS::AccountId}:dashboard/*'
+              - Sid: QuickSightTopicRead
+                Effect: Allow
+                Action:
+                  - quicksight:DescribeTopic
+                  - quicksight:DescribeTopicV2
+                Resource: !Sub 'arn:${AWS::Partition}:quicksight:${AWS::Region}:${AWS::AccountId}:topic/*'
+              - Sid: QuickSightSpaceRead
+                Effect: Allow
+                Action:
+                  - quicksight:ListSpaceResources
+                Resource: !Sub 'arn:${AWS::Partition}:quicksight:${AWS::Region}:${AWS::AccountId}:space/*'
+              - Sid: QuickSightAgentRead
+                Effect: Allow
+                Action:
+                  - quicksight:DescribeAgent
+                Resource: !Sub 'arn:${AWS::Partition}:quicksight:${AWS::Region}:${AWS::AccountId}:agent/*'
+              - Sid: CloudWatchReadViewMetrics
+                Effect: Allow
+                Action:
+                  - cloudwatch:GetMetricData
+                Resource: '*'
+              - Sid: CloudWatchWriteKpis
+                Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    cloudwatch:namespace: 'QuickGovernance/DatasetLifecycle'
+              - Sid: DataLogGroupWrite
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !GetAtt DataLogGroup.Arn
+                  - !Sub '${DataLogGroup.Arn}:*'
+              - Sid: StateBucketReadWrite
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: !Sub '${StateBucket.Arn}/*'
+              - Sid: StateBucketList
+                Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !GetAtt StateBucket.Arn
+              - Sid: CloudTrailEventHistoryRead
+                Effect: Allow
+                Action:
+                  - cloudtrail:LookupEvents
+                Resource: '*'
+              - !If
+                - HasChatLogGroup
+                - Sid: ChatLogsInsightsQuery
+                  Effect: Allow
+                  Action:
+                    - logs:StartQuery
+                  Resource:
+                    - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${ChatLogGroupName}'
+                    - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${ChatLogGroupName}:*'
+                - !Ref AWS::NoValue
+              - !If
+                - HasChatLogGroup
+                - Sid: ChatLogsInsightsResults
+                  Effect: Allow
+                  Action:
+                    - logs:GetQueryResults
+                    - logs:StopQuery
+                  Resource: '*'
+                - !Ref AWS::NoValue
+              - !If
+                - HasAlertEmail
+                - Sid: SnsPublishAlerts
+                  Effect: Allow
+                  Action:
+                    - sns:Publish
+                  Resource: !Ref AlertTopic
+                - !Ref AWS::NoValue
+      Tags:
+        - Key: Purpose
+          Value: !Ref ResourcePrefix
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  CollectorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ResourcePrefix}-fn'
+      RetentionInDays: !Ref LogRetentionDays
+
+  CollectorFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: CollectorLogGroup
+    Properties:
+      FunctionName: !Sub '${ResourcePrefix}-fn'
+      Description: >
+        Scans Amazon Quick datasets: sync health, durations, usage evidence.
+      Runtime: python3.14
+      Architectures:
+        - arm64
+      Handler: collector.lambda_handler
+      CodeUri: ../lambda/
+      Role: !GetAtt CollectorRole.Arn
+      Timeout: !Ref FunctionTimeoutSeconds
+      MemorySize: !Ref FunctionMemoryMb
+      # Serializes the two loops so combined QuickSight API pressure stays
+      # under the per-user TPS quotas. A colliding run is throttled and
+      # retried by EventBridge.
+      ReservedConcurrentExecutions: 1
+      Environment:
+        Variables:
+          QS_ACCOUNT_ID: !Ref AWS::AccountId
+          DATA_LOG_GROUP: !Ref DataLogGroupName
+          STATE_BUCKET: !Ref StateBucket
+          SNS_TOPIC_ARN: !If [HasAlertEmail, !Ref AlertTopic, '']
+          ENABLE_CLOUDTRAIL: !Ref EnableCloudTrailEvidence
+          SPICE_RATE_PER_GB_MONTH: !Ref SpiceRatePerGBMonth
+          UNUSED_THRESHOLD_DAYS: !Ref UnusedThresholdDays
+          INGESTION_LOOKBACK_RUNS: !Ref IngestionLookbackRuns
+          CT_LOOKBACK_DAYS: !Ref CloudTrailLookbackDays
+          CHAT_LOG_GROUP: !Ref ChatLogGroupName
+          AGENT_SCOPE_MEDIUM_MAX: !Ref AgentScopeMediumMax
+          LOG_RETENTION_DAYS: !Ref LogRetentionDays
+      Events:
+        FastLoop:
+          Type: Schedule
+          Properties:
+            Name: !Sub '${ResourcePrefix}-fast'
+            Description: Sync-health sweep (status, failure reason, durations).
+            Schedule: !Ref FastLoopSchedule
+            Input: '{"mode": "fast"}'
+        SlowLoop:
+          Type: Schedule
+          Properties:
+            Name: !Sub '${ResourcePrefix}-slow'
+            Description: Usage, lineage, and capacity sweep.
+            Schedule: !Ref SlowLoopSchedule
+            Input: '{"mode": "slow"}'
+      Tags:
+        Purpose: !Ref ResourcePrefix
+        ManagedBy: CloudFormation
+
+  # ----- Alarms ---------------------------------------------------------------
+
+  IngestionFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ResourcePrefix}-ingestion-failures'
+      AlarmDescription: >
+        At least one Amazon Quick SPICE ingestion failed in the last 5 minutes
+        (native account-aggregate metric; minutes-level MTTD between collector
+        runs). The dashboard and SNS alert carry the per-dataset reason.
+      Namespace: AWS/QuickSight
+      MetricName: IngestionErrorCount
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlertEmail, [!Ref AlertTopic], []]
+
+  CollectorErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ResourcePrefix}-collector-errors'
+      AlarmDescription: >
+        The dataset-lifecycle collector Lambda reported at least one error in
+        15 minutes. Scan data may be stale or partial.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref CollectorFunction
+      Statistic: Sum
+      Period: 900
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlertEmail, [!Ref AlertTopic], []]
+
+  # ----- Dashboard -------------------------------------------------------------
+
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ResourcePrefix}-dashboard'
+      DashboardBody: !Sub |
+        {
+          "start": "-P1W",
+          "periodOverride": "auto",
+          "widgets": [
+            {
+              "type":"metric","x":0,"y":0,"width":4,"height":5,
+              "properties":{
+                "title":"Datasets (total | direct query)","view":"singleValue","region":"${AWS::Region}",
+                "stat":"Maximum","period":3600,"sparkline":false,
+                "metrics":[
+                  ["QuickGovernance/DatasetLifecycle","DatasetsScanned",{"label":"Total"}],
+                  ["QuickGovernance/DatasetLifecycle","DirectQueryDatasets",{"label":"Direct query","color":"#7f7f7f"}]
+                ]
+              }
+            },
+            {
+              "type":"metric","x":4,"y":0,"width":4,"height":5,
+              "properties":{
+                "title":"SPICE datasets","view":"singleValue","region":"${AWS::Region}",
+                "stat":"Maximum","period":3600,"sparkline":false,
+                "metrics":[["QuickGovernance/DatasetLifecycle","SpiceDatasets",{"label":"SPICE datasets"}]]
+              }
+            },
+            {
+              "type":"metric","x":8,"y":0,"width":4,"height":5,
+              "properties":{
+                "title":"Datasets with FAILED last refresh","view":"singleValue","region":"${AWS::Region}",
+                "stat":"Maximum","period":3600,"sparkline":true,
+                "metrics":[["QuickGovernance/DatasetLifecycle","FailedRefreshDatasets",{"label":"Failed","color":"#d13212"}]]
+              }
+            },
+            {
+              "type":"metric","x":12,"y":0,"width":4,"height":5,
+              "properties":{
+                "title":"Unreferenced SPICE datasets","view":"singleValue","region":"${AWS::Region}",
+                "stat":"Maximum","period":86400,"sparkline":false,
+                "metrics":[["QuickGovernance/DatasetLifecycle","UnreferencedDatasets",{"label":"No dashboard, topic, or space","color":"#ff9900"}]]
+              }
+            },
+            {
+              "type":"metric","x":16,"y":0,"width":4,"height":5,
+              "properties":{
+                "title":"Referenced, no observed use","view":"singleValue","region":"${AWS::Region}",
+                "stat":"Maximum","period":86400,"sparkline":false,
+                "metrics":[["QuickGovernance/DatasetLifecycle","NoObservedUseDatasets",{"label":"No observed use","color":"#ff9900"}]]
+              }
+            },
+            {
+              "type":"metric","x":20,"y":0,"width":4,"height":5,
+              "properties":{
+                "title":"Consumed SPICE (GB, estimated)","view":"singleValue","region":"${AWS::Region}",
+                "stat":"Maximum","period":86400,"sparkline":false,
+                "metrics":[["QuickGovernance/DatasetLifecycle","ConsumedSpiceGB",{"label":"SPICE GB"}]]
+              }
+            },
+            {
+              "type":"log","x":0,"y":5,"width":24,"height":6,
+              "properties":{
+                "title":"Currently FAILED datasets (latest state per dataset, with reason)",
+                "region":"${AWS::Region}","view":"table",
+                "query":"SOURCE '${DataLogGroupName}' | filter loop = 'fast' and importMode = 'SPICE' | stats latest(datasetName) as name, latest(lastStatus) as status, latest(errorType) as error_type, latest(errorMessage) as error_message, latest(lastFailedAt) as last_failed_at, latest(lastSuccessAt) as last_success_at, latest(lastRequestType) as refresh_type by datasetId | filter status = 'FAILED' | sort last_failed_at desc"
+              }
+            },
+            {
+              "type":"log","x":0,"y":11,"width":12,"height":6,
+              "properties":{
+                "title":"Slowest SPICE datasets (avg vs last duration, seconds)",
+                "region":"${AWS::Region}","view":"table",
+                "query":"SOURCE '${DataLogGroupName}' | filter loop = 'fast' and importMode = 'SPICE' | stats latest(datasetName) as name, latest(lastStatus) as status, latest(lastDurationSec) as last_sec, latest(avgDurationSec) as avg_sec, latest(avgFullRefreshSec) as avg_full_sec, latest(avgIncrementalSec) as avg_incr_sec, latest(assetState) as state by datasetId | filter ispresent(avg_sec) and coalesce(state, 'ACTIVE') != 'DELETED' | sort avg_sec desc | limit 20"
+              }
+            },
+            {
+              "type":"log","x":12,"y":11,"width":12,"height":6,
+              "properties":{
+                "title":"Unreferenced SPICE datasets - in no dashboard, topic, or space (cost vs evidence)",
+                "region":"${AWS::Region}","view":"table",
+                "query":"SOURCE '${DataLogGroupName}' | filter loop = 'slow' | stats latest(datasetName) as name, latest(spiceGB) as spice_gb, latest(estMonthlyCostUsd) as est_monthly_usd, latest(usageConfidence) as confidence, latest(findingsCsv) as findings, latest(assetState) as state by datasetId | filter coalesce(state, 'ACTIVE') != 'DELETED' and findings like 'SPICE_DATASET_NOT_REFERENCED' | sort spice_gb desc | limit 25"
+              }
+            },
+            {
+              "type":"text","x":0,"y":17,"width":24,"height":4,
+              "properties":{
+                "markdown":"## How to read usage evidence\n**Confidence** - `HIGH`: a Chat Agent cited the dataset in an answer, or a direct-query dataset was queried (CloudTrail). `MEDIUM`: a dashboard using it was viewed, an agent cited a topic or used a space containing it, a user selected it in chat, a conversation ran on a tightly-scoped agent that can reach it (scope-level, not query proof), or a CloudTrail query touched a SPICE dataset (interactive, prewarm, or refresh - indistinguishable). `LOW`: referenced by a dashboard, topic, or space (the agents column counts Chat Agents that can reach it), or only broad-scope agent conversations observed. `NO_EVIDENCE`: no references and no observed activity - **not proof of non-use**.\n\n**Evidence windows** - dashboard views up to 455 days (CloudWatch metrics) | CloudTrail queries up to 90 days | agent citations and conversations from CHAT_LOGS (Chat and Feedback Monitor, when deployed), accumulated from 30-day scans.\n\n**Blind spots** - a topic-grounded agent answer can cite nothing and emit no CloudTrail event or metric; the AGENT_CONVERSATION_SCOPE evidence (agent activity x lineage) is the compensating control, and it is scope-level - it never proves the specific dataset was queried. Ad-hoc analyses are invisible. **Never delete a dataset on this signal alone.** Deleted datasets leave every table on the next scan. Full/incremental duration averages appear once those refresh types run. The two account-wide trend charts below are empty when no refresh ran in the selected time range."
+              }
+            },
+            {
+              "type":"log","x":0,"y":21,"width":12,"height":6,
+              "properties":{
+                "title":"Least recently used - datasets WITH usage evidence (stalest first, windows in legend)",
+                "region":"${AWS::Region}","view":"table",
+                "query":"SOURCE '${DataLogGroupName}' | filter loop = 'slow' | stats latest(datasetName) as name, latest(importMode) as mode, latest(dependentDashboardCount) as dashboards, latest(dependentTopicCount) as topics, latest(dependentSpaceCount) as spaces, latest(dependentAgentCount) as agents, latest(lastObservedUseAt) as last_used, latest(daysSinceObservedUse) as days_since_use, latest(usageConfidence) as confidence, latest(usageSource) as source, latest(assetState) as state by datasetId | filter coalesce(state, 'ACTIVE') != 'DELETED' and ispresent(days_since_use) | sort days_since_use desc | limit 25"
+              }
+            },
+            {
+              "type":"log","x":12,"y":21,"width":12,"height":6,
+              "properties":{
+                "title":"No usage evidence - telemetry saw nothing (agent or ad-hoc use may exist, verify first)",
+                "region":"${AWS::Region}","view":"table",
+                "query":"SOURCE '${DataLogGroupName}' | filter loop = 'slow' | stats latest(datasetName) as name, latest(importMode) as mode, latest(dependentDashboardCount) as dashboards, latest(dependentTopicCount) as topics, latest(dependentSpaceCount) as spaces, latest(dependentAgentCount) as agents, latest(daysSinceObservedUse) as days_since_use, latest(usageConfidence) as confidence, latest(spiceGB) as spice_gb, latest(findingsCsv) as findings, latest(assetState) as state by datasetId | filter coalesce(state, 'ACTIVE') != 'DELETED' and not ispresent(days_since_use) | sort spice_gb desc | limit 25"
+              }
+            },
+            {
+              "type":"metric","x":0,"y":27,"width":12,"height":6,
+              "properties":{
+                "title":"Ingestion latency - account-wide, emitted by Quick",
+                "region":"${AWS::Region}","view":"timeSeries","stacked":false,
+                "metrics":[
+                  ["AWS/QuickSight","IngestionLatency",{"stat":"Average","label":"Average (s)"}],
+                  ["AWS/QuickSight","IngestionLatency",{"stat":"Maximum","label":"Max (s)"}]
+                ]
+              }
+            },
+            {
+              "type":"metric","x":12,"y":27,"width":12,"height":6,
+              "properties":{
+                "title":"Ingestions and failures - account-wide, emitted by Quick",
+                "region":"${AWS::Region}","view":"timeSeries","stacked":false,
+                "metrics":[
+                  ["AWS/QuickSight","IngestionInvocationCount",{"stat":"Sum","label":"Ingestions"}],
+                  ["AWS/QuickSight","IngestionErrorCount",{"stat":"Sum","label":"Failures","color":"#d13212"}]
+                ]
+              }
+            },
+            {
+              "type":"log","x":0,"y":33,"width":12,"height":6,
+              "properties":{
+                "title":"Largest SPICE datasets (estimated cost signal, not an invoice)",
+                "region":"${AWS::Region}","view":"table",
+                "query":"SOURCE '${DataLogGroupName}' | filter loop = 'slow' | stats latest(datasetName) as name, latest(spiceGB) as spice_gb, latest(estMonthlyCostUsd) as est_monthly_usd, latest(costType) as cost_type, latest(dependentDashboardCount) as dashboards, latest(dependentTopicCount) as topics, latest(daysSinceObservedUse) as days_since_use, latest(assetState) as state by datasetId | filter ispresent(spice_gb) and coalesce(state, 'ACTIVE') != 'DELETED' | sort spice_gb desc | limit 20"
+              }
+            },
+            {
+              "type":"log","x":12,"y":33,"width":12,"height":6,
+              "properties":{
+                "title":"Recent refresh-failure events (feed)",
+                "region":"${AWS::Region}","view":"table",
+                "query":"SOURCE '${DataLogGroupName}' | fields @timestamp, datasetName, errorType, errorMessage, lastRequestType | filter loop = 'fast' and lastStatus = 'FAILED' | sort @timestamp desc | limit 50"
+              }
+            }
+          ]
+        }
+
+Outputs:
+  ResourcePrefix:
+    Description: Prefix shared by every AWS resource created by this stack.
+    Value: !Ref ResourcePrefix
+    Export:
+      Name: !Sub '${AWS::StackName}-ResourcePrefix'
+
+  FunctionName:
+    Description: Name of the collector Lambda function.
+    Value: !Ref CollectorFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-FunctionName'
+
+  DataLogGroupName:
+    Description: Log group holding one JSON event per dataset per run.
+    Value: !Ref DataLogGroupName
+    Export:
+      Name: !Sub '${AWS::StackName}-DataLogGroup'
+
+  StateBucketName:
+    Description: S3 bucket with collector state and JSONL snapshots (retained on delete).
+    Value: !Ref StateBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-StateBucket'
+
+  AlertTopicArn:
+    Condition: HasAlertEmail
+    Description: SNS topic receiving refresh-failure alerts and alarms.
+    Value: !Ref AlertTopic
+
+  DashboardUrl:
+    Description: Direct link to the dataset lifecycle CloudWatch dashboard.
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ResourcePrefix}-dashboard'
+
+  RunFastLoopNowCommand:
+    Description: Convenience command to trigger a sync-health scan immediately.
+    Value: !Sub >-
+      aws lambda invoke --function-name ${CollectorFunction}
+      --payload '{"mode": "fast"}' --cli-binary-format raw-in-base64-out
+      --region ${AWS::Region} /dev/stdout
+
+  RunSlowLoopNowCommand:
+    Description: Convenience command to trigger a usage/capacity scan immediately.
+    Value: !Sub >-
+      aws lambda invoke --function-name ${CollectorFunction}
+      --payload '{"mode": "slow"}' --cli-binary-format raw-in-base64-out
+      --region ${AWS::Region} /dev/stdout
