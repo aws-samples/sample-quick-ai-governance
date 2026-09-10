@@ -1,0 +1,8 @@
+# The managed Lambda runtime's boto3 predates the Quick Space/Agent/Topic-V2
+# permission APIs (DescribeSpacePermissions, DescribeAgentPermissions,
+# DescribeTopicPermissionsV2, ListSpaces, ListAgents, ListTopicsV2) used by
+# the ownership scan. Pin a version verified to contain them. The collector
+# feature-detects the topic V2 APIs, so an older build still works for the
+# classic asset types.
+boto3==1.43.91
+botocore==1.43.91

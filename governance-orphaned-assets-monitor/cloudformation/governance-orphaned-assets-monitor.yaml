@@ -1,0 +1,468 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Amazon Quick orphaned assets monitor (Phase 1, AUDIT_ONLY). A scheduled
+  collector reconciles every asset's owner grants (datasets, dashboards,
+  analyses, data sources, folders, spaces, agents, topics) against the
+  current Quick user/group inventory and flags ownership risk - orphaned
+  assets, missing owner principals, single-owner assets - with evidence and
+  confidence, on a CloudWatch dashboard with SNS alerts. Strictly read-only:
+  it never transfers ownership, never deletes anything. Deploy via
+  scripts/apply-governance-orphaned-assets-monitor.sh (sam build + deploy).
+
+Parameters:
+  ResourcePrefix:
+    Type: String
+    Default: 'quick-governance-orphaned-assets'
+    AllowedPattern: '^[a-z0-9-]{1,40}$'
+    ConstraintDescription: 1-40 chars, lowercase letters, digits, hyphens.
+    Description: Prefix for every resource name (also in the bucket name).
+
+  DataLogGroupName:
+    Type: String
+    Default: '/quick-governance/orphaned-assets'
+    Description: >
+      Log group storing one JSON ownership event per asset per scan (the
+      system of record queried by the dashboard).
+
+  ScheduleExpression:
+    Type: String
+    Default: 'cron(45 3 * * ? *)'
+    Description: Reconciliation cadence (daily 03:45 UTC by default).
+
+  AlertEmail:
+    Type: String
+    Default: ''
+    Description: >
+      Email for new HIGH-severity finding alerts and alarms. Empty = no SNS.
+      Confirm the subscription from the inbox after deployment.
+
+  IdentityRegion:
+    Type: String
+    Default: ''
+    Description: >
+      Region hosting the Quick user/group APIs, which can differ from the
+      asset Region. Leave empty to auto-discover (the collector parses the
+      identity-region hint from the AccessDeniedException and caches it).
+
+  Namespaces:
+    Type: String
+    Default: 'default'
+    Description: Comma-separated Quick namespaces to inventory.
+
+  AssetTypes:
+    Type: String
+    Default: 'DATASET,DASHBOARD,ANALYSIS,DATA_SOURCE,FOLDER,SPACE,AGENT,TOPIC'
+    Description: Comma-separated asset types to scan.
+
+  LogRetentionDays:
+    Type: Number
+    Default: 90
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096, 1827, 2192, 2557, 2922, 3288, 3653]
+
+  SnapshotExpirationDays:
+    Type: Number
+    Default: 365
+    MinValue: 1
+    MaxValue: 3650
+    Description: Days before S3 JSONL snapshots expire (state/ objects kept).
+
+  FunctionTimeoutSeconds:
+    Type: Number
+    Default: 900
+    MinValue: 60
+    MaxValue: 900
+
+  FunctionMemoryMb:
+    Type: Number
+    Default: 512
+    MinValue: 128
+    MaxValue: 10240
+
+Conditions:
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, '']]
+
+Resources:
+
+  DataLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Ref DataLogGroupName
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Purpose
+          Value: !Ref ResourcePrefix
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  StateBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub '${ResourcePrefix}-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-snapshots
+            Status: Enabled
+            Prefix: 'snapshots/'
+            ExpirationInDays: !Ref SnapshotExpirationDays
+      Tags:
+        - Key: Purpose
+          Value: !Ref ResourcePrefix
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Condition: HasAlertEmail
+    Properties:
+      TopicName: !Sub '${ResourcePrefix}-alerts'
+      Tags:
+        - Key: Purpose
+          Value: !Ref ResourcePrefix
+
+  AlertSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  CollectorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ResourcePrefix}-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: !Sub '${ResourcePrefix}-policy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: QuickSightListInventory
+                Effect: Allow
+                Action:
+                  - quicksight:ListDataSets
+                  - quicksight:ListDashboards
+                  - quicksight:ListAnalyses
+                  - quicksight:ListDataSources
+                  - quicksight:ListFolders
+                  - quicksight:ListSpaces
+                  - quicksight:ListAgents
+                  - quicksight:ListTopics
+                  - quicksight:ListTopicsV2
+                Resource: '*'
+              # User/group APIs live in the account's identity region, which
+              # can differ from the deployment region - hence region "*".
+              - Sid: QuickSightIdentityRead
+                Effect: Allow
+                Action:
+                  - quicksight:ListUsers
+                  - quicksight:ListGroups
+                  - quicksight:ListGroupMemberships
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:quicksight:*:${AWS::AccountId}:user/*'
+                  - !Sub 'arn:${AWS::Partition}:quicksight:*:${AWS::AccountId}:group/*'
+                  - !Sub 'arn:${AWS::Partition}:quicksight:*:${AWS::AccountId}:namespace/*'
+              - Sid: QuickSightPermissionsRead
+                Effect: Allow
+                Action:
+                  - quicksight:DescribeDataSetPermissions
+                  - quicksight:DescribeDashboardPermissions
+                  - quicksight:DescribeAnalysisPermissions
+                  - quicksight:DescribeDataSourcePermissions
+                  - quicksight:DescribeFolderPermissions
+                  - quicksight:DescribeFolderResolvedPermissions
+                  - quicksight:DescribeSpacePermissions
+                  - quicksight:DescribeAgentPermissions
+                  - quicksight:DescribeTopicPermissions
+                  - quicksight:DescribeTopicPermissionsV2
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:quicksight:${AWS::Region}:${AWS::AccountId}:dataset/*'
+                  - !Sub 'arn:${AWS::Partition}:quicksight:${AWS::Region}:${AWS::AccountId}:dashboard/*'
+                  - !Sub 'arn:${AWS::Partition}:quicksight:${AWS::Region}:${AWS::AccountId}:analysis/*'
+                  - !Sub 'arn:${AWS::Partition}:quicksight:${AWS::Region}:${AWS::AccountId}:datasource/*'
+                  - !Sub 'arn:${AWS::Partition}:quicksight:${AWS::Region}:${AWS::AccountId}:folder/*'
+                  - !Sub 'arn:${AWS::Partition}:quicksight:${AWS::Region}:${AWS::AccountId}:space/*'
+                  - !Sub 'arn:${AWS::Partition}:quicksight:${AWS::Region}:${AWS::AccountId}:agent/*'
+                  - !Sub 'arn:${AWS::Partition}:quicksight:${AWS::Region}:${AWS::AccountId}:topic/*'
+              - Sid: DataLogGroupWrite
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !GetAtt DataLogGroup.Arn
+                  - !Sub '${DataLogGroup.Arn}:*'
+              - Sid: CloudWatchWriteKpis
+                Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    cloudwatch:namespace: 'QuickGovernance/OrphanedAssets'
+              - Sid: StateBucketReadWrite
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: !Sub '${StateBucket.Arn}/*'
+              - Sid: StateBucketList
+                Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !GetAtt StateBucket.Arn
+              - !If
+                - HasAlertEmail
+                - Sid: SnsPublishAlerts
+                  Effect: Allow
+                  Action:
+                    - sns:Publish
+                  Resource: !Ref AlertTopic
+                - !Ref AWS::NoValue
+      Tags:
+        - Key: Purpose
+          Value: !Ref ResourcePrefix
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  CollectorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ResourcePrefix}-fn'
+      RetentionInDays: !Ref LogRetentionDays
+
+  CollectorFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: CollectorLogGroup
+    Properties:
+      FunctionName: !Sub '${ResourcePrefix}-fn'
+      Description: >
+        Reconciles Amazon Quick asset ownership against the user inventory
+        (audit-only).
+      Runtime: python3.14
+      Architectures:
+        - arm64
+      Handler: collector.lambda_handler
+      CodeUri: ../lambda/
+      Role: !GetAtt CollectorRole.Arn
+      Timeout: !Ref FunctionTimeoutSeconds
+      MemorySize: !Ref FunctionMemoryMb
+      ReservedConcurrentExecutions: 1
+      Environment:
+        Variables:
+          QS_ACCOUNT_ID: !Ref AWS::AccountId
+          DATA_LOG_GROUP: !Ref DataLogGroupName
+          STATE_BUCKET: !Ref StateBucket
+          SNS_TOPIC_ARN: !If [HasAlertEmail, !Ref AlertTopic, '']
+          IDENTITY_REGION: !Ref IdentityRegion
+          NAMESPACES: !Ref Namespaces
+          ASSET_TYPES: !Ref AssetTypes
+      Events:
+        DailyScan:
+          Type: Schedule
+          Properties:
+            Name: !Sub '${ResourcePrefix}-scan'
+            Description: Daily ownership reconciliation scan.
+            Schedule: !Ref ScheduleExpression
+            Input: '{}'
+      Tags:
+        Purpose: !Ref ResourcePrefix
+        ManagedBy: CloudFormation
+
+  CollectorErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ResourcePrefix}-collector-errors'
+      AlarmDescription: >
+        The orphaned-assets collector reported an error. Findings may be
+        stale; no findings are ever closed after a failed or partial scan.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref CollectorFunction
+      Statistic: Sum
+      Period: 900
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlertEmail, [!Ref AlertTopic], []]
+
+  HighFindingsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ResourcePrefix}-high-findings'
+      AlarmDescription: >
+        At least one HIGH-severity ownership finding is open (asset with no
+        active owner or with every owner principal missing). Review the
+        dashboard and transfer ownership via the Quick asset management
+        console.
+      Namespace: QuickGovernance/OrphanedAssets
+      MetricName: HighSeverityFindings
+      Statistic: Maximum
+      Period: 86400
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlertEmail, [!Ref AlertTopic], []]
+
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ResourcePrefix}-dashboard'
+      DashboardBody: !Sub |
+        {
+          "start": "-P1W",
+          "periodOverride": "inherit",
+          "widgets": [
+            {
+              "type":"metric","x":0,"y":0,"width":4,"height":5,
+              "properties":{
+                "title":"Open findings","view":"singleValue","region":"${AWS::Region}","liveData":true,
+                "stat":"Maximum","period":86400,"sparkline":true,
+                "metrics":[["QuickGovernance/OrphanedAssets","OpenFindings",{"label":"Open"}]]
+              }
+            },
+            {
+              "type":"metric","x":4,"y":0,"width":4,"height":5,
+              "properties":{
+                "title":"HIGH severity (orphaned)","view":"singleValue","region":"${AWS::Region}","liveData":true,
+                "stat":"Maximum","period":86400,"sparkline":false,
+                "metrics":[["QuickGovernance/OrphanedAssets","HighSeverityFindings",{"label":"HIGH","color":"#d13212"}]]
+              }
+            },
+            {
+              "type":"metric","x":8,"y":0,"width":4,"height":5,
+              "properties":{
+                "title":"Single-owner assets (bus factor 1)","view":"singleValue","region":"${AWS::Region}","liveData":true,
+                "stat":"Maximum","period":86400,"sparkline":false,
+                "metrics":[["QuickGovernance/OrphanedAssets","SingleActiveOwnerFindings",{"label":"Single owner","color":"#ff9900"}]]
+              }
+            },
+            {
+              "type":"metric","x":12,"y":0,"width":4,"height":5,
+              "properties":{
+                "title":"Assets | users scanned","view":"singleValue","region":"${AWS::Region}","liveData":true,
+                "stat":"Maximum","period":86400,"sparkline":false,
+                "metrics":[
+                  ["QuickGovernance/OrphanedAssets","AssetsScanned",{"label":"Assets"}],
+                  ["QuickGovernance/OrphanedAssets","UsersScanned",{"label":"Users","color":"#7f7f7f"}]
+                ]
+              }
+            },
+            {
+              "type":"metric","x":16,"y":0,"width":4,"height":5,
+              "properties":{
+                "title":"Partial scans","view":"singleValue","region":"${AWS::Region}","liveData":true,
+                "stat":"Maximum","period":86400,"sparkline":false,
+                "metrics":[["QuickGovernance/OrphanedAssets","PartialScans",{"label":"Partial","color":"#ff9900"}]]
+              }
+            },
+            {
+              "type":"metric","x":20,"y":0,"width":4,"height":5,
+              "properties":{
+                "title":"Recovered findings","view":"singleValue","region":"${AWS::Region}","liveData":true,
+                "stat":"Sum","period":86400,"sparkline":false,
+                "metrics":[["QuickGovernance/OrphanedAssets","RecoveredFindings",{"label":"Recovered","color":"#2ca02c"}]]
+              }
+            },
+            {
+              "type":"text","x":0,"y":5,"width":24,"height":4,
+              "properties":{
+                "markdown":"## How to read ownership findings\n**Rule** - an owner is any grant containing `quicksight:Update<Type>Permissions` (verified against live permission documents). A deleted user's grant survives verbatim (verified) - only reconciliation against the user inventory reveals it.\n\n**Findings** - `NO_OWNER_GRANTS` / `OWNER_PRINCIPAL_MISSING` / `NO_ACTIVE_OWNER` (HIGH: nobody can manage the asset) | `ONLY_INACTIVE_POLICY_OWNERS` (MEDIUM: owners exist but never activated) | `SINGLE_ACTIVE_OWNER` (MEDIUM: bus factor 1 - transfer target if that person leaves) | `MIXED_OWNER_STATUS` / `OWNER_STATUS_UNKNOWN` (LOW) | `RECOVERED` (a prior finding cleared after a COMPLETE scan).\n\n**Confidence** - `QUICK_ONLY` identity mode: a missing principal is *probable* deletion, not confirmed (identity may have moved or the inventory may be incomplete). Findings from PARTIAL scans never close open findings. **This monitor is audit-only** - remediation is manual in Manage Quick -> Manage assets: **Transfer** orphaned assets to a new owner, and for single-owner assets use **Share -> owner** to add an admin or recovery group as co-owner - Quick never deletes an asset that has more than one owner when a user is removed. The two removal paths that orphan assets are the `DeleteUser` API (no cleanup runs) and identity-provider removal pending review in the Inactive users list."
+              }
+            },
+            {
+              "type":"log","x":0,"y":9,"width":24,"height":7,
+              "properties":{
+                "title":"HIGH - orphaned or missing-owner assets (latest state per asset)",
+                "region":"${AWS::Region}","view":"table",
+                "query":"SOURCE '${DataLogGroupName}' | stats latest(assetName) as name, latest(findingType) as finding, latest(severity) as sev, latest(confidence) as conf, latest(ownersTotal) as owners, latest(ownersMissing) as missing, latest(viewersTotal) as viewers, latest(firstObservedAt) as first_seen by assetType, assetId | filter sev = 'HIGH' | sort first_seen asc | limit 50"
+              }
+            },
+            {
+              "type":"log","x":0,"y":16,"width":12,"height":7,
+              "properties":{
+                "title":"MEDIUM - at-risk assets (single owner, inactive-only owners)",
+                "region":"${AWS::Region}","view":"table",
+                "query":"SOURCE '${DataLogGroupName}' | stats latest(assetName) as name, latest(findingType) as finding, latest(severity) as sev, latest(ownersActive) as active_owners, latest(ownersPending) as pending, latest(viewersTotal) as viewers by assetType, assetId | filter sev = 'MEDIUM' | sort assetType asc | limit 50"
+              }
+            },
+            {
+              "type":"log","x":12,"y":16,"width":12,"height":7,
+              "properties":{
+                "title":"Ownership coverage by asset type (latest scan)",
+                "region":"${AWS::Region}","view":"table",
+                "query":"SOURCE '${DataLogGroupName}' | stats latest(findingType) as finding by assetType, assetId | filter finding != 'RECOVERED' | stats count(*) as assets, sum(strcontains(finding, 'NONE')) as healthy, sum(strcontains(finding, 'NO_') + strcontains(finding, 'MISSING')) as high_risk, sum(strcontains(finding, 'SINGLE')) as single_owner by assetType | sort assets desc"
+              }
+            },
+            {
+              "type":"log","x":0,"y":23,"width":12,"height":6,
+              "properties":{
+                "title":"Recovered findings (feed)",
+                "region":"${AWS::Region}","view":"table",
+                "query":"SOURCE '${DataLogGroupName}' | fields @timestamp, assetType, assetName, recoveredFrom, firstObservedAt | filter findingType = 'RECOVERED' | sort @timestamp desc | limit 25"
+              }
+            },
+            {
+              "type":"log","x":12,"y":23,"width":12,"height":6,
+              "properties":{
+                "title":"LOW - mixed or unknown owner status",
+                "region":"${AWS::Region}","view":"table",
+                "query":"SOURCE '${DataLogGroupName}' | stats latest(assetName) as name, latest(findingType) as finding, latest(severity) as sev, latest(ownersActive) as active_owners, latest(ownersMissing) as missing by assetType, assetId | filter sev = 'LOW' | sort assetType asc | limit 50"
+              }
+            }
+          ]
+        }
+
+Outputs:
+  FunctionName:
+    Description: Name of the collector Lambda function.
+    Value: !Ref CollectorFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-FunctionName'
+
+  DataLogGroupName:
+    Description: Log group holding one ownership event per asset per scan.
+    Value: !Ref DataLogGroupName
+
+  StateBucketName:
+    Description: S3 bucket with findings state and JSONL snapshots (retained on delete).
+    Value: !Ref StateBucket
+
+  AlertTopicArn:
+    Condition: HasAlertEmail
+    Description: SNS topic receiving new HIGH-finding alerts and alarms.
+    Value: !Ref AlertTopic
+
+  DashboardUrl:
+    Description: Direct link to the ownership dashboard.
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ResourcePrefix}-dashboard'
+
+  RunScanNowCommand:
+    Description: Convenience command to trigger a scan immediately.
+    Value: !Sub >-
+      aws lambda invoke --function-name ${CollectorFunction}
+      --payload '{}' --cli-binary-format raw-in-base64-out
+      --region ${AWS::Region} /dev/stdout

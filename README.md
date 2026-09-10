@@ -17,7 +17,7 @@ This repository organizes that agenda into five pillars. Pillars 1–4 combine n
 | 1 · Consumption | Who consumes agent hours, on which feature, and with what cap? | [Limit profiles](https://docs.aws.amazon.com/quick/latest/userguide/limit-profiles.html) (per-user caps on agent hours and index storage) | [Agent Hours Usage Monitor](./governance-agent-hours-monitor/README.md) |
 | 2 · Interactions | Are people using it? Do they trust the answers? What is failing? | [`CHAT_LOGS` and `FEEDBACK_LOGS` vended logs](https://docs.aws.amazon.com/quick/latest/userguide/monitoring-cloudwatch-logs.html) | [Chat and Feedback Monitor](./governance-chat-feedback-monitor/README.md) |
 | 3 · Sharing | Who may expand access to an asset, and how? | [Custom permissions](https://docs.aws.amazon.com/quick/latest/userguide/custom-permissions.html) and [approval workflows](https://docs.aws.amazon.com/quick/latest/userguide/approval-workflows.html) | [Block Sharing](./governance-block-sharing/README.md) |
-| 4 · Data asset lifecycle | Is the dataset estate healthy, and still in use? | [EventBridge events](https://docs.aws.amazon.com/quick/latest/userguide/events-integration.html) and native CloudWatch metrics | [Spreadsheet File Rename](./governance-spreadsheet-file-rename/README.md) · [Dataset Lifecycle Monitor](./governance-dataset-lifecycle-monitor/README.md) |
+| 4 · Data asset lifecycle | Is the asset estate healthy, still in use, and still owned? | [EventBridge events](https://docs.aws.amazon.com/quick/latest/userguide/events-integration.html), native CloudWatch metrics, and the [asset management console](https://docs.aws.amazon.com/quick/latest/userguide/manage-qs-assets.html) | [Spreadsheet File Rename](./governance-spreadsheet-file-rename/README.md) · [Dataset Lifecycle Monitor](./governance-dataset-lifecycle-monitor/README.md) · [Orphaned Assets Monitor](./governance-orphaned-assets-monitor/README.md) |
 | 5 · Data security in agent access | Does the agent respect each user's data permissions? | [RLS](https://docs.aws.amazon.com/quick/latest/userguide/restrict-access-to-a-data-set-using-row-level-security.html) / [CLS](https://docs.aws.amazon.com/quick/latest/userguide/restrict-access-to-a-data-set-using-column-level-security.html) inherited through the semantic layer · [DLP with Microsoft Purview](https://docs.aws.amazon.com/quick/latest/userguide/data-loss-prevention.html) | — (platform property) |
 
 ```
@@ -28,11 +28,14 @@ This repository organizes that agenda into five pillars. Pillars 1–4 combine n
 | Usage Monitor    | Feedback Monitor |                  | Rename           |     (this repository)
 |                  |                  |                  | Dataset Lifecycle|
 |                  |                  |                  | Monitor          |
+|                  |                  |                  | Orphaned Assets  |
+|                  |                  |                  | Monitor          |
 +------------------+------------------+------------------+------------------+
 | Limit profiles   | CHAT_LOGS and    | Custom           | EventBridge      |  <- native controls
 | (agent hours,    | FEEDBACK_LOGS    | permissions and  | events, native   |     (Amazon Quick)
 | index storage)   | vended logs      | approval         | CloudWatch       |
-|                  |                  | workflows        | metrics          |
+|                  |                  | workflows        | metrics, asset   |
+|                  |                  |                  | management       |
 +------------------+------------------+------------------+------------------+
 | 5 - Data security in agent access: permissions inherited end to end       |  <- native platform
 |     RLS / CLS evaluated per user through the semantic layer               |     property, no
@@ -52,7 +55,7 @@ This repository organizes that agenda into five pillars. Pillars 1–4 combine n
 | [Block Sharing](./governance-block-sharing/README.md) | 3 | Creates a Quick custom permissions profile that denies sharing of Chat Agents, Spaces, and Datasets (optionally dashboards, analyses, data sources) and assigns it at account, role, or user scope. | CloudFormation + Quick APIs |
 | [Spreadsheet File Rename](./governance-spreadsheet-file-rename/README.md) | 4 | Renames any dataset created from an uploaded spreadsheet with a standard prefix (`xls-` by default) within seconds, via an EventBridge → Lambda automation, with no change to the upload experience. | AWS SAM |
 | [Dataset Lifecycle Monitor](./governance-dataset-lifecycle-monitor/README.md) | 4 | Fleet-wide dataset health without co-owning datasets: last sync status with typed failure reason, sync duration (last vs. average), SPICE capacity with an estimated cost signal, and last observed use with confidence labels — evidence from dashboards, CloudTrail, topics, and Chat Agent citations (`CHAT_LOGS`) — on a CloudWatch dashboard with SNS failure alerts and S3 snapshots. | AWS SAM |
-| [Orphaned Assets Monitor](./governance-orphaned-assets-monitor/README.md) | 4 | **Design draft — no deployable infrastructure yet.** Continuously detect assets whose owners were deleted, deprovisioned, or are inactive by policy, so administrators can transfer ownership before content becomes inaccessible. | — |
+| [Orphaned Assets Monitor](./governance-orphaned-assets-monitor/README.md) | 4 | Daily read-only reconciliation of every asset's owner grants (datasets, dashboards, analyses, data sources, folders, spaces, agents, topics) against the Quick user/group inventory: flags orphaned and missing-owner assets (HIGH), single-owner assets (bus factor 1), and recoveries, on a CloudWatch dashboard with SNS alerts. Audit-only — ownership transfer stays a human decision. | AWS SAM |
 
 ## Pillar 1 — Visibility and control of consumption
 
@@ -92,7 +95,7 @@ The quality of an agent's answers is bounded by the quality of the data behind i
 
 **[Dataset Lifecycle Monitor](./governance-dataset-lifecycle-monitor/README.md)** gives the fleet view the console does not offer an enterprise administrator: the last sync status of every dataset with the typed failure reason, refresh duration (last vs. average, full vs. incremental), SPICE capacity consumed with an estimated cost signal, and the last observed use — always with a confidence label, because the available usage evidence is a signal, not a verdict. Usage evidence spans dashboard views, CloudTrail queries, topic lineage, and — when the Chat and Feedback Monitor is deployed — resources cited by Chat Agents in `CHAT_LOGS`, covering the agent consumption path that dashboard telemetry alone misses. New refresh failures raise Amazon SNS alerts. The design matters for the operating model: all collection uses IAM-authorized read-only APIs, so the governance team sees the operation without becoming co-owner of anyone's dataset or gaining access to anyone's data. The module is strictly observational: it never deletes assets, disables schedules, or changes permissions.
 
-**[Orphaned Assets Monitor](./governance-orphaned-assets-monitor/README.md)** is a design draft, not yet deployable. It targets the ownership gap: Amazon Quick does not automatically transfer assets when a user is removed from the identity source, so the design proposes continuous, read-only detection of assets whose owners are deleted, deprovisioned, or inactive by policy, with evidence and confidence per finding and an optional approval-based ownership transfer. The README documents the finding rules, data model, and implementation phases for anyone who wants to build on it.
+**[Orphaned Assets Monitor](./governance-orphaned-assets-monitor/README.md)** closes the ownership gap: Amazon Quick does not automatically transfer assets when a user is removed — the `DeleteUser` API runs no cleanup at all, and identity-provider removals only park the user in the *Inactive users* list pending review. A daily read-only scan reconciles every asset's owner grants against the current user and group inventory and flags the risk ladder: assets with no owner grants or only missing principals (HIGH — verified live: after a user is deleted the dangling grant survives briefly and is then purged, leaving an empty permission document), assets kept alive by a single active owner (the bus-factor-1 list to review before offboarding), and recoveries once ownership is restored. Findings carry evidence and confidence, are never closed after a partial scan, and remediation deliberately stays manual in the Quick asset management console — the module is audit-only by design.
 
 The combined result is a curated, explainable estate — exactly the foundation the agents in the next pillar depend on.
 
@@ -116,7 +119,7 @@ There is no module in this repository for Pillar 5 by design: RLS, CLS, and the 
 
 - An Amazon Quick subscription in the AWS account and Region you deploy into. Every module targets the deploying account through the `AWS::AccountId` pseudo-parameter — there is no account ID to pass — and cross-account deployment is out of scope. Vended-log delivery requires Enterprise or Professional subscriptions; Block Sharing, approval workflows, and RLS / CLS require Enterprise Edition.
 - [AWS CLI v2](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html) authenticated to that account (pass `--profile <name>` to the scripts or set `AWS_PROFILE`).
-- [AWS SAM CLI](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/install-sam-cli.html) for the SAM-based modules (Spreadsheet File Rename, Dataset Lifecycle Monitor).
+- [AWS SAM CLI](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/install-sam-cli.html) for the SAM-based modules (Spreadsheet File Rename, Dataset Lifecycle Monitor, Orphaned Assets Monitor).
 - `jq` on `PATH` for the Block Sharing apply script.
 - Deployment credentials with CloudFormation, IAM, Lambda, S3, SNS, and CloudWatch permissions as required by each template, plus `quicksight:AllowVendedLogDeliveryForResource` on the Quick account for the two log-based monitors. Amazon Quick APIs and IAM actions still use the `quicksight` namespace.
 
@@ -128,7 +131,8 @@ Every module follows the same layout and one-command workflow:
 governance-<module>/
 ├── README.md                          prerequisites, parameters, dashboards, cost, teardown
 ├── cloudformation/<module>.yaml       CloudFormation or SAM template (source of truth)
-├── lambda/                            Python source, SAM modules only
+├── lambda/                            Python source, SAM modules only (plus a pinned
+│                                      requirements.txt where the runtime SDK lacks newer Quick APIs)
 └── scripts/
     ├── apply-<module>.sh              idempotent deploy / update, prints stack outputs
     └── remove-<module>.sh             teardown
@@ -146,6 +150,7 @@ Each README lists the module-specific flags (for example, the Chat and Feedback 
 
 - Vended-log delivery (Pillars 1 and 2) is per Region: deploy the monitors in every Region with Amazon Quick activity.
 - EventBridge events (Spreadsheet File Rename) fire in the Region where the dataset lives.
+- Asset inventories (Dataset Lifecycle Monitor, Orphaned Assets Monitor) are per Region: deploy one stack per Region that holds Quick assets. The Orphaned Assets Monitor discovers the identity Region (users and groups) automatically when it differs from the asset Region.
 - Custom permissions (Block Sharing) must be called against the account's Quick capacity Region.
 
 ### Suggested adoption sequence
@@ -169,7 +174,7 @@ Operating cost is on the order of a few US dollars per month per module, mostly 
 ├── governance-block-sharing/               Pillar 3 · CloudFormation + Quick APIs
 ├── governance-spreadsheet-file-rename/     Pillar 4 · AWS SAM (Python Lambda)
 ├── governance-dataset-lifecycle-monitor/   Pillar 4 · AWS SAM (Python Lambda)
-└── governance-orphaned-assets-monitor/     Pillar 4 · design draft (README only)
+└── governance-orphaned-assets-monitor/     Pillar 4 · AWS SAM (Python Lambda)
 ```
 
 ## Security
