@@ -1,22 +1,49 @@
 # =============================================================================
-# Amazon Quick - Best Practices
+# Amazon Quick - AI Governance
 #
-# Scoped to the currently published module:
-#   governance-agent-hours-monitor  (Bash helper scripts + CloudFormation)
+# Ignore rules covering every module in this repository:
+#   * Bash helper scripts + CloudFormation templates
+#       governance-agent-hours-monitor, governance-chat-feedback-monitor,
+#       governance-block-sharing
+#   * AWS SAM templates + Python Lambda sources
+#       governance-spreadsheet-file-rename, governance-dataset-lifecycle-monitor
 #
-# That module produces no local build artifacts, so the rules below are just
-# OS / editor / secret hygiene. As additional modules are made ready, add
-# their own ignore rules back here (e.g. Node.js, Python, AWS SAM builds).
+# The templates, scripts, and Lambda sources are the source of truth. Anything
+# generated locally by the AWS SAM CLI, Python tooling, editors, or the OS
+# stays out of git.
 # =============================================================================
 
 # ---- OS ---------------------------------------------------------------------
 .DS_Store
+._*
+Thumbs.db
 
 # ---- Editors / IDEs ---------------------------------------------------------
 .vscode/*
 !.vscode/extensions.json
 .idea/
 *.sw?
+*~
+
+# ---- AWS SAM / CloudFormation build and deploy artifacts --------------------
+# `sam build` output, `sam deploy --guided` config, and `sam package` /
+# `aws cloudformation package` output templates. The apply scripts deploy
+# straight from cloudformation/*.yaml with --resolve-s3, so none of these
+# belong in the repository.
+.aws-sam/
+samconfig.toml
+samconfig.yaml
+packaged.yaml
+packaged-*.yaml
+
+# ---- Python (Lambda sources under */lambda/) --------------------------------
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
 # ---- Environment / secrets --------------------------------------------------
 # The scripts authenticate via AWS profiles / AWS_PROFILE, not .env files, but
@@ -24,3 +51,10 @@
 .env
 .env.*
 !.env.example
+*.pem
+
+# ---- Local scratch output ---------------------------------------------------
+# e.g. `aws lambda invoke ... response.json`, log tails, temporary folders.
+response.json
+*.log
+tmp/
