@@ -1,0 +1,1223 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Amazon Quick agent-hours usage monitor - native Amazon Quick dashboard for
+  administrators. Creates a Glue table over the AGENT_HOURS_LOGS objects
+  delivered to S3, a Direct Query dataset (Athena, custom SQL) and a four-tab
+  dashboard: Overview (KPIs, trends, top consumers), Users, Features and
+  automations, Events (audit). Requires the governance analytics foundation
+  stack in the same Region.
+
+# Prerequisites (NOT created by this stack):
+#   * governance-analytics-foundation deployed in this Region (imports its
+#     Glue database and Quick data source exports).
+#   * The agent-hours feed delivered to S3 by the Agent Hours module.
+#   * Manual, console only: Manage Quick -> Security & permissions -> AWS
+#     resources -> Manage: Amazon Athena enabled and DataBucketName selected.
+#
+# Deploy:
+#   aws cloudformation deploy \
+#       --stack-name quick-governance-agent-hours-quick-dashboard \
+#       --template-file governance-agent-hours-quick-dashboard.yaml --region <REGION> \
+#       --parameter-overrides QuickPrincipalArn=<arn> DataBucketName=<bucket>
+
+Parameters:
+  ResourcePrefix:
+    Type: String
+    Default: 'quick-governance-agent-hours'
+    Description: Prefix for the Quick dataset and dashboard IDs.
+    AllowedPattern: '^[a-z0-9-]{1,40}$'
+
+  FoundationStackName:
+    Type: String
+    Default: 'quick-governance-analytics-foundation'
+    Description: Stack name of the governance analytics foundation (exports are imported).
+    AllowedPattern: '^[A-Za-z][A-Za-z0-9-]{0,127}$'
+
+  DataBucketName:
+    Type: String
+    Default: ''
+    Description: >
+      Bucket holding the agent-hours objects. Empty (default) reads the shared
+      analytics bucket created by the foundation stack. Set it to read a
+      module-owned bucket (<AgentHoursResourcePrefix>-<account-id>) instead,
+      together with DataPrefix=AWSLogs/.
+    AllowedPattern: '^$|^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$'
+
+  DataPrefix:
+    Type: String
+    Default: 'agent-hours/'
+    Description: >
+      Prefix that holds the objects: agent-hours/ in the shared analytics
+      bucket (default), AWSLogs/ in a module-owned bucket.
+    AllowedPattern: '^([A-Za-z0-9_=./-]+/)?$'
+
+  GlueTableName:
+    Type: String
+    Default: 'agent_hours_logs'
+    AllowedPattern: '^[a-z0-9_]{1,128}$'
+    Description: Glue table name inside the foundation database.
+
+  QuickPrincipalArn:
+    Type: String
+    Description: Quick user or group ARN (identity Region) that owns the dataset and dashboard.
+    AllowedPattern: '^arn:aws[a-z-]*:quicksight:[a-z0-9-]+:[0-9]{12}:(user|group)/.+$'
+
+Conditions:
+  UseSharedBucket: !Equals [!Ref DataBucketName, '']
+
+Resources:
+
+  # ----- Glue table: gzip JSON lines, one object per hour, no partitions ----
+  # Same modeling as the tables Quick's console creates for its own vended
+  # logs (OpenX JSON SerDe, TextInputFormat). Athena reads every object under
+  # the location, so the legacy and Hive-compatible layouts coexist.
+
+  GlueTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref 'AWS::AccountId'
+      DatabaseName:
+        Fn::ImportValue: !Sub '${FoundationStackName}-GlueDatabase'
+      TableInput:
+        Name: !Ref GlueTableName
+        Description: Amazon Quick AGENT_HOURS_LOGS vended-log events (see monitoring-cloudwatch-logs.html).
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          classification: json
+          EXTERNAL: 'TRUE'
+        StorageDescriptor:
+          Location: !If
+            - UseSharedBucket
+            - !Sub
+              - 's3://${Bucket}/${DataPrefix}'
+              - Bucket:
+                  Fn::ImportValue: !Sub '${FoundationStackName}-AnalyticsBucket'
+            - !Sub 's3://${DataBucketName}/${DataPrefix}'
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          Compressed: true
+          SerdeInfo:
+            SerializationLibrary: org.openx.data.jsonserde.JsonSerDe
+            Parameters:
+              ignore.malformed.json: 'true'
+              case.insensitive: 'true'
+          Columns:
+            - {Name: user_arn, Type: string}
+            - {Name: subscription_type, Type: string}
+            - {Name: reporting_service, Type: string}
+            - {Name: usage_group, Type: string}
+            - {Name: usage_hours, Type: double}
+            - {Name: service_resource_arn, Type: string}
+            - {Name: resource_arn, Type: string}
+            - {Name: event_timestamp, Type: bigint}
+            - {Name: logtype, Type: string}
+            - {Name: accountid, Type: string}
+
+  # ----- Quick dataset: Direct Query over Athena --------------------------------
+  # Every derived column lives in SQL so the visuals need no calculated fields:
+  # principal / principal_type / principal_label (short display name),
+  # included_hours / extra_hours (coverage split), event_count.
+  # event_timestamp arrives in epoch SECONDS in the delivered objects (the
+  # documentation example shows milliseconds); the CASE handles both.
+
+  DataSet:
+    Type: AWS::QuickSight::DataSet
+    DependsOn: GlueTable
+    Properties:
+      AwsAccountId: !Ref 'AWS::AccountId'
+      DataSetId: !Sub '${ResourcePrefix}-dataset'
+      Name: Quick governance - agent hours
+      ImportMode: DIRECT_QUERY
+      PhysicalTableMap:
+        agenthours:
+          CustomSql:
+            DataSourceArn:
+              Fn::ImportValue: !Sub '${FoundationStackName}-QuickDataSourceArn'
+            Name: agent_hours
+            SqlQuery: !Sub
+              - |
+                SELECT
+                  CAST(from_unixtime(CASE WHEN event_timestamp > 100000000000 THEN event_timestamp / 1000 ELSE event_timestamp END) AS TIMESTAMP) AS event_time,
+                  user_arn,
+                  service_resource_arn,
+                  COALESCE(user_arn, service_resource_arn) AS principal,
+                  CASE WHEN user_arn IS NULL OR user_arn = '' THEN 'Automation' ELSE 'User' END AS principal_type,
+                  CASE WHEN user_arn IS NULL OR user_arn = ''
+                       THEN regexp_replace(service_resource_arn, '^arn:[^:]*:[^:]*:[^:]*:[^:]*:', '')
+                       ELSE regexp_replace(user_arn, '^.*:user/', '') END AS principal_label,
+                  CASE WHEN user_arn IS NULL OR user_arn = '' THEN service_resource_arn END AS automation_resource,
+                  reporting_service,
+                  usage_group,
+                  subscription_type,
+                  usage_hours,
+                  CASE WHEN usage_group = 'Included' THEN usage_hours ELSE 0 END AS included_hours,
+                  CASE WHEN usage_group = 'Extra' THEN usage_hours ELSE 0 END AS extra_hours,
+                  1 AS event_count,
+                  CASE reporting_service
+                    WHEN 'FLOW' THEN 'Quick Flows'
+                    WHEN 'AUTOMATION' THEN 'Quick Automate'
+                    WHEN 'RESEARCH' THEN 'Quick Research'
+                    WHEN 'PAGES_RUNTIME' THEN 'Apps in Quick (custom applications)'
+                    WHEN 'ARTIFACT_GENERATION' THEN 'Artifact generation (documents, presentations, images)'
+                    WHEN 'STRUCTURED_DATA_QUERY' THEN 'Questions over structured data (datasets and Topics in chat)'
+                    ELSE reporting_service END AS feature_label,
+                  CASE reporting_service
+                    WHEN 'FLOW' THEN 'Runtime while a user-created workflow is actively executing, excluding idle and waiting time.'
+                    WHEN 'AUTOMATION' THEN 'Runtime of deployed, centrally managed automations; runs unattended, so events carry no user.'
+                    WHEN 'RESEARCH' THEN 'Time from a research request until the report completes.'
+                    WHEN 'PAGES_RUNTIME' THEN 'Runtime of AI-powered custom applications built with apps in Quick.'
+                    WHEN 'ARTIFACT_GENERATION' THEN 'Time spent generating documents, presentations, spreadsheets and images from chat.'
+                    WHEN 'STRUCTURED_DATA_QUERY' THEN 'Natural-language questions answered by generating queries over datasets and Topics in chat.'
+                    ELSE 'Code not yet described by AWS documentation. Check the metered activities list for the current set of features.' END AS feature_description,
+                  CASE reporting_service
+                    WHEN 'FLOW' THEN 'AWS documentation'
+                    WHEN 'AUTOMATION' THEN 'AWS documentation'
+                    WHEN 'RESEARCH' THEN 'AWS documentation'
+                    WHEN 'PAGES_RUNTIME' THEN 'AWS documentation (feature); code mapping inferred from its name'
+                    WHEN 'ARTIFACT_GENERATION' THEN 'AWS documentation'
+                    WHEN 'STRUCTURED_DATA_QUERY' THEN 'Inferred from the code name; not documented as a code'
+                    ELSE 'Undocumented' END AS feature_source,
+                  CASE reporting_service
+                    WHEN 'FLOW' THEN 'https://docs.aws.amazon.com/quick/latest/userguide/using-amazon-quick-flows.html'
+                    WHEN 'AUTOMATION' THEN 'https://docs.aws.amazon.com/quick/latest/userguide/using-amazon-quick-automations.html'
+                    WHEN 'RESEARCH' THEN 'https://docs.aws.amazon.com/quick/latest/userguide/using-amazon-quick-research.html'
+                    WHEN 'PAGES_RUNTIME' THEN 'https://docs.aws.amazon.com/quick/latest/userguide/using-amazon-quick-apps.html'
+                    WHEN 'ARTIFACT_GENERATION' THEN 'https://docs.aws.amazon.com/quick/latest/userguide/using-quick-chat.html'
+                    WHEN 'STRUCTURED_DATA_QUERY' THEN 'https://docs.aws.amazon.com/quick/latest/userguide/topics-in-chat.html'
+                    ELSE 'https://docs.aws.amazon.com/quick/latest/userguide/limit-profiles.html' END AS feature_doc_url
+                FROM "${Db}"."${GlueTableName}"
+                WHERE event_timestamp IS NOT NULL
+              - Db:
+                  Fn::ImportValue: !Sub '${FoundationStackName}-GlueDatabase'
+            Columns:
+              - {Name: event_time, Type: DATETIME}
+              - {Name: user_arn, Type: STRING}
+              - {Name: service_resource_arn, Type: STRING}
+              - {Name: principal, Type: STRING}
+              - {Name: principal_type, Type: STRING}
+              - {Name: principal_label, Type: STRING}
+              - {Name: automation_resource, Type: STRING}
+              - {Name: reporting_service, Type: STRING}
+              - {Name: usage_group, Type: STRING}
+              - {Name: subscription_type, Type: STRING}
+              - {Name: usage_hours, Type: DECIMAL}
+              - {Name: included_hours, Type: DECIMAL}
+              - {Name: extra_hours, Type: DECIMAL}
+              - {Name: event_count, Type: INTEGER}
+              - {Name: feature_label, Type: STRING}
+              - {Name: feature_description, Type: STRING}
+              - {Name: feature_source, Type: STRING}
+              - {Name: feature_doc_url, Type: STRING}
+      LogicalTableMap:
+        agenthours:
+          Alias: agent_hours
+          Source:
+            PhysicalTableId: agenthours
+      Permissions:
+        - Principal: !Ref QuickPrincipalArn
+          Actions:
+            - quicksight:DescribeDataSet
+            - quicksight:DescribeDataSetPermissions
+            - quicksight:PassDataSet
+            - quicksight:DescribeIngestion
+            - quicksight:ListIngestions
+            - quicksight:UpdateDataSet
+            - quicksight:DeleteDataSet
+            - quicksight:CreateIngestion
+            - quicksight:CancelIngestion
+            - quicksight:UpdateDataSetPermissions
+      Tags:
+        - Key: Purpose
+          Value: !Ref ResourcePrefix
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ----- Quick dashboard: administrator view, four tabs -------------------------
+  # Controls live in the collapsible top control bar (SheetControlLayouts), not
+  # on the canvas. Parameters drive the filters so the same controls repeat on
+  # every tab.
+
+  Dashboard:
+    Type: AWS::QuickSight::Dashboard
+    Properties:
+      AwsAccountId: !Ref 'AWS::AccountId'
+      DashboardId: !Sub '${ResourcePrefix}-dashboard'
+      Name: Amazon Quick - agent hours usage
+      VersionDescription: Administrator dashboard - Overview, Users, Features and automations, Events.
+      DashboardPublishOptions:
+        AdHocFilteringOption: {AvailabilityStatus: ENABLED}
+        ExportToCSVOption: {AvailabilityStatus: ENABLED}
+        SheetControlsOption: {VisibilityState: EXPANDED}
+      Permissions:
+        - Principal: !Ref QuickPrincipalArn
+          Actions:
+            - quicksight:DescribeDashboard
+            - quicksight:ListDashboardVersions
+            - quicksight:UpdateDashboardPermissions
+            - quicksight:QueryDashboard
+            - quicksight:UpdateDashboard
+            - quicksight:DeleteDashboard
+            - quicksight:DescribeDashboardPermissions
+            - quicksight:UpdateDashboardPublishedVersion
+      Definition:
+        DataSetIdentifierDeclarations:
+          - Identifier: agent_hours
+            DataSetArn: !GetAtt DataSet.Arn
+        ParameterDeclarations:
+          - DateTimeParameterDeclaration:
+              Name: pStart
+              TimeGranularity: DAY
+              DefaultValues:
+                RollingDate:
+                  Expression: "addDateTime(-3, 'MM', truncDate('MM', now()))"
+          - DateTimeParameterDeclaration:
+              Name: pEnd
+              TimeGranularity: DAY
+              DefaultValues:
+                RollingDate:
+                  Expression: "addDateTime(1, 'DD', truncDate('DD', now()))"
+        CalculatedFields:
+          - DataSetIdentifier: agent_hours
+            Name: pct_extra
+            Expression: "ifelse(sum({usage_hours}) = 0, 0, sum({extra_hours}) / sum({usage_hours}))"
+        FilterGroups:
+          - FilterGroupId: fg-range
+            CrossDataset: SINGLE_DATASET
+            Status: ENABLED
+            Filters:
+              - TimeRangeFilter:
+                  FilterId: f-range
+                  Column: {DataSetIdentifier: agent_hours, ColumnName: event_time}
+                  IncludeMinimum: true
+                  IncludeMaximum: false
+                  RangeMinimumValue: {Parameter: pStart}
+                  RangeMaximumValue: {Parameter: pEnd}
+                  NullOption: NON_NULLS_ONLY
+                  TimeGranularity: DAY
+            ScopeConfiguration:
+              AllSheets: {}
+          - FilterGroupId: fg-features-ov
+            CrossDataset: SINGLE_DATASET
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-features-ov
+                  Column: {DataSetIdentifier: agent_hours, ColumnName: reporting_service}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      SelectAllOptions: FILTER_ALL_VALUES
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-overview
+                    Scope: ALL_VISUALS
+          - FilterGroupId: fg-coverage-ov
+            CrossDataset: SINGLE_DATASET
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-coverage-ov
+                  Column: {DataSetIdentifier: agent_hours, ColumnName: usage_group}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      SelectAllOptions: FILTER_ALL_VALUES
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-overview
+                    Scope: ALL_VISUALS
+          - FilterGroupId: fg-features-us
+            CrossDataset: SINGLE_DATASET
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-features-us
+                  Column: {DataSetIdentifier: agent_hours, ColumnName: reporting_service}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      SelectAllOptions: FILTER_ALL_VALUES
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-users
+                    Scope: ALL_VISUALS
+          - FilterGroupId: fg-coverage-us
+            CrossDataset: SINGLE_DATASET
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-coverage-us
+                  Column: {DataSetIdentifier: agent_hours, ColumnName: usage_group}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      SelectAllOptions: FILTER_ALL_VALUES
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-users
+                    Scope: ALL_VISUALS
+          - FilterGroupId: fg-features-ft
+            CrossDataset: SINGLE_DATASET
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-features-ft
+                  Column: {DataSetIdentifier: agent_hours, ColumnName: reporting_service}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      SelectAllOptions: FILTER_ALL_VALUES
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-features
+                    Scope: ALL_VISUALS
+          - FilterGroupId: fg-coverage-ft
+            CrossDataset: SINGLE_DATASET
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-coverage-ft
+                  Column: {DataSetIdentifier: agent_hours, ColumnName: usage_group}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      SelectAllOptions: FILTER_ALL_VALUES
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-features
+                    Scope: ALL_VISUALS
+          - FilterGroupId: fg-features-ev
+            CrossDataset: SINGLE_DATASET
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-features-ev
+                  Column: {DataSetIdentifier: agent_hours, ColumnName: reporting_service}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      SelectAllOptions: FILTER_ALL_VALUES
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-events
+                    Scope: ALL_VISUALS
+          - FilterGroupId: fg-coverage-ev
+            CrossDataset: SINGLE_DATASET
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-coverage-ev
+                  Column: {DataSetIdentifier: agent_hours, ColumnName: usage_group}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      SelectAllOptions: FILTER_ALL_VALUES
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-events
+                    Scope: ALL_VISUALS
+          # Over-entitlement visuals only show principals with chargeable hours.
+          # One group per sheet: Quick only allows SELECTED_VISUALS scope within a
+          # single sheet.
+          - FilterGroupId: fg-has-extra-users
+            CrossDataset: SINGLE_DATASET
+            Status: ENABLED
+            Filters:
+              - NumericRangeFilter:
+                  FilterId: f-has-extra-users
+                  Column: {DataSetIdentifier: agent_hours, ColumnName: extra_hours}
+                  AggregationFunction: {NumericalAggregationFunction: {SimpleNumericalAggregation: SUM}}
+                  IncludeMinimum: false
+                  RangeMinimum: {StaticValue: 0}
+                  NullOption: NON_NULLS_ONLY
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-users
+                    Scope: SELECTED_VISUALS
+                    VisualIds: [bar-extra-users]
+          - FilterGroupId: fg-has-extra-automations
+            CrossDataset: SINGLE_DATASET
+            Status: ENABLED
+            Filters:
+              - NumericRangeFilter:
+                  FilterId: f-has-extra-automations
+                  Column: {DataSetIdentifier: agent_hours, ColumnName: extra_hours}
+                  AggregationFunction: {NumericalAggregationFunction: {SimpleNumericalAggregation: SUM}}
+                  IncludeMinimum: false
+                  RangeMinimum: {StaticValue: 0}
+                  NullOption: NON_NULLS_ONLY
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-features
+                    Scope: SELECTED_VISUALS
+                    VisualIds: [bar-extra-automations]
+          - FilterGroupId: fg-automations-only
+            CrossDataset: SINGLE_DATASET
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-automations-only
+                  Column: {DataSetIdentifier: agent_hours, ColumnName: principal_type}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      CategoryValues: [Automation]
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-features
+                    Scope: SELECTED_VISUALS
+                    VisualIds: [tbl-automations, bar-extra-automations]
+          - FilterGroupId: fg-users-only
+            CrossDataset: SINGLE_DATASET
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-users-only
+                  Column: {DataSetIdentifier: agent_hours, ColumnName: principal_type}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      CategoryValues: [User]
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-users
+                    Scope: SELECTED_VISUALS
+                    VisualIds: [tbl-users, pivot-users-features, bar-extra-users]
+        Sheets:
+          # ===================== Tab 1: Overview =====================
+          - SheetId: sh-overview
+            Name: Overview
+            Title: Agent hours - overview
+            Description: Consumption, license coverage and who drives it, for the selected period.
+            FilterControls:
+              - Dropdown:
+                  FilterControlId: fc-ov-features
+                  Title: Feature
+                  SourceFilterId: f-features-ov
+                  Type: MULTI_SELECT
+                  DisplayOptions:
+                    SelectAllOptions: {Visibility: VISIBLE}
+                    TitleOptions: {Visibility: VISIBLE}
+              - Dropdown:
+                  FilterControlId: fc-ov-coverage
+                  Title: Coverage
+                  SourceFilterId: f-coverage-ov
+                  Type: MULTI_SELECT
+                  DisplayOptions:
+                    SelectAllOptions: {Visibility: VISIBLE}
+                    TitleOptions: {Visibility: VISIBLE}
+            ParameterControls:
+              - DateTimePicker:
+                  ParameterControlId: pc-ov-start
+                  Title: From
+                  SourceParameterName: pStart
+                  DisplayOptions: {DateTimeFormat: 'YYYY-MM-DD'}
+              - DateTimePicker:
+                  ParameterControlId: pc-ov-end
+                  Title: To (exclusive)
+                  SourceParameterName: pEnd
+                  DisplayOptions: {DateTimeFormat: 'YYYY-MM-DD'}
+            SheetControlLayouts:
+              - Configuration:
+                  GridLayout:
+                    Elements:
+                      - {ElementId: pc-ov-start, ElementType: PARAMETER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: pc-ov-end, ElementType: PARAMETER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: fc-ov-features, ElementType: FILTER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: fc-ov-coverage, ElementType: FILTER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+            Visuals:
+              - KPIVisual:
+                  VisualId: kpi-total
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Agent hours'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      Values:
+                        - NumericalMeasureField:
+                            FieldId: kpi-total-v
+                            Column: {DataSetIdentifier: agent_hours, ColumnName: usage_hours}
+                            AggregationFunction: {SimpleNumericalAggregation: SUM}
+                            FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 2}}}}
+              - KPIVisual:
+                  VisualId: kpi-included
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Included (entitlement)'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      Values:
+                        - NumericalMeasureField:
+                            FieldId: kpi-included-v
+                            Column: {DataSetIdentifier: agent_hours, ColumnName: included_hours}
+                            AggregationFunction: {SimpleNumericalAggregation: SUM}
+                            FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 2}}}}
+              - KPIVisual:
+                  VisualId: kpi-extra
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Extra (chargeable)'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      Values:
+                        - NumericalMeasureField:
+                            FieldId: kpi-extra-v
+                            Column: {DataSetIdentifier: agent_hours, ColumnName: extra_hours}
+                            AggregationFunction: {SimpleNumericalAggregation: SUM}
+                            FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 2}}}}
+              - KPIVisual:
+                  VisualId: kpi-pct-extra
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Chargeable share'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      Values:
+                        - NumericalMeasureField:
+                            FieldId: kpi-pct-extra-v
+                            Column: {DataSetIdentifier: agent_hours, ColumnName: pct_extra}
+                            FormatConfiguration: {FormatConfiguration: {PercentageDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 1}}}}
+              - KPIVisual:
+                  VisualId: kpi-users
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Active users'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      Values:
+                        - CategoricalMeasureField:
+                            FieldId: kpi-users-v
+                            Column: {DataSetIdentifier: agent_hours, ColumnName: user_arn}
+                            AggregationFunction: DISTINCT_COUNT
+              - KPIVisual:
+                  VisualId: kpi-automations
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Automations (scheduled or deployed)'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      Values:
+                        - CategoricalMeasureField:
+                            FieldId: kpi-automations-v
+                            Column: {DataSetIdentifier: agent_hours, ColumnName: automation_resource}
+                            AggregationFunction: DISTINCT_COUNT
+              - KPIVisual:
+                  VisualId: kpi-features
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Features in use'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      Values:
+                        - CategoricalMeasureField:
+                            FieldId: kpi-features-v
+                            Column: {DataSetIdentifier: agent_hours, ColumnName: reporting_service}
+                            AggregationFunction: DISTINCT_COUNT
+              - LineChartVisual:
+                  VisualId: line-feature-trend
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Daily agent hours by feature'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      LineChartAggregatedFieldWells:
+                        Category:
+                          - DateDimensionField:
+                              FieldId: lf-day
+                              Column: {DataSetIdentifier: agent_hours, ColumnName: event_time}
+                              DateGranularity: DAY
+                        Values:
+                          - NumericalMeasureField:
+                              FieldId: lf-hours
+                              Column: {DataSetIdentifier: agent_hours, ColumnName: usage_hours}
+                              AggregationFunction: {SimpleNumericalAggregation: SUM}
+                        Colors:
+                          - CategoricalDimensionField:
+                              FieldId: lf-service
+                              Column: {DataSetIdentifier: agent_hours, ColumnName: reporting_service}
+                    Type: LINE
+                    Legend: {Visibility: VISIBLE, Position: BOTTOM}
+              - BarChartVisual:
+                  VisualId: bar-coverage-trend
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Daily license coverage - Included vs Extra'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      BarChartAggregatedFieldWells:
+                        Category:
+                          - DateDimensionField:
+                              FieldId: ct-day
+                              Column: {DataSetIdentifier: agent_hours, ColumnName: event_time}
+                              DateGranularity: DAY
+                        Values:
+                          - NumericalMeasureField:
+                              FieldId: ct-hours
+                              Column: {DataSetIdentifier: agent_hours, ColumnName: usage_hours}
+                              AggregationFunction: {SimpleNumericalAggregation: SUM}
+                        Colors:
+                          - CategoricalDimensionField:
+                              FieldId: ct-group
+                              Column: {DataSetIdentifier: agent_hours, ColumnName: usage_group}
+                    Orientation: VERTICAL
+                    BarsArrangement: STACKED
+                    Legend: {Visibility: VISIBLE, Position: BOTTOM}
+              - BarChartVisual:
+                  VisualId: bar-top-consumers
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Top 10 consumers (users and automations)'}}
+                  Subtitle: {Visibility: VISIBLE, FormatText: {PlainText: 'Full ranking on the Users and Features tabs'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      BarChartAggregatedFieldWells:
+                        Category:
+                          - CategoricalDimensionField:
+                              FieldId: tc-principal
+                              Column: {DataSetIdentifier: agent_hours, ColumnName: principal_label}
+                        Values:
+                          - NumericalMeasureField:
+                              FieldId: tc-hours
+                              Column: {DataSetIdentifier: agent_hours, ColumnName: usage_hours}
+                              AggregationFunction: {SimpleNumericalAggregation: SUM}
+                        Colors:
+                          - CategoricalDimensionField:
+                              FieldId: tc-type
+                              Column: {DataSetIdentifier: agent_hours, ColumnName: principal_type}
+                    SortConfiguration:
+                      CategorySort:
+                        - FieldSort: {FieldId: tc-hours, Direction: DESC}
+                      CategoryItemsLimit: {ItemsLimit: 10, OtherCategories: EXCLUDE}
+                    Orientation: HORIZONTAL
+                    BarsArrangement: STACKED
+                    Legend: {Visibility: VISIBLE, Position: BOTTOM}
+            TextBoxes:
+              - SheetTextBoxId: txt-howto
+                Content: >-
+                  <text-box><block align="left"><inline font-weight="bold">How to read this dashboard.</inline> An agent hour is the
+                  metered unit of AI usage in Amazon Quick (Research, Flows, Automate, apps, chat over data, artifact
+                  generation), metered per second while Quick is actively working. Included hours fall within the
+                  subscription entitlement; Extra hours are billed as overage. Events without a user are scheduled or
+                  deployed automations and are attributed to the resource that ran them. The Features and automations tab
+                  has a glossary of the reporting_service codes with links to the documentation.</block></text-box>
+            Layouts:
+              - Configuration:
+                  GridLayout:
+                    CanvasSizeOptions:
+                      ScreenCanvasSizeOptions: {ResizeOption: FIXED, OptimizedViewPortWidth: '1600px'}
+                    Elements:
+                      - {ElementId: kpi-total, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 5, RowIndex: 0, RowSpan: 5}
+                      - {ElementId: kpi-included, ElementType: VISUAL, ColumnIndex: 5, ColumnSpan: 5, RowIndex: 0, RowSpan: 5}
+                      - {ElementId: kpi-extra, ElementType: VISUAL, ColumnIndex: 10, ColumnSpan: 5, RowIndex: 0, RowSpan: 5}
+                      - {ElementId: kpi-pct-extra, ElementType: VISUAL, ColumnIndex: 15, ColumnSpan: 5, RowIndex: 0, RowSpan: 5}
+                      - {ElementId: kpi-users, ElementType: VISUAL, ColumnIndex: 20, ColumnSpan: 5, RowIndex: 0, RowSpan: 5}
+                      - {ElementId: kpi-automations, ElementType: VISUAL, ColumnIndex: 25, ColumnSpan: 6, RowIndex: 0, RowSpan: 5}
+                      - {ElementId: kpi-features, ElementType: VISUAL, ColumnIndex: 31, ColumnSpan: 5, RowIndex: 0, RowSpan: 5}
+                      - {ElementId: line-feature-trend, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 18, RowIndex: 5, RowSpan: 12}
+                      - {ElementId: bar-coverage-trend, ElementType: VISUAL, ColumnIndex: 18, ColumnSpan: 18, RowIndex: 5, RowSpan: 12}
+                      - {ElementId: bar-top-consumers, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 36, RowIndex: 17, RowSpan: 12}
+                      - {ElementId: txt-howto, ElementType: TEXT_BOX, ColumnIndex: 0, ColumnSpan: 36, RowIndex: 29, RowSpan: 3}
+          # ===================== Tab 2: Users =====================
+          - SheetId: sh-users
+            Name: Users
+            Title: Users
+            Description: Interactive consumption per user - hours, coverage split, features used, first and last activity.
+            FilterControls:
+              - Dropdown:
+                  FilterControlId: fc-us-features
+                  Title: Feature
+                  SourceFilterId: f-features-us
+                  Type: MULTI_SELECT
+                  DisplayOptions:
+                    SelectAllOptions: {Visibility: VISIBLE}
+                    TitleOptions: {Visibility: VISIBLE}
+              - Dropdown:
+                  FilterControlId: fc-us-coverage
+                  Title: Coverage
+                  SourceFilterId: f-coverage-us
+                  Type: MULTI_SELECT
+                  DisplayOptions:
+                    SelectAllOptions: {Visibility: VISIBLE}
+                    TitleOptions: {Visibility: VISIBLE}
+            ParameterControls:
+              - DateTimePicker:
+                  ParameterControlId: pc-us-start
+                  Title: From
+                  SourceParameterName: pStart
+                  DisplayOptions: {DateTimeFormat: 'YYYY-MM-DD'}
+              - DateTimePicker:
+                  ParameterControlId: pc-us-end
+                  Title: To (exclusive)
+                  SourceParameterName: pEnd
+                  DisplayOptions: {DateTimeFormat: 'YYYY-MM-DD'}
+            SheetControlLayouts:
+              - Configuration:
+                  GridLayout:
+                    Elements:
+                      - {ElementId: pc-us-start, ElementType: PARAMETER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: pc-us-end, ElementType: PARAMETER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: fc-us-features, ElementType: FILTER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: fc-us-coverage, ElementType: FILTER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+            Visuals:
+              - TableVisual:
+                  VisualId: tbl-users
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Users - hours, coverage and activity (sorted by hours)'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      TableAggregatedFieldWells:
+                        GroupBy:
+                          - CategoricalDimensionField:
+                              FieldId: us-user
+                              Column: {DataSetIdentifier: agent_hours, ColumnName: principal_label}
+                        Values:
+                          - NumericalMeasureField:
+                              FieldId: us-hours
+                              Column: {DataSetIdentifier: agent_hours, ColumnName: usage_hours}
+                              AggregationFunction: {SimpleNumericalAggregation: SUM}
+                              FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 3}}}}
+                          - NumericalMeasureField:
+                              FieldId: us-included
+                              Column: {DataSetIdentifier: agent_hours, ColumnName: included_hours}
+                              AggregationFunction: {SimpleNumericalAggregation: SUM}
+                              FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 3}}}}
+                          - NumericalMeasureField:
+                              FieldId: us-extra
+                              Column: {DataSetIdentifier: agent_hours, ColumnName: extra_hours}
+                              AggregationFunction: {SimpleNumericalAggregation: SUM}
+                              FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 3}}}}
+                          - CategoricalMeasureField:
+                              FieldId: us-features
+                              Column: {DataSetIdentifier: agent_hours, ColumnName: reporting_service}
+                              AggregationFunction: DISTINCT_COUNT
+                          - NumericalMeasureField:
+                              FieldId: us-events
+                              Column: {DataSetIdentifier: agent_hours, ColumnName: event_count}
+                              AggregationFunction: {SimpleNumericalAggregation: SUM}
+                          - DateMeasureField:
+                              FieldId: us-first
+                              Column: {DataSetIdentifier: agent_hours, ColumnName: event_time}
+                              AggregationFunction: MIN
+                              FormatConfiguration: {DateTimeFormat: 'YYYY-MM-DD HH:mm'}
+                          - DateMeasureField:
+                              FieldId: us-last
+                              Column: {DataSetIdentifier: agent_hours, ColumnName: event_time}
+                              AggregationFunction: MAX
+                              FormatConfiguration: {DateTimeFormat: 'YYYY-MM-DD HH:mm'}
+                    SortConfiguration:
+                      RowSort:
+                        - FieldSort: {FieldId: us-hours, Direction: DESC}
+                    FieldOptions:
+                      SelectedFieldOptions:
+                        - {FieldId: us-user, CustomLabel: User}
+                        - {FieldId: us-hours, CustomLabel: Agent hours}
+                        - {FieldId: us-included, CustomLabel: Included}
+                        - {FieldId: us-extra, CustomLabel: Extra (chargeable)}
+                        - {FieldId: us-features, CustomLabel: Features used}
+                        - {FieldId: us-events, CustomLabel: Events}
+                        - {FieldId: us-first, CustomLabel: First activity}
+                        - {FieldId: us-last, CustomLabel: Last activity}
+                  ConditionalFormatting:
+                    ConditionalFormattingOptions:
+                      - Cell:
+                          FieldId: us-extra
+                          TextFormat:
+                            TextColor:
+                              Solid: {Expression: 'sum({extra_hours}) > 0', Color: '#D91515'}
+              - PivotTableVisual:
+                  VisualId: pivot-users-features
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Agent hours by user and feature'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      PivotTableAggregatedFieldWells:
+                        Rows:
+                          - CategoricalDimensionField:
+                              FieldId: pv-user
+                              Column: {DataSetIdentifier: agent_hours, ColumnName: principal_label}
+                        Columns:
+                          - CategoricalDimensionField:
+                              FieldId: pv-service
+                              Column: {DataSetIdentifier: agent_hours, ColumnName: reporting_service}
+                        Values:
+                          - NumericalMeasureField:
+                              FieldId: pv-hours
+                              Column: {DataSetIdentifier: agent_hours, ColumnName: usage_hours}
+                              AggregationFunction: {SimpleNumericalAggregation: SUM}
+                              FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 3}}}}
+                    TotalOptions:
+                      RowTotalOptions: {TotalsVisibility: VISIBLE}
+                      ColumnTotalOptions: {TotalsVisibility: VISIBLE}
+              - BarChartVisual:
+                  VisualId: bar-extra-users
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Users over entitlement - chargeable hours'}}
+                  Subtitle: {Visibility: VISIBLE, FormatText: {PlainText: 'Only users with Extra hours in the selected period'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      BarChartAggregatedFieldWells:
+                        Category:
+                          - CategoricalDimensionField:
+                              FieldId: eu-user
+                              Column: {DataSetIdentifier: agent_hours, ColumnName: principal_label}
+                        Values:
+                          - NumericalMeasureField:
+                              FieldId: eu-extra
+                              Column: {DataSetIdentifier: agent_hours, ColumnName: extra_hours}
+                              AggregationFunction: {SimpleNumericalAggregation: SUM}
+                    SortConfiguration:
+                      CategorySort:
+                        - FieldSort: {FieldId: eu-extra, Direction: DESC}
+                    Orientation: HORIZONTAL
+                    BarsArrangement: CLUSTERED
+            Layouts:
+              - Configuration:
+                  GridLayout:
+                    CanvasSizeOptions:
+                      ScreenCanvasSizeOptions: {ResizeOption: FIXED, OptimizedViewPortWidth: '1600px'}
+                    Elements:
+                      - {ElementId: tbl-users, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 36, RowIndex: 0, RowSpan: 14}
+                      - {ElementId: pivot-users-features, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 22, RowIndex: 14, RowSpan: 14}
+                      - {ElementId: bar-extra-users, ElementType: VISUAL, ColumnIndex: 22, ColumnSpan: 14, RowIndex: 14, RowSpan: 14}
+          # ===================== Tab 3: Features and automations =====================
+          - SheetId: sh-features
+            Name: Features and automations
+            Title: Features and automations
+            Description: Which Quick surfaces consume agent hours, and the scheduled or deployed automations behind unattended consumption.
+            FilterControls:
+              - Dropdown:
+                  FilterControlId: fc-ft-features
+                  Title: Feature
+                  SourceFilterId: f-features-ft
+                  Type: MULTI_SELECT
+                  DisplayOptions:
+                    SelectAllOptions: {Visibility: VISIBLE}
+                    TitleOptions: {Visibility: VISIBLE}
+              - Dropdown:
+                  FilterControlId: fc-ft-coverage
+                  Title: Coverage
+                  SourceFilterId: f-coverage-ft
+                  Type: MULTI_SELECT
+                  DisplayOptions:
+                    SelectAllOptions: {Visibility: VISIBLE}
+                    TitleOptions: {Visibility: VISIBLE}
+            ParameterControls:
+              - DateTimePicker:
+                  ParameterControlId: pc-ft-start
+                  Title: From
+                  SourceParameterName: pStart
+                  DisplayOptions: {DateTimeFormat: 'YYYY-MM-DD'}
+              - DateTimePicker:
+                  ParameterControlId: pc-ft-end
+                  Title: To (exclusive)
+                  SourceParameterName: pEnd
+                  DisplayOptions: {DateTimeFormat: 'YYYY-MM-DD'}
+            SheetControlLayouts:
+              - Configuration:
+                  GridLayout:
+                    Elements:
+                      - {ElementId: pc-ft-start, ElementType: PARAMETER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: pc-ft-end, ElementType: PARAMETER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: fc-ft-features, ElementType: FILTER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: fc-ft-coverage, ElementType: FILTER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+            Visuals:
+              - TableVisual:
+                  VisualId: tbl-features
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Features - hours, coverage, users and automations'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      TableAggregatedFieldWells:
+                        GroupBy:
+                          - CategoricalDimensionField:
+                              FieldId: ft-service
+                              Column: {DataSetIdentifier: agent_hours, ColumnName: reporting_service}
+                        Values:
+                          - NumericalMeasureField:
+                              FieldId: ft-hours
+                              Column: {DataSetIdentifier: agent_hours, ColumnName: usage_hours}
+                              AggregationFunction: {SimpleNumericalAggregation: SUM}
+                              FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 3}}}}
+                          - NumericalMeasureField:
+                              FieldId: ft-included
+                              Column: {DataSetIdentifier: agent_hours, ColumnName: included_hours}
+                              AggregationFunction: {SimpleNumericalAggregation: SUM}
+                              FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 3}}}}
+                          - NumericalMeasureField:
+                              FieldId: ft-extra
+                              Column: {DataSetIdentifier: agent_hours, ColumnName: extra_hours}
+                              AggregationFunction: {SimpleNumericalAggregation: SUM}
+                              FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 3}}}}
+                          - CategoricalMeasureField:
+                              FieldId: ft-users
+                              Column: {DataSetIdentifier: agent_hours, ColumnName: user_arn}
+                              AggregationFunction: DISTINCT_COUNT
+                          - CategoricalMeasureField:
+                              FieldId: ft-automations
+                              Column: {DataSetIdentifier: agent_hours, ColumnName: automation_resource}
+                              AggregationFunction: DISTINCT_COUNT
+                          - NumericalMeasureField:
+                              FieldId: ft-events
+                              Column: {DataSetIdentifier: agent_hours, ColumnName: event_count}
+                              AggregationFunction: {SimpleNumericalAggregation: SUM}
+                    SortConfiguration:
+                      RowSort:
+                        - FieldSort: {FieldId: ft-hours, Direction: DESC}
+                    FieldOptions:
+                      SelectedFieldOptions:
+                        - {FieldId: ft-service, CustomLabel: Feature}
+                        - {FieldId: ft-hours, CustomLabel: Agent hours}
+                        - {FieldId: ft-included, CustomLabel: Included}
+                        - {FieldId: ft-extra, CustomLabel: Extra (chargeable)}
+                        - {FieldId: ft-users, CustomLabel: Users}
+                        - {FieldId: ft-automations, CustomLabel: Automations}
+                        - {FieldId: ft-events, CustomLabel: Events}
+              - BarChartVisual:
+                  VisualId: bar-feature-coverage
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Agent hours by feature - Included vs Extra'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      BarChartAggregatedFieldWells:
+                        Category:
+                          - CategoricalDimensionField:
+                              FieldId: fc-service
+                              Column: {DataSetIdentifier: agent_hours, ColumnName: reporting_service}
+                        Values:
+                          - NumericalMeasureField:
+                              FieldId: fc-hours
+                              Column: {DataSetIdentifier: agent_hours, ColumnName: usage_hours}
+                              AggregationFunction: {SimpleNumericalAggregation: SUM}
+                        Colors:
+                          - CategoricalDimensionField:
+                              FieldId: fc-group
+                              Column: {DataSetIdentifier: agent_hours, ColumnName: usage_group}
+                    SortConfiguration:
+                      CategorySort:
+                        - FieldSort: {FieldId: fc-hours, Direction: DESC}
+                    Orientation: HORIZONTAL
+                    BarsArrangement: STACKED
+                    Legend: {Visibility: VISIBLE, Position: BOTTOM}
+              - TableVisual:
+                  VisualId: tbl-automations
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Automations - unattended consumption by resource'}}
+                  Subtitle: {Visibility: VISIBLE, FormatText: {PlainText: 'Events without a user - scheduled or deployed flows, automations and research'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      TableAggregatedFieldWells:
+                        GroupBy:
+                          - CategoricalDimensionField:
+                              FieldId: au-resource
+                              Column: {DataSetIdentifier: agent_hours, ColumnName: principal_label}
+                          - CategoricalDimensionField:
+                              FieldId: au-service
+                              Column: {DataSetIdentifier: agent_hours, ColumnName: reporting_service}
+                        Values:
+                          - NumericalMeasureField:
+                              FieldId: au-hours
+                              Column: {DataSetIdentifier: agent_hours, ColumnName: usage_hours}
+                              AggregationFunction: {SimpleNumericalAggregation: SUM}
+                              FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 3}}}}
+                          - NumericalMeasureField:
+                              FieldId: au-extra
+                              Column: {DataSetIdentifier: agent_hours, ColumnName: extra_hours}
+                              AggregationFunction: {SimpleNumericalAggregation: SUM}
+                              FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 3}}}}
+                          - NumericalMeasureField:
+                              FieldId: au-runs
+                              Column: {DataSetIdentifier: agent_hours, ColumnName: event_count}
+                              AggregationFunction: {SimpleNumericalAggregation: SUM}
+                          - DateMeasureField:
+                              FieldId: au-last
+                              Column: {DataSetIdentifier: agent_hours, ColumnName: event_time}
+                              AggregationFunction: MAX
+                              FormatConfiguration: {DateTimeFormat: 'YYYY-MM-DD HH:mm'}
+                    SortConfiguration:
+                      RowSort:
+                        - FieldSort: {FieldId: au-hours, Direction: DESC}
+                    FieldOptions:
+                      SelectedFieldOptions:
+                        - {FieldId: au-resource, CustomLabel: Resource}
+                        - {FieldId: au-service, CustomLabel: Feature}
+                        - {FieldId: au-hours, CustomLabel: Agent hours}
+                        - {FieldId: au-extra, CustomLabel: Extra (chargeable)}
+                        - {FieldId: au-runs, CustomLabel: Events}
+                        - {FieldId: au-last, CustomLabel: Last run}
+              - BarChartVisual:
+                  VisualId: bar-extra-automations
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Automations over entitlement - chargeable hours'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      BarChartAggregatedFieldWells:
+                        Category:
+                          - CategoricalDimensionField:
+                              FieldId: ea-resource
+                              Column: {DataSetIdentifier: agent_hours, ColumnName: principal_label}
+                        Values:
+                          - NumericalMeasureField:
+                              FieldId: ea-extra
+                              Column: {DataSetIdentifier: agent_hours, ColumnName: extra_hours}
+                              AggregationFunction: {SimpleNumericalAggregation: SUM}
+                    SortConfiguration:
+                      CategorySort:
+                        - FieldSort: {FieldId: ea-extra, Direction: DESC}
+                    Orientation: HORIZONTAL
+                    BarsArrangement: CLUSTERED
+              - TableVisual:
+                  VisualId: tbl-feature-glossary
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Feature glossary - what each reporting_service code meters'}}
+                  Subtitle: {Visibility: VISIBLE, FormatText: {PlainText: 'Codes are emitted by Quick and new ones appear as features start metering agent hours; undocumented codes are flagged in the Source column'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      TableAggregatedFieldWells:
+                        GroupBy:
+                          - CategoricalDimensionField:
+                              FieldId: gl-code
+                              Column: {DataSetIdentifier: agent_hours, ColumnName: reporting_service}
+                          - CategoricalDimensionField:
+                              FieldId: gl-label
+                              Column: {DataSetIdentifier: agent_hours, ColumnName: feature_label}
+                          - CategoricalDimensionField:
+                              FieldId: gl-description
+                              Column: {DataSetIdentifier: agent_hours, ColumnName: feature_description}
+                          - CategoricalDimensionField:
+                              FieldId: gl-source
+                              Column: {DataSetIdentifier: agent_hours, ColumnName: feature_source}
+                          - CategoricalDimensionField:
+                              FieldId: gl-url
+                              Column: {DataSetIdentifier: agent_hours, ColumnName: feature_doc_url}
+                        Values:
+                          - NumericalMeasureField:
+                              FieldId: gl-hours
+                              Column: {DataSetIdentifier: agent_hours, ColumnName: usage_hours}
+                              AggregationFunction: {SimpleNumericalAggregation: SUM}
+                              FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 3}}}}
+                    SortConfiguration:
+                      RowSort:
+                        - FieldSort: {FieldId: gl-hours, Direction: DESC}
+                    FieldOptions:
+                      SelectedFieldOptions:
+                        - {FieldId: gl-code, CustomLabel: Code, Width: 170px}
+                        - {FieldId: gl-label, CustomLabel: Feature, Width: 260px}
+                        - {FieldId: gl-description, CustomLabel: What it meters, Width: 520px}
+                        - {FieldId: gl-source, CustomLabel: Source, Width: 220px}
+                        - FieldId: gl-url
+                          CustomLabel: Documentation
+                          Width: 140px
+                          URLStyling:
+                            LinkConfiguration:
+                              Target: NEW_TAB
+                              Content:
+                                CustomTextContent:
+                                  Value: Open docs
+                                  FontConfiguration: {FontDecoration: UNDERLINE}
+                        - {FieldId: gl-hours, CustomLabel: Agent hours (period)}
+                    TableOptions:
+                      CellStyle: {Height: 40}
+            Layouts:
+              - Configuration:
+                  GridLayout:
+                    CanvasSizeOptions:
+                      ScreenCanvasSizeOptions: {ResizeOption: FIXED, OptimizedViewPortWidth: '1600px'}
+                    Elements:
+                      - {ElementId: tbl-features, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 22, RowIndex: 0, RowSpan: 12}
+                      - {ElementId: bar-feature-coverage, ElementType: VISUAL, ColumnIndex: 22, ColumnSpan: 14, RowIndex: 0, RowSpan: 12}
+                      - {ElementId: tbl-automations, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 22, RowIndex: 12, RowSpan: 14}
+                      - {ElementId: bar-extra-automations, ElementType: VISUAL, ColumnIndex: 22, ColumnSpan: 14, RowIndex: 12, RowSpan: 14}
+                      - {ElementId: tbl-feature-glossary, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 36, RowIndex: 26, RowSpan: 14}
+          # ===================== Tab 4: Events (audit) =====================
+          - SheetId: sh-events
+            Name: Events
+            Title: Events (audit)
+            Description: Every metered event in the selected period, newest first. Export to CSV from the visual menu for chargeback joins.
+            FilterControls:
+              - Dropdown:
+                  FilterControlId: fc-ev-features
+                  Title: Feature
+                  SourceFilterId: f-features-ev
+                  Type: MULTI_SELECT
+                  DisplayOptions:
+                    SelectAllOptions: {Visibility: VISIBLE}
+                    TitleOptions: {Visibility: VISIBLE}
+              - Dropdown:
+                  FilterControlId: fc-ev-coverage
+                  Title: Coverage
+                  SourceFilterId: f-coverage-ev
+                  Type: MULTI_SELECT
+                  DisplayOptions:
+                    SelectAllOptions: {Visibility: VISIBLE}
+                    TitleOptions: {Visibility: VISIBLE}
+            ParameterControls:
+              - DateTimePicker:
+                  ParameterControlId: pc-ev-start
+                  Title: From
+                  SourceParameterName: pStart
+                  DisplayOptions: {DateTimeFormat: 'YYYY-MM-DD'}
+              - DateTimePicker:
+                  ParameterControlId: pc-ev-end
+                  Title: To (exclusive)
+                  SourceParameterName: pEnd
+                  DisplayOptions: {DateTimeFormat: 'YYYY-MM-DD'}
+            SheetControlLayouts:
+              - Configuration:
+                  GridLayout:
+                    Elements:
+                      - {ElementId: pc-ev-start, ElementType: PARAMETER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: pc-ev-end, ElementType: PARAMETER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: fc-ev-features, ElementType: FILTER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: fc-ev-coverage, ElementType: FILTER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+            Visuals:
+              - TableVisual:
+                  VisualId: tbl-events
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Metered events'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      TableUnaggregatedFieldWells:
+                        Values:
+                          - FieldId: ev-time
+                            Column: {DataSetIdentifier: agent_hours, ColumnName: event_time}
+                            FormatConfiguration: {DateTimeFormatConfiguration: {DateTimeFormat: 'YYYY-MM-DD HH:mm:ss'}}
+                          - FieldId: ev-type
+                            Column: {DataSetIdentifier: agent_hours, ColumnName: principal_type}
+                          - FieldId: ev-principal
+                            Column: {DataSetIdentifier: agent_hours, ColumnName: principal_label}
+                          - FieldId: ev-service
+                            Column: {DataSetIdentifier: agent_hours, ColumnName: reporting_service}
+                          - FieldId: ev-group
+                            Column: {DataSetIdentifier: agent_hours, ColumnName: usage_group}
+                          - FieldId: ev-hours
+                            Column: {DataSetIdentifier: agent_hours, ColumnName: usage_hours}
+                            FormatConfiguration: {NumberFormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 4}}}}}
+                          - FieldId: ev-subscription
+                            Column: {DataSetIdentifier: agent_hours, ColumnName: subscription_type}
+                          - FieldId: ev-resource
+                            Column: {DataSetIdentifier: agent_hours, ColumnName: service_resource_arn}
+                          - FieldId: ev-user
+                            Column: {DataSetIdentifier: agent_hours, ColumnName: user_arn}
+                    SortConfiguration:
+                      RowSort:
+                        - FieldSort: {FieldId: ev-time, Direction: DESC}
+                      PaginationConfiguration: {PageSize: 100, PageNumber: 1}
+                    FieldOptions:
+                      SelectedFieldOptions:
+                        - {FieldId: ev-time, CustomLabel: Time (UTC)}
+                        - {FieldId: ev-type, CustomLabel: Type}
+                        - {FieldId: ev-principal, CustomLabel: Principal}
+                        - {FieldId: ev-service, CustomLabel: Feature}
+                        - {FieldId: ev-group, CustomLabel: Coverage}
+                        - {FieldId: ev-hours, CustomLabel: Agent hours}
+                        - {FieldId: ev-subscription, CustomLabel: Subscription}
+                        - {FieldId: ev-resource, CustomLabel: Resource ARN}
+                        - {FieldId: ev-user, CustomLabel: User ARN}
+            Layouts:
+              - Configuration:
+                  GridLayout:
+                    CanvasSizeOptions:
+                      ScreenCanvasSizeOptions: {ResizeOption: FIXED, OptimizedViewPortWidth: '1600px'}
+                    Elements:
+                      - {ElementId: tbl-events, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 36, RowIndex: 0, RowSpan: 21}
+      Tags:
+        - Key: Purpose
+          Value: !Ref ResourcePrefix
+        - Key: ManagedBy
+          Value: CloudFormation
+
+Outputs:
+  GlueTable:
+    Description: Glue table over the agent-hours objects.
+    Value: !Ref GlueTable
+
+  DataSetArn:
+    Description: Quick dataset (Direct Query).
+    Value: !GetAtt DataSet.Arn
+
+  DashboardUrl:
+    Description: Open the dashboard in Amazon Quick (this Region).
+    Value: !Sub 'https://${AWS::Region}.quicksight.aws.amazon.com/sn/dashboards/${ResourcePrefix}-dashboard'

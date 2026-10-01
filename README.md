@@ -18,44 +18,25 @@ This repository organizes that agenda into five pillars. Pillars 1–4 combine n
 | 2 · Interactions | Are people using it? Do they trust the answers? What is failing? | [`CHAT_LOGS` and `FEEDBACK_LOGS` vended logs](https://docs.aws.amazon.com/quick/latest/userguide/monitoring-cloudwatch-logs.html) | [Chat and Feedback Monitor](./governance-chat-feedback-monitor/README.md) |
 | 3 · Sharing | Who may expand access to an asset, and how? | [Custom permissions](https://docs.aws.amazon.com/quick/latest/userguide/custom-permissions.html) and [approval workflows](https://docs.aws.amazon.com/quick/latest/userguide/approval-workflows.html) | [Block Sharing](./governance-block-sharing/README.md) |
 | 4 · Data asset lifecycle | Is the asset estate healthy, still in use, and still owned? | [EventBridge events](https://docs.aws.amazon.com/quick/latest/userguide/events-integration.html), native CloudWatch metrics, and the [asset management console](https://docs.aws.amazon.com/quick/latest/userguide/manage-qs-assets.html) | [Spreadsheet File Rename](./governance-spreadsheet-file-rename/README.md) · [Dataset Lifecycle Monitor](./governance-dataset-lifecycle-monitor/README.md) · [Orphaned Assets Monitor](./governance-orphaned-assets-monitor/README.md) |
-| 5 · Data security in agent access | Does the agent respect each user's data permissions? | [RLS](https://docs.aws.amazon.com/quick/latest/userguide/restrict-access-to-a-data-set-using-row-level-security.html) / [CLS](https://docs.aws.amazon.com/quick/latest/userguide/restrict-access-to-a-data-set-using-column-level-security.html) inherited through the semantic layer · [DLP with Microsoft Purview](https://docs.aws.amazon.com/quick/latest/userguide/data-loss-prevention.html) | — (platform property) |
+| 5 · Data security in agent access | Does the agent respect each user's data permissions? | [RLS](https://docs.aws.amazon.com/quick/latest/userguide/restrict-access-to-a-data-set-using-row-level-security.html) / [CLS](https://docs.aws.amazon.com/quick/latest/userguide/restrict-access-to-a-data-set-using-column-level-security.html) inherited through the semantic layer · [DLP with Microsoft Purview](https://docs.aws.amazon.com/quick/latest/userguide/data-loss-prevention.html) | — (native capability) |
 
-```
-+------------------+------------------+------------------+------------------+
-| 1 - Consumption  | 2 - Interactions | 3 - Sharing      | 4 - Data assets  |
-+------------------+------------------+------------------+------------------+
-| Agent Hours      | Chat and         | Block Sharing    | Spreadsheet File |  <- reference modules
-| Usage Monitor    | Feedback Monitor |                  | Rename           |     (this repository)
-|                  |                  |                  | Dataset Lifecycle|
-|                  |                  |                  | Monitor          |
-|                  |                  |                  | Orphaned Assets  |
-|                  |                  |                  | Monitor          |
-+------------------+------------------+------------------+------------------+
-| Limit profiles   | CHAT_LOGS and    | Custom           | EventBridge      |  <- native controls
-| (agent hours,    | FEEDBACK_LOGS    | permissions and  | events, native   |     (Amazon Quick)
-| index storage)   | vended logs      | approval         | CloudWatch       |
-|                  |                  | workflows        | metrics, asset   |
-|                  |                  |                  | management       |
-+------------------+------------------+------------------+------------------+
-| 5 - Data security in agent access: permissions inherited end to end       |  <- native platform
-|     RLS / CLS evaluated per user through the semantic layer               |     property, no
-|     DLP with Microsoft Purview for unstructured content                   |     module required
-+---------------------------------------------------------------------------+
-| Amazon Quick platform: Datasets, semantic layer (topics), Spaces,         |
-| Chat Agents                                                               |
-+---------------------------------------------------------------------------+
-```
+<p align="center">
+  <img src="docs/images/five-pillars.svg" alt="Amazon Quick AI governance: four pillars each pairing a reference module from this repository with native Amazon Quick controls, a fifth pillar (data security in agent access) provided natively by the service, all resting on the Amazon Quick service layer" width="100%">
+</p>
 
 ## Modules
 
-| Module | Pillar | What it does | Deploy with |
-|---|---|---|---|
-| [Agent Hours Usage Monitor](./governance-agent-hours-monitor/README.md) | 1 | Delivers the `AGENT_HOURS_LOGS` feed to CloudWatch Logs (optionally Amazon S3) and builds an executive dashboard: total hours, top consumers, spend by feature, license-covered vs. chargeable, and overage by feature, user, and automation. | CloudFormation |
-| [Chat and Feedback Monitor](./governance-chat-feedback-monitor/README.md) | 2 | Delivers `CHAT_LOGS` and `FEEDBACK_LOGS` to one KMS-encrypted log group and builds a dashboard: message volume, most active users, most-used agents (daily friendly-name resolution), response outcomes, Useful / Not Useful trend with reasons, and an audit trail with correlation IDs. | CloudFormation |
-| [Block Sharing](./governance-block-sharing/README.md) | 3 | Creates a Quick custom permissions profile that denies sharing of Chat Agents, Spaces, and Datasets (optionally dashboards, analyses, data sources) and assigns it at account, role, or user scope. | CloudFormation + Quick APIs |
-| [Spreadsheet File Rename](./governance-spreadsheet-file-rename/README.md) | 4 | Renames any dataset created from an uploaded spreadsheet with a standard prefix (`xls-` by default) within seconds, via an EventBridge → Lambda automation, with no change to the upload experience. | AWS SAM |
-| [Dataset Lifecycle Monitor](./governance-dataset-lifecycle-monitor/README.md) | 4 | Fleet-wide dataset health without co-owning datasets: last sync status with typed failure reason, sync duration (last vs. average), SPICE capacity with an estimated cost signal, and last observed use with confidence labels — evidence from dashboards, CloudTrail, topics, and Chat Agent citations (`CHAT_LOGS`) — on a CloudWatch dashboard with SNS failure alerts and S3 snapshots. | AWS SAM |
-| [Orphaned Assets Monitor](./governance-orphaned-assets-monitor/README.md) | 4 | Daily read-only reconciliation of every asset's owner grants (datasets, dashboards, analyses, data sources, folders, spaces, agents, topics) against the Quick user/group inventory: flags orphaned and missing-owner assets (HIGH), single-owner assets (bus factor 1), and recoveries, on a CloudWatch dashboard with SNS alerts. Audit-only — ownership transfer stays a human decision. | AWS SAM |
+| Module | Pillar | What it does | Deploy with | Needs the foundation |
+|---|---|---|---|---|
+| [Agent Hours Usage Monitor](./governance-agent-hours-monitor/README.md) | 1 | Delivers the `AGENT_HOURS_LOGS` feed to the shared analytics bucket and ships an Amazon Quick dashboard: total hours, top consumers, spend by feature, license-covered vs. chargeable, and overage by feature, user, and automation. | CloudFormation | yes |
+| [Chat and Feedback Monitor](./governance-chat-feedback-monitor/README.md) | 2 | Delivers `CHAT_LOGS` and `FEEDBACK_LOGS` to one KMS-encrypted log group (the content audit trail) and a field-minimized copy to the shared analytics bucket, and ships an Amazon Quick dashboard: message volume, most active users, most-used agents (friendly names refreshed on every agent rename), response outcomes, Useful / Not Useful trend with reasons, and an audit trail with correlation IDs. | CloudFormation | yes |
+| [Block Sharing](./governance-block-sharing/README.md) | 3 | Creates a Quick custom permissions profile that denies sharing of Chat Agents, Spaces, and Datasets (optionally dashboards, analyses, data sources) and assigns it at account, role, or user scope. | CloudFormation + Quick APIs | no |
+| [Spreadsheet File Rename](./governance-spreadsheet-file-rename/README.md) | 4 | Renames any dataset created from an uploaded spreadsheet with a standard prefix (`xls-` by default) within seconds, via an EventBridge → Lambda automation, with no change to the upload experience. | AWS SAM | no |
+| [Dataset Lifecycle Monitor](./governance-dataset-lifecycle-monitor/README.md) | 4 | Fleet-wide dataset health without co-owning datasets: last sync status with typed failure reason, sync duration (last vs. average), SPICE capacity with an estimated cost signal, and last observed use with confidence labels — evidence from dashboards, CloudTrail, topics, and Chat Agent citations (`CHAT_LOGS`) — with SNS failure alerts, snapshots in the shared analytics bucket and an Amazon Quick dashboard. | AWS SAM | yes |
+| [Orphaned Assets Monitor](./governance-orphaned-assets-monitor/README.md) | 4 | Daily read-only reconciliation of every asset's owner grants (datasets, dashboards, analyses, data sources, folders, spaces, agents, topics) against the Quick user/group inventory: flags orphaned and missing-owner assets (HIGH), single-owner assets (bus factor 1), and recoveries, with SNS alerts. Audit-only — ownership transfer stays a human decision. Snapshots in the shared analytics bucket and an Amazon Quick dashboard. | AWS SAM | yes |
+| [Analytics Foundation](./governance-analytics-foundation/README.md) | shared | Once-per-Region prerequisites for the Amazon Quick dashboards: the shared analytics bucket every module writes into (one prefix per module), a Glue database, an Athena workgroup, the Quick data source, and the IAM grant that lets Quick read the data — no console step. | CloudFormation | is the foundation |
+
+The four monitoring modules visualize in Amazon Quick: each ships a Quick dashboard that its `apply` script deploys together with the module, over data in one shared analytics bucket. Alerting stays operational — CloudWatch alarms and SNS — and the conversation audit trail stays in CloudWatch Logs. See [Deployment options](#deployment-options).
 
 ## Pillar 1 — Visibility and control of consumption
 
@@ -63,7 +44,7 @@ AI features in Amazon Quick — Quick Research, Flows, Automate, the desktop ass
 
 **Native control.** The built-in usage analytics aggregate consumption by subscription tier, which is enough to track the whole but not to hold teams and users accountable. For enforcement, [limit profiles](https://docs.aws.amazon.com/quick/latest/userguide/limit-profiles.html) let an administrator define reusable per-user caps on agent hours per billing cycle and on index storage, assigned to individual users, to a role (Author or Reader), or as the account default — the most specific assignment wins. When a user reaches 100% of a cap, new agent invocations (or new uploads and knowledge base ingestions, for storage) are blocked until the next billing cycle. Existing content is always preserved, enforcement is global across Regions, and each user can follow their own consumption in the *My usage* widget.
 
-**Reference module.** The [Agent Hours Usage Monitor](./governance-agent-hours-monitor/README.md) provisions delivery of the `AGENT_HOURS_LOGS` vended-log feed — the granular source the console does not expose — to CloudWatch Logs and, optionally, Amazon S3, and builds a dashboard with total hours for the period, top consumers, consumption trend by feature, included vs. extra hours, and the overage broken down by user and by automation. Every chargeable hour has an owner: interactive events are attributed to `user_arn`, and scheduled or deployed automations to the resource that ran them. The S3 copy feeds downstream analysis in Athena, Grafana, or Quick itself, including joins with groups and cost centers for internal chargeback. The account-total metric can back an alarm as monthly consumption approaches the contracted entitlement.
+**Reference module.** The [Agent Hours Usage Monitor](./governance-agent-hours-monitor/README.md) provisions delivery of the `AGENT_HOURS_LOGS` vended-log feed — the granular source the console does not expose — to the shared analytics bucket and ships an Amazon Quick dashboard with total hours for the period, top consumers, consumption trend by feature, included vs. extra hours, and the overage broken down by user and by automation. Every chargeable hour has an owner: interactive events are attributed to `user_arn`, and scheduled or deployed automations to the resource that ran them. The same S3 data serves downstream analysis in Athena or Grafana, including joins with groups and cost centers for internal chargeback.
 
 **Outcome.** Predictability in two layers: the native cap prevents a single user from exhausting the shared allowance or generating unexpected overage, and the monitor answers what the cap cannot — who consumes, on what, and with what trend.
 
@@ -71,7 +52,7 @@ AI features in Amazon Quick — Quick Research, Flows, Automate, the desktop ass
 
 The next questions from any adoption committee are qualitative: are people actually using it? Do they trust the answers? What is being blocked or left unanswered? Amazon Quick emits two vended-log feeds for this — `CHAT_LOGS` (messages, responses, and status) and `FEEDBACK_LOGS` (Useful / Not Useful ratings with reasons and comments) — documented in [Monitoring Amazon Quick using CloudWatch Logs](https://docs.aws.amazon.com/quick/latest/userguide/monitoring-cloudwatch-logs.html). The same delivery mechanism also serves `AGENT_HOURS_LOGS` (Pillar 1), `DLP_LOGS` (Pillar 5), `AGENT_METADATA_LOGS`, `INDEX_USAGE_LOGS`, and `KB_FILE_SYNC_LOGS`.
 
-**Reference module.** The [Chat and Feedback Monitor](./governance-chat-feedback-monitor/README.md) delivers both feeds to a single log group and builds the dashboard: message volume, most active users, most-used agents (with daily resolution of agent friendly names), response status (success, blocked, no answer), sentiment trend with the reasons behind negative ratings, and an audit trail whose correlation IDs (`conversation_id`, `user_message_id`, `system_message_id`) tie a question, its response, and its rating together — essential during investigations.
+**Reference module.** The [Chat and Feedback Monitor](./governance-chat-feedback-monitor/README.md) delivers both feeds to a single encrypted log group (the content audit trail) and, without prompts, responses or comments, to the shared analytics bucket, and ships the Amazon Quick dashboard: message volume, most active users, most-used agents (friendly names refreshed on every agent rename), response status (success, blocked, no answer), sentiment trend with the reasons behind negative ratings, and an audit trail whose correlation IDs (`conversation_id`, `user_message_id`, `system_message_id`) tie a question, its response, and its rating together — essential during investigations.
 
 **Two points for leadership.** First, conversation logs contain prompts and responses — potentially sensitive data. The module encrypts the log group with a dedicated AWS KMS key by default and tags it `DataClassification=Sensitive`, but controlling who can read those views, and complying with internal employee-monitoring policies, remains the organization's responsibility: involve privacy and legal teams before exposing per-user rankings. Second, vended-log delivery is **per Region and not retroactive**: enable it early, in every Region with Amazon Quick activity, because history before the delivery was configured cannot be recovered.
 
@@ -122,6 +103,7 @@ There is no module in this repository for Pillar 5 by design: RLS, CLS, and the 
 - [AWS SAM CLI](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/install-sam-cli.html) for the SAM-based modules (Spreadsheet File Rename, Dataset Lifecycle Monitor, Orphaned Assets Monitor).
 - `jq` on `PATH` for the Block Sharing apply script.
 - Deployment credentials with CloudFormation, IAM, Lambda, S3, SNS, and CloudWatch permissions as required by each template, plus `quicksight:AllowVendedLogDeliveryForResource` on the Quick account for the two log-based monitors. Amazon Quick APIs and IAM actions still use the `quicksight` namespace.
+- For the four monitoring modules: the [Analytics Foundation](./governance-analytics-foundation/README.md) deployed once per Region first. It needs a Quick **user or group ARN** to own the dashboards (it lives in the account's Quick *identity* Region, which can differ from the deployment Region) and `CAPABILITY_IAM`, because it attaches a scoped policy to Quick's service role.
 
 ### Deploy and remove a module
 
@@ -129,13 +111,17 @@ Every module follows the same layout and one-command workflow:
 
 ```text
 governance-<module>/
-├── README.md                          prerequisites, parameters, dashboards, cost, teardown
-├── cloudformation/<module>.yaml       CloudFormation or SAM template (source of truth)
-├── lambda/                            Python source, SAM modules only (plus a pinned
-│                                      requirements.txt where the runtime SDK lacks newer Quick APIs)
+├── README.md                              prerequisites, parameters, dashboards, cost, teardown
+├── cloudformation/<module>.yaml           CloudFormation or SAM template (source of truth)
+├── cloudformation/<module>-quick-dashboard.yaml
+│                                          the Amazon Quick dashboard (monitoring modules)
+├── lambda/                                Python source, SAM modules only (plus a pinned
+│                                          requirements.txt where the runtime SDK lacks newer Quick APIs)
 └── scripts/
-    ├── apply-<module>.sh              idempotent deploy / update, prints stack outputs
-    └── remove-<module>.sh             teardown
+    ├── apply-<module>.sh                  idempotent deploy / update of the module AND its Quick dashboard
+    ├── remove-<module>.sh                 teardown of both
+    ├── apply-<module>-quick-dashboard.sh  the Quick dashboard alone (monitoring modules)
+    └── remove-<module>-quick-dashboard.sh
 ```
 
 ```bash
@@ -144,7 +130,39 @@ cd governance-<module>/scripts
 ./remove-governance-<module>.sh --region <region> [--profile <aws-cli-profile>]
 ```
 
-Each README lists the module-specific flags (for example, the Chat and Feedback Monitor requires an explicit confirmation to delete conversation history, and Block Sharing takes a `--scope`). The templates can also be deployed directly with `aws cloudformation deploy` or `sam deploy`.
+Each README lists the module-specific flags (for example, the Chat and Feedback Monitor requires an explicit confirmation to delete conversation history, Block Sharing takes a `--scope`, and every monitoring module accepts `--skip-dashboard` and `--foundation-stack`). The templates can also be deployed directly with `aws cloudformation deploy` or `sam deploy`; the monitoring templates then need `AnalyticsBucketName` (the foundation's output).
+
+### Deployment options
+
+Two questions decide everything:
+
+1. **Which modules do you need?** Any subset, in any order. Every module is its own stack; no module depends on another.
+2. **Do any of them visualize?** The four monitoring modules (Agent Hours, Chat and Feedback, Dataset Lifecycle, Orphaned Assets) do, in Amazon Quick, and they need the [Analytics Foundation](./governance-analytics-foundation/README.md) deployed **once per Region before them**. Block Sharing and Spreadsheet File Rename never need it.
+
+| You want | Deploy, in this order | Buckets created |
+|---|---|---|
+| One control module (Block Sharing, Spreadsheet File Rename) | the module stack | 0 (+1 SAM artifact bucket, once per account/Region, for the SAM modules) |
+| One monitoring module, e.g. Agent Hours | foundation, then `apply-governance-agent-hours-monitor.sh --region <r>` — it deploys the module stack and its Quick dashboard | 3 (foundation: data, Athena results, access logs) |
+| Every module | foundation, then each `apply-*.sh` in any order | 3 (+1 SAM artifact bucket) |
+| A monitoring module's data for your own tools, no Quick dashboard | foundation, then the module with `--skip-dashboard`; read `<module>/` in the analytics bucket with Athena, Grafana, Datadog… | 3 |
+
+```bash
+# the whole estate in one Region
+governance-analytics-foundation/scripts/apply-governance-analytics-foundation.sh --region <r> --quick-principal-arn <arn>
+governance-agent-hours-monitor/scripts/apply-governance-agent-hours-monitor.sh     --region <r>
+governance-chat-feedback-monitor/scripts/apply-governance-chat-feedback-monitor.sh --region <r>
+governance-orphaned-assets-monitor/scripts/apply-governance-orphaned-assets-monitor.sh   --region <r>
+governance-dataset-lifecycle-monitor/scripts/apply-governance-dataset-lifecycle-monitor.sh --region <r>
+governance-block-sharing/scripts/apply-governance-block-sharing.sh --region <r> --scope <scope>
+governance-spreadsheet-file-rename/scripts/apply-governance-spreadsheet-file-rename.sh --region <r>
+```
+
+What the monitoring modules share, and what they keep:
+
+- **One shared analytics bucket per Region**, one prefix per module (`agent-hours/`, `chat-feedback/`, `dataset-lifecycle/`, `orphaned-assets/`). The collectors keep their working state under `<module>/state/` in the same bucket — outside every Glue table location, never expired by the bucket's lifecycle rules, and explicitly denied to Quick's service role. The modules create no buckets of their own.
+- **Freshness.** The Quick datasets are Direct Query over Athena, so every dashboard load reads the bucket: data is visible seconds after a vended-log delivery or a collector run. A dashboard may be deployed before its data exists; it shows empty until the first delivery or scan.
+- **Operations stay in CloudWatch** where they belong: the collectors publish low-cardinality KPI metrics that drive alarms (new HIGH ownership findings, refresh failures, collector errors), with SNS notifications; the Chat and Feedback log group remains the encrypted audit trail of prompts and responses — content that never enters S3 or Quick.
+- **No console steps.** Quick reads the shared bucket through an IAM policy the foundation stack attaches to Quick's service role; the console's *AWS resources* authorization is not needed. Cross-account deployment is out of scope.
 
 ### Region matters
 
@@ -163,18 +181,20 @@ The five pillars form a simple operating model: the platform team or data center
 
 ### Cost
 
-Operating cost is on the order of a few US dollars per month per module, mostly CloudWatch Logs ingestion and storage; Block Sharing has no runtime cost and Spreadsheet File Rename is pay-per-use. Each module README breaks down its own cost drivers and defaults (retention, schedules, optional S3 delivery).
+Operating cost is on the order of a few US dollars per month for the whole estate: vended-log delivery to S3 and S3 storage in cents, Athena per-query charges for the Quick dashboards (a few small queries per dashboard load, kilobytes scanned at governance volumes), the Chat and Feedback log group's ingestion and storage, a handful of custom metrics and alarms, and Lambda invocations for the collectors. Block Sharing has no runtime cost and Spreadsheet File Rename is pay-per-use. Glue and the Athena workgroup are free, and Quick itself is priced per user independently of this repository. Each module README breaks down its own cost drivers and defaults (retention, schedules).
 
 ## Repository layout
 
 ```text
 .
+├── docs/images/                            diagrams used by the READMEs
 ├── governance-agent-hours-monitor/         Pillar 1 · CloudFormation
 ├── governance-chat-feedback-monitor/       Pillar 2 · CloudFormation
 ├── governance-block-sharing/               Pillar 3 · CloudFormation + Quick APIs
 ├── governance-spreadsheet-file-rename/     Pillar 4 · AWS SAM (Python Lambda)
 ├── governance-dataset-lifecycle-monitor/   Pillar 4 · AWS SAM (Python Lambda)
-└── governance-orphaned-assets-monitor/     Pillar 4 · AWS SAM (Python Lambda)
+├── governance-orphaned-assets-monitor/     Pillar 4 · AWS SAM (Python Lambda)
+└── governance-analytics-foundation/        shared · CloudFormation (prerequisite of the four monitoring modules)
 ```
 
 ## Security

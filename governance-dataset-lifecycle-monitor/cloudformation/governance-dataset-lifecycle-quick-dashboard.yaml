@@ -1,0 +1,1459 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Amazon Quick dataset lifecycle monitor - native Amazon Quick dashboard for
+  administrators. Glue tables over the fast (refresh health) and slow (usage,
+  lineage, capacity) snapshots the module writes to S3, current-state datasets
+  (latest run per dataset) plus a refresh history dataset, and a five-tab
+  dashboard: Overview, Refresh health, Usage, Capacity and cost, History.
+  Requires the governance analytics foundation stack in the same Region.
+
+# Prerequisites: governance-analytics-foundation in this Region; the Dataset
+# Lifecycle module writing snapshots (snapshots/fast|slow/dt=.../run-*.jsonl);
+# console authorization of DataBucketName for Quick's service role.
+
+Parameters:
+  ResourcePrefix:
+    Type: String
+    Default: 'quick-governance-dataset-lifecycle'
+    AllowedPattern: '^[a-z0-9-]{1,40}$'
+    Description: Prefix for the Quick dataset and dashboard IDs.
+  FoundationStackName:
+    Type: String
+    Default: 'quick-governance-analytics-foundation'
+    AllowedPattern: '^[A-Za-z][A-Za-z0-9-]{0,127}$'
+    Description: Stack name of the governance analytics foundation (exports are imported).
+  DataBucketName:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$'
+    Description: >
+      Bucket holding the module snapshots. Empty (default) reads the shared
+      analytics bucket created by the foundation stack; set it to read a
+      module-owned bucket (<prefix>-<account-id>) together with FastPrefix=snapshots/fast/ and SlowPrefix=snapshots/slow/.
+  FastPrefix:
+    Type: String
+    Default: 'dataset-lifecycle/fast/'
+    AllowedPattern: '^([A-Za-z0-9_=./-]+/)?$'
+    Description: Prefix of the fast-loop (refresh health) snapshots.
+  SlowPrefix:
+    Type: String
+    Default: 'dataset-lifecycle/slow/'
+    AllowedPattern: '^([A-Za-z0-9_=./-]+/)?$'
+    Description: Prefix of the slow-loop (usage, lineage, capacity) snapshots.
+  QuickPrincipalArn:
+    Type: String
+    AllowedPattern: '^arn:aws[a-z-]*:quicksight:[a-z0-9-]+:[0-9]{12}:(user|group)/.+$'
+    Description: Quick user or group ARN (identity Region) that owns the datasets and dashboard.
+
+Conditions:
+  UseSharedBucket: !Equals [!Ref DataBucketName, '']
+
+Resources:
+
+  FastTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref 'AWS::AccountId'
+      DatabaseName:
+        Fn::ImportValue: !Sub '${FoundationStackName}-GlueDatabase'
+      TableInput:
+        Name: dataset_lifecycle_fast
+        Description: Dataset Lifecycle Monitor - refresh health, one record per dataset per hourly run.
+        TableType: EXTERNAL_TABLE
+        Parameters: {classification: json, EXTERNAL: 'TRUE'}
+        StorageDescriptor:
+          Location: !If
+            - UseSharedBucket
+            - !Sub
+              - 's3://${Bucket}/${FastPrefix}'
+              - Bucket:
+                  Fn::ImportValue: !Sub '${FoundationStackName}-AnalyticsBucket'
+            - !Sub 's3://${DataBucketName}/${FastPrefix}'
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.openx.data.jsonserde.JsonSerDe
+            Parameters: {ignore.malformed.json: 'true', case.insensitive: 'true'}
+          Columns:
+            - {Name: ts, Type: string}
+            - {Name: loop, Type: string}
+            - {Name: datasetid, Type: string}
+            - {Name: datasetname, Type: string}
+            - {Name: importmode, Type: string}
+            - {Name: assetstate, Type: string}
+            - {Name: laststatus, Type: string}
+            - {Name: lastrequesttype, Type: string}
+            - {Name: lastrequestsource, Type: string}
+            - {Name: lastattemptat, Type: string}
+            - {Name: lastsuccessat, Type: string}
+            - {Name: lastfailedat, Type: string}
+            - {Name: errortype, Type: string}
+            - {Name: errormessage, Type: string}
+            - {Name: lastdurationsec, Type: double}
+            - {Name: avgdurationsec, Type: double}
+            - {Name: avgfullrefreshsec, Type: double}
+            - {Name: avgincrementalsec, Type: double}
+            - {Name: rowsingested, Type: bigint}
+            - {Name: rowsdropped, Type: bigint}
+            - {Name: windowruns, Type: int}
+            - {Name: windowfailed, Type: int}
+            - {Name: findingscsv, Type: string}
+
+  SlowTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref 'AWS::AccountId'
+      DatabaseName:
+        Fn::ImportValue: !Sub '${FoundationStackName}-GlueDatabase'
+      TableInput:
+        Name: dataset_lifecycle_slow
+        Description: Dataset Lifecycle Monitor - usage evidence, lineage and SPICE capacity, one record per dataset per daily run.
+        TableType: EXTERNAL_TABLE
+        Parameters: {classification: json, EXTERNAL: 'TRUE'}
+        StorageDescriptor:
+          Location: !If
+            - UseSharedBucket
+            - !Sub
+              - 's3://${Bucket}/${SlowPrefix}'
+              - Bucket:
+                  Fn::ImportValue: !Sub '${FoundationStackName}-AnalyticsBucket'
+            - !Sub 's3://${DataBucketName}/${SlowPrefix}'
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.openx.data.jsonserde.JsonSerDe
+            Parameters: {ignore.malformed.json: 'true', case.insensitive: 'true'}
+          Columns:
+            - {Name: ts, Type: string}
+            - {Name: loop, Type: string}
+            - {Name: datasetid, Type: string}
+            - {Name: datasetname, Type: string}
+            - {Name: importmode, Type: string}
+            - {Name: assetstate, Type: string}
+            - {Name: dependentdashboardcount, Type: int}
+            - {Name: dependenttopiccount, Type: int}
+            - {Name: dependentspacecount, Type: int}
+            - {Name: dependentagentcount, Type: int}
+            - {Name: lastobserveduseat, Type: string}
+            - {Name: dayssinceobserveduse, Type: int}
+            - {Name: usageconfidence, Type: string}
+            - {Name: usagesource, Type: string}
+            - {Name: viewlookbackdays, Type: int}
+            - {Name: querylookbackdays, Type: int}
+            - {Name: agentlookbackdays, Type: int}
+            - {Name: spicegb, Type: double}
+            - {Name: estmonthlycostusd, Type: double}
+            - {Name: costtype, Type: string}
+            - {Name: findingscsv, Type: string}
+
+  # Refresh health: latest fast-loop record per dataset.
+  HealthDataSet:
+    Type: AWS::QuickSight::DataSet
+    DependsOn: FastTable
+    Properties:
+      AwsAccountId: !Ref 'AWS::AccountId'
+      DataSetId: !Sub '${ResourcePrefix}-health'
+      Name: Quick governance - dataset refresh health (current)
+      ImportMode: DIRECT_QUERY
+      PhysicalTableMap:
+        health:
+          CustomSql:
+            DataSourceArn:
+              Fn::ImportValue: !Sub '${FoundationStackName}-QuickDataSourceArn'
+            Name: refresh_health
+            SqlQuery: !Sub
+              - |
+                WITH ranked AS (
+                  SELECT f.*, row_number() OVER (PARTITION BY datasetid ORDER BY ts DESC) AS rn
+                  FROM "${Db}"."dataset_lifecycle_fast" f WHERE ts IS NOT NULL
+                )
+                SELECT
+                  from_iso8601_timestamp(ts) AS scan_time,
+                  datasetid AS dataset_id,
+                  COALESCE(datasetname, datasetid) AS dataset_name,
+                  COALESCE(importmode, 'UNKNOWN') AS import_mode,
+                  COALESCE(assetstate, 'ACTIVE') AS asset_state,
+                  COALESCE(laststatus, 'UNKNOWN') AS last_status,
+                  lastrequesttype AS last_request_type,
+                  lastrequestsource AS last_request_source,
+                  TRY(from_iso8601_timestamp(lastattemptat)) AS last_attempt_at,
+                  TRY(from_iso8601_timestamp(lastsuccessat)) AS last_success_at,
+                  TRY(from_iso8601_timestamp(lastfailedat)) AS last_failed_at,
+                  errortype AS error_type,
+                  errormessage AS error_message,
+                  lastdurationsec AS last_duration_sec,
+                  avgdurationsec AS avg_duration_sec,
+                  avgfullrefreshsec AS avg_full_refresh_sec,
+                  avgincrementalsec AS avg_incremental_sec,
+                  CASE WHEN avgdurationsec > 0 THEN lastdurationsec / avgdurationsec END AS duration_ratio,
+                  rowsingested AS rows_ingested,
+                  rowsdropped AS rows_dropped,
+                  windowruns AS window_runs,
+                  windowfailed AS window_failed,
+                  COALESCE(findingscsv, '') AS findings,
+                  CASE WHEN laststatus = 'FAILED' THEN 1 ELSE 0 END AS failed_count,
+                  CASE WHEN importmode = 'SPICE' THEN 1 ELSE 0 END AS spice_count,
+                  CASE WHEN importmode <> 'SPICE' THEN 1 ELSE 0 END AS direct_query_count,
+                  1 AS dataset_count
+                FROM ranked WHERE rn = 1 AND COALESCE(assetstate, 'ACTIVE') <> 'DELETED'
+              - Db:
+                  Fn::ImportValue: !Sub '${FoundationStackName}-GlueDatabase'
+            Columns:
+              - {Name: scan_time, Type: DATETIME}
+              - {Name: dataset_id, Type: STRING}
+              - {Name: dataset_name, Type: STRING}
+              - {Name: import_mode, Type: STRING}
+              - {Name: asset_state, Type: STRING}
+              - {Name: last_status, Type: STRING}
+              - {Name: last_request_type, Type: STRING}
+              - {Name: last_request_source, Type: STRING}
+              - {Name: last_attempt_at, Type: DATETIME}
+              - {Name: last_success_at, Type: DATETIME}
+              - {Name: last_failed_at, Type: DATETIME}
+              - {Name: error_type, Type: STRING}
+              - {Name: error_message, Type: STRING}
+              - {Name: last_duration_sec, Type: DECIMAL}
+              - {Name: avg_duration_sec, Type: DECIMAL}
+              - {Name: avg_full_refresh_sec, Type: DECIMAL}
+              - {Name: avg_incremental_sec, Type: DECIMAL}
+              - {Name: duration_ratio, Type: DECIMAL}
+              - {Name: rows_ingested, Type: INTEGER}
+              - {Name: rows_dropped, Type: INTEGER}
+              - {Name: window_runs, Type: INTEGER}
+              - {Name: window_failed, Type: INTEGER}
+              - {Name: findings, Type: STRING}
+              - {Name: failed_count, Type: INTEGER}
+              - {Name: spice_count, Type: INTEGER}
+              - {Name: direct_query_count, Type: INTEGER}
+              - {Name: dataset_count, Type: INTEGER}
+      LogicalTableMap:
+        health:
+          Alias: refresh_health
+          Source: {PhysicalTableId: health}
+      Permissions:
+        - Principal: !Ref QuickPrincipalArn
+          Actions: [quicksight:DescribeDataSet, quicksight:DescribeDataSetPermissions, quicksight:PassDataSet, quicksight:DescribeIngestion, quicksight:ListIngestions, quicksight:UpdateDataSet, quicksight:DeleteDataSet, quicksight:CreateIngestion, quicksight:CancelIngestion, quicksight:UpdateDataSetPermissions]
+      Tags:
+        - {Key: Purpose, Value: !Ref ResourcePrefix}
+        - {Key: ManagedBy, Value: CloudFormation}
+
+  # Usage, lineage and capacity: latest slow-loop record per dataset.
+  UsageDataSet:
+    Type: AWS::QuickSight::DataSet
+    DependsOn: SlowTable
+    Properties:
+      AwsAccountId: !Ref 'AWS::AccountId'
+      DataSetId: !Sub '${ResourcePrefix}-usage'
+      Name: Quick governance - dataset usage and capacity (current)
+      ImportMode: DIRECT_QUERY
+      PhysicalTableMap:
+        usage:
+          CustomSql:
+            DataSourceArn:
+              Fn::ImportValue: !Sub '${FoundationStackName}-QuickDataSourceArn'
+            Name: dataset_usage
+            SqlQuery: !Sub
+              - |
+                WITH ranked AS (
+                  SELECT s.*, row_number() OVER (PARTITION BY datasetid ORDER BY ts DESC) AS rn
+                  FROM "${Db}"."dataset_lifecycle_slow" s WHERE ts IS NOT NULL
+                )
+                SELECT
+                  from_iso8601_timestamp(ts) AS scan_time,
+                  datasetid AS dataset_id,
+                  COALESCE(datasetname, datasetid) AS dataset_name,
+                  COALESCE(importmode, 'UNKNOWN') AS import_mode,
+                  dependentdashboardcount AS dashboards,
+                  dependenttopiccount AS topics,
+                  dependentspacecount AS spaces,
+                  dependentagentcount AS agents,
+                  dependentdashboardcount + dependenttopiccount + dependentspacecount AS references_total,
+                  CASE WHEN dependentdashboardcount + dependenttopiccount + dependentspacecount > 0 THEN 'Referenced' ELSE 'Unreferenced' END AS reference_state,
+                  TRY(from_iso8601_timestamp(lastobserveduseat)) AS last_observed_use_at,
+                  dayssinceobserveduse AS days_since_observed_use,
+                  COALESCE(usageconfidence, 'NO_EVIDENCE') AS usage_confidence,
+                  COALESCE(usagesource, '(none)') AS usage_source,
+                  spicegb AS spice_gb,
+                  estmonthlycostusd AS est_monthly_cost_usd,
+                  COALESCE(costtype, '(n/a)') AS cost_type,
+                  COALESCE(findingscsv, '') AS findings,
+                  CASE WHEN findingscsv LIKE '%SPICE_DATASET_NOT_REFERENCED%' THEN 1 ELSE 0 END AS unreferenced_count,
+                  CASE WHEN findingscsv LIKE '%NO_OBSERVED_USE%' THEN 1 ELSE 0 END AS no_observed_use_count,
+                  CASE WHEN importmode = 'SPICE' THEN 1 ELSE 0 END AS spice_count,
+                  1 AS dataset_count
+                FROM ranked WHERE rn = 1 AND COALESCE(assetstate, 'ACTIVE') <> 'DELETED'
+              - Db:
+                  Fn::ImportValue: !Sub '${FoundationStackName}-GlueDatabase'
+            Columns:
+              - {Name: scan_time, Type: DATETIME}
+              - {Name: dataset_id, Type: STRING}
+              - {Name: dataset_name, Type: STRING}
+              - {Name: import_mode, Type: STRING}
+              - {Name: dashboards, Type: INTEGER}
+              - {Name: topics, Type: INTEGER}
+              - {Name: spaces, Type: INTEGER}
+              - {Name: agents, Type: INTEGER}
+              - {Name: references_total, Type: INTEGER}
+              - {Name: reference_state, Type: STRING}
+              - {Name: last_observed_use_at, Type: DATETIME}
+              - {Name: days_since_observed_use, Type: INTEGER}
+              - {Name: usage_confidence, Type: STRING}
+              - {Name: usage_source, Type: STRING}
+              - {Name: spice_gb, Type: DECIMAL}
+              - {Name: est_monthly_cost_usd, Type: DECIMAL}
+              - {Name: cost_type, Type: STRING}
+              - {Name: findings, Type: STRING}
+              - {Name: unreferenced_count, Type: INTEGER}
+              - {Name: no_observed_use_count, Type: INTEGER}
+              - {Name: spice_count, Type: INTEGER}
+              - {Name: dataset_count, Type: INTEGER}
+      LogicalTableMap:
+        usage:
+          Alias: dataset_usage
+          Source: {PhysicalTableId: usage}
+      Permissions:
+        - Principal: !Ref QuickPrincipalArn
+          Actions: [quicksight:DescribeDataSet, quicksight:DescribeDataSetPermissions, quicksight:PassDataSet, quicksight:DescribeIngestion, quicksight:ListIngestions, quicksight:UpdateDataSet, quicksight:DeleteDataSet, quicksight:CreateIngestion, quicksight:CancelIngestion, quicksight:UpdateDataSetPermissions]
+      Tags:
+        - {Key: Purpose, Value: !Ref ResourcePrefix}
+        - {Key: ManagedBy, Value: CloudFormation}
+
+  # Refresh history: every fast-loop record (hourly), for trends and the failure feed.
+  HistoryDataSet:
+    Type: AWS::QuickSight::DataSet
+    DependsOn: FastTable
+    Properties:
+      AwsAccountId: !Ref 'AWS::AccountId'
+      DataSetId: !Sub '${ResourcePrefix}-history'
+      Name: Quick governance - dataset refresh history
+      ImportMode: DIRECT_QUERY
+      PhysicalTableMap:
+        history:
+          CustomSql:
+            DataSourceArn:
+              Fn::ImportValue: !Sub '${FoundationStackName}-QuickDataSourceArn'
+            Name: refresh_history
+            SqlQuery: !Sub
+              - |
+                SELECT
+                  from_iso8601_timestamp(ts) AS scan_time,
+                  datasetid AS dataset_id,
+                  COALESCE(datasetname, datasetid) AS dataset_name,
+                  COALESCE(importmode, 'UNKNOWN') AS import_mode,
+                  COALESCE(laststatus, 'UNKNOWN') AS last_status,
+                  lastrequesttype AS last_request_type,
+                  errortype AS error_type,
+                  errormessage AS error_message,
+                  TRY(from_iso8601_timestamp(lastfailedat)) AS last_failed_at,
+                  lastdurationsec AS last_duration_sec,
+                  rowsingested AS rows_ingested,
+                  CASE WHEN laststatus = 'FAILED' THEN 1 ELSE 0 END AS failed_count,
+                  1 AS record_count
+                FROM "${Db}"."dataset_lifecycle_fast"
+                WHERE ts IS NOT NULL AND COALESCE(assetstate, 'ACTIVE') <> 'DELETED'
+              - Db:
+                  Fn::ImportValue: !Sub '${FoundationStackName}-GlueDatabase'
+            Columns:
+              - {Name: scan_time, Type: DATETIME}
+              - {Name: dataset_id, Type: STRING}
+              - {Name: dataset_name, Type: STRING}
+              - {Name: import_mode, Type: STRING}
+              - {Name: last_status, Type: STRING}
+              - {Name: last_request_type, Type: STRING}
+              - {Name: error_type, Type: STRING}
+              - {Name: error_message, Type: STRING}
+              - {Name: last_failed_at, Type: DATETIME}
+              - {Name: last_duration_sec, Type: DECIMAL}
+              - {Name: rows_ingested, Type: INTEGER}
+              - {Name: failed_count, Type: INTEGER}
+              - {Name: record_count, Type: INTEGER}
+      LogicalTableMap:
+        history:
+          Alias: refresh_history
+          Source: {PhysicalTableId: history}
+      Permissions:
+        - Principal: !Ref QuickPrincipalArn
+          Actions: [quicksight:DescribeDataSet, quicksight:DescribeDataSetPermissions, quicksight:PassDataSet, quicksight:DescribeIngestion, quicksight:ListIngestions, quicksight:UpdateDataSet, quicksight:DeleteDataSet, quicksight:CreateIngestion, quicksight:CancelIngestion, quicksight:UpdateDataSetPermissions]
+      Tags:
+        - {Key: Purpose, Value: !Ref ResourcePrefix}
+        - {Key: ManagedBy, Value: CloudFormation}
+
+  Dashboard:
+    Type: AWS::QuickSight::Dashboard
+    Properties:
+      AwsAccountId: !Ref 'AWS::AccountId'
+      DashboardId: !Sub '${ResourcePrefix}-dashboard'
+      Name: Amazon Quick - dataset lifecycle
+      VersionDescription: Administrator dashboard - Overview, Refresh health, Usage, Capacity and cost, History.
+      DashboardPublishOptions:
+        AdHocFilteringOption: {AvailabilityStatus: ENABLED}
+        ExportToCSVOption: {AvailabilityStatus: ENABLED}
+        SheetControlsOption: {VisibilityState: EXPANDED}
+      Permissions:
+        - Principal: !Ref QuickPrincipalArn
+          Actions: [quicksight:DescribeDashboard, quicksight:ListDashboardVersions, quicksight:UpdateDashboardPermissions, quicksight:QueryDashboard, quicksight:UpdateDashboard, quicksight:DeleteDashboard, quicksight:DescribeDashboardPermissions, quicksight:UpdateDashboardPublishedVersion]
+      Definition: # GENERATED
+        DataSetIdentifierDeclarations:
+          - Identifier: health
+            DataSetArn: !GetAtt HealthDataSet.Arn
+          - Identifier: usage
+            DataSetArn: !GetAtt UsageDataSet.Arn
+          - Identifier: hist
+            DataSetArn: !GetAtt HistoryDataSet.Arn
+        ParameterDeclarations:
+          - DateTimeParameterDeclaration:
+              Name: pStart
+              TimeGranularity: DAY
+              DefaultValues:
+                RollingDate: {Expression: "addDateTime(-1, 'MM', truncDate('MM', now()))"}
+          - DateTimeParameterDeclaration:
+              Name: pEnd
+              TimeGranularity: DAY
+              DefaultValues:
+                RollingDate: {Expression: "addDateTime(1, 'DD', truncDate('DD', now()))"}
+        FilterGroups:
+          - FilterGroupId: fg-range
+            CrossDataset: SINGLE_DATASET
+            Status: ENABLED
+            Filters:
+              - TimeRangeFilter:
+                  FilterId: f-range
+                  Column: {DataSetIdentifier: hist, ColumnName: scan_time}
+                  IncludeMinimum: true
+                  IncludeMaximum: false
+                  RangeMinimumValue: {Parameter: pStart}
+                  RangeMaximumValue: {Parameter: pEnd}
+                  NullOption: NON_NULLS_ONLY
+                  TimeGranularity: DAY
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-history
+                    Scope: ALL_VISUALS
+          - FilterGroupId: fg-mode-ov
+            CrossDataset: ALL_DATASETS
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-mode-ov
+                  Column: {DataSetIdentifier: health, ColumnName: import_mode}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      SelectAllOptions: FILTER_ALL_VALUES
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-overview
+                    Scope: ALL_VISUALS
+          - FilterGroupId: fg-dataset-ov
+            CrossDataset: ALL_DATASETS
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-dataset-ov
+                  Column: {DataSetIdentifier: health, ColumnName: dataset_name}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      SelectAllOptions: FILTER_ALL_VALUES
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-overview
+                    Scope: ALL_VISUALS
+          - FilterGroupId: fg-mode-rh
+            CrossDataset: ALL_DATASETS
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-mode-rh
+                  Column: {DataSetIdentifier: health, ColumnName: import_mode}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      SelectAllOptions: FILTER_ALL_VALUES
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-health
+                    Scope: ALL_VISUALS
+          - FilterGroupId: fg-dataset-rh
+            CrossDataset: ALL_DATASETS
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-dataset-rh
+                  Column: {DataSetIdentifier: health, ColumnName: dataset_name}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      SelectAllOptions: FILTER_ALL_VALUES
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-health
+                    Scope: ALL_VISUALS
+          - FilterGroupId: fg-mode-us
+            CrossDataset: ALL_DATASETS
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-mode-us
+                  Column: {DataSetIdentifier: health, ColumnName: import_mode}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      SelectAllOptions: FILTER_ALL_VALUES
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-usage
+                    Scope: ALL_VISUALS
+          - FilterGroupId: fg-dataset-us
+            CrossDataset: ALL_DATASETS
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-dataset-us
+                  Column: {DataSetIdentifier: health, ColumnName: dataset_name}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      SelectAllOptions: FILTER_ALL_VALUES
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-usage
+                    Scope: ALL_VISUALS
+          - FilterGroupId: fg-mode-cp
+            CrossDataset: ALL_DATASETS
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-mode-cp
+                  Column: {DataSetIdentifier: health, ColumnName: import_mode}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      SelectAllOptions: FILTER_ALL_VALUES
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-capacity
+                    Scope: ALL_VISUALS
+          - FilterGroupId: fg-dataset-cp
+            CrossDataset: ALL_DATASETS
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-dataset-cp
+                  Column: {DataSetIdentifier: health, ColumnName: dataset_name}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      SelectAllOptions: FILTER_ALL_VALUES
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-capacity
+                    Scope: ALL_VISUALS
+          - FilterGroupId: fg-mode-hs
+            CrossDataset: ALL_DATASETS
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-mode-hs
+                  Column: {DataSetIdentifier: health, ColumnName: import_mode}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      SelectAllOptions: FILTER_ALL_VALUES
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-history
+                    Scope: ALL_VISUALS
+          - FilterGroupId: fg-dataset-hs
+            CrossDataset: ALL_DATASETS
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-dataset-hs
+                  Column: {DataSetIdentifier: health, ColumnName: dataset_name}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      SelectAllOptions: FILTER_ALL_VALUES
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-history
+                    Scope: ALL_VISUALS
+          - FilterGroupId: fg-failed-only-sh-overview
+            CrossDataset: SINGLE_DATASET
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-failed-only-sh-overview
+                  Column: {DataSetIdentifier: health, ColumnName: last_status}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      CategoryValues: ['FAILED']
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-overview
+                    Scope: SELECTED_VISUALS
+                    VisualIds: [ov-tbl-failed]
+          - FilterGroupId: fg-failed-only-sh-health
+            CrossDataset: SINGLE_DATASET
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-failed-only-sh-health
+                  Column: {DataSetIdentifier: health, ColumnName: last_status}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      CategoryValues: ['FAILED']
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-health
+                    Scope: SELECTED_VISUALS
+                    VisualIds: [rh-tbl-failed]
+          - FilterGroupId: fg-spice-only-sh-health
+            CrossDataset: SINGLE_DATASET
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-spice-only-sh-health
+                  Column: {DataSetIdentifier: health, ColumnName: import_mode}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      CategoryValues: ['SPICE']
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-health
+                    Scope: SELECTED_VISUALS
+                    VisualIds: [rh-tbl-slowest, rh-bar-duration]
+          - FilterGroupId: fg-unreferenced-sh-usage
+            CrossDataset: SINGLE_DATASET
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-unreferenced-sh-usage
+                  Column: {DataSetIdentifier: usage, ColumnName: reference_state}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      CategoryValues: ['Unreferenced']
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-usage
+                    Scope: SELECTED_VISUALS
+                    VisualIds: [us-tbl-unreferenced]
+          - FilterGroupId: fg-referenced-sh-usage
+            CrossDataset: SINGLE_DATASET
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-referenced-sh-usage
+                  Column: {DataSetIdentifier: usage, ColumnName: reference_state}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      CategoryValues: ['Referenced']
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-usage
+                    Scope: SELECTED_VISUALS
+                    VisualIds: [us-tbl-lru]
+          - FilterGroupId: fg-no-evidence-sh-usage
+            CrossDataset: SINGLE_DATASET
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-no-evidence-sh-usage
+                  Column: {DataSetIdentifier: usage, ColumnName: usage_confidence}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      CategoryValues: ['NO_EVIDENCE']
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-usage
+                    Scope: SELECTED_VISUALS
+                    VisualIds: [us-tbl-noevidence]
+          - FilterGroupId: fg-spice-usage-sh-capacity
+            CrossDataset: SINGLE_DATASET
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-spice-usage-sh-capacity
+                  Column: {DataSetIdentifier: usage, ColumnName: import_mode}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      CategoryValues: ['SPICE']
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-capacity
+                    Scope: SELECTED_VISUALS
+                    VisualIds: [cp-tbl-largest, cp-bar-cost]
+          - FilterGroupId: fg-hist-failed-sh-history
+            CrossDataset: SINGLE_DATASET
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-hist-failed-sh-history
+                  Column: {DataSetIdentifier: hist, ColumnName: last_status}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      CategoryValues: ['FAILED']
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-history
+                    Scope: SELECTED_VISUALS
+                    VisualIds: [hs-tbl-failures]
+        Sheets:
+          - SheetId: sh-overview
+            Name: 'Overview'
+            Title: 'Dataset lifecycle - overview'
+            Description: 'Fleet health from the latest scans: refresh status, usage evidence and SPICE capacity, without co-owning a single dataset.'
+            ParameterControls:
+              - DateTimePicker:
+                  ParameterControlId: pc-ov-start
+                  Title: 'From'
+                  SourceParameterName: pStart
+                  DisplayOptions: {DateTimeFormat: 'YYYY-MM-DD'}
+              - DateTimePicker:
+                  ParameterControlId: pc-ov-end
+                  Title: 'To (exclusive)'
+                  SourceParameterName: pEnd
+                  DisplayOptions: {DateTimeFormat: 'YYYY-MM-DD'}
+            FilterControls:
+              - Dropdown:
+                  FilterControlId: fc-ov-mode
+                  Title: 'Import mode'
+                  SourceFilterId: f-mode-ov
+                  Type: MULTI_SELECT
+                  DisplayOptions:
+                    SelectAllOptions: {Visibility: VISIBLE}
+                    TitleOptions: {Visibility: VISIBLE}
+              - Dropdown:
+                  FilterControlId: fc-ov-dataset
+                  Title: 'Dataset'
+                  SourceFilterId: f-dataset-ov
+                  Type: MULTI_SELECT
+                  DisplayOptions:
+                    SelectAllOptions: {Visibility: VISIBLE}
+                    TitleOptions: {Visibility: VISIBLE}
+            SheetControlLayouts:
+              - Configuration:
+                  GridLayout:
+                    Elements:
+                      - {ElementId: pc-ov-start, ElementType: PARAMETER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: pc-ov-end, ElementType: PARAMETER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: fc-ov-mode, ElementType: FILTER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: fc-ov-dataset, ElementType: FILTER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+            Visuals:
+              - KPIVisual:
+                  VisualId: ov-kpi-datasets
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Datasets'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      Values:
+                        - NumericalMeasureField: {FieldId: ov-kpi-datasets-v, Column: {DataSetIdentifier: health, ColumnName: dataset_count}, AggregationFunction: {SimpleNumericalAggregation: SUM}}
+              - KPIVisual:
+                  VisualId: ov-kpi-spice
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'SPICE datasets'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      Values:
+                        - NumericalMeasureField: {FieldId: ov-kpi-spice-v, Column: {DataSetIdentifier: health, ColumnName: spice_count}, AggregationFunction: {SimpleNumericalAggregation: SUM}}
+              - KPIVisual:
+                  VisualId: ov-kpi-dq
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Direct query datasets'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      Values:
+                        - NumericalMeasureField: {FieldId: ov-kpi-dq-v, Column: {DataSetIdentifier: health, ColumnName: direct_query_count}, AggregationFunction: {SimpleNumericalAggregation: SUM}}
+              - KPIVisual:
+                  VisualId: ov-kpi-failed
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'FAILED last refresh'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      Values:
+                        - NumericalMeasureField: {FieldId: ov-kpi-failed-v, Column: {DataSetIdentifier: health, ColumnName: failed_count}, AggregationFunction: {SimpleNumericalAggregation: SUM}}
+              - KPIVisual:
+                  VisualId: ov-kpi-unref
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Unreferenced SPICE datasets'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      Values:
+                        - NumericalMeasureField: {FieldId: ov-kpi-unref-v, Column: {DataSetIdentifier: usage, ColumnName: unreferenced_count}, AggregationFunction: {SimpleNumericalAggregation: SUM}}
+              - KPIVisual:
+                  VisualId: ov-kpi-nouse
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Referenced, no observed use'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      Values:
+                        - NumericalMeasureField: {FieldId: ov-kpi-nouse-v, Column: {DataSetIdentifier: usage, ColumnName: no_observed_use_count}, AggregationFunction: {SimpleNumericalAggregation: SUM}}
+              - KPIVisual:
+                  VisualId: ov-kpi-gb
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'SPICE consumed (GB, estimated)'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      Values:
+                        - NumericalMeasureField: {FieldId: ov-kpi-gb-v, Column: {DataSetIdentifier: usage, ColumnName: spice_gb}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 2}}}}}
+              - KPIVisual:
+                  VisualId: ov-kpi-cost
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Est. SPICE cost (USD / month)'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      Values:
+                        - NumericalMeasureField: {FieldId: ov-kpi-cost-v, Column: {DataSetIdentifier: usage, ColumnName: est_monthly_cost_usd}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 2}}}}}
+              - BarChartVisual:
+                  VisualId: ov-bar-status
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Datasets by last refresh status and import mode'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      BarChartAggregatedFieldWells:
+                        Category:
+                          - CategoricalDimensionField: {FieldId: ov-bar-status-cat, Column: {DataSetIdentifier: health, ColumnName: last_status}}
+                        Values:
+                          - NumericalMeasureField: {FieldId: ov-bar-status-val, Column: {DataSetIdentifier: health, ColumnName: dataset_count}, AggregationFunction: {SimpleNumericalAggregation: SUM}}
+                        Colors:
+                          - CategoricalDimensionField: {FieldId: ov-bar-status-color, Column: {DataSetIdentifier: health, ColumnName: import_mode}}
+                    SortConfiguration:
+                      CategorySort:
+                        - FieldSort: {FieldId: ov-bar-status-val, Direction: DESC}
+                    Orientation: HORIZONTAL
+                    BarsArrangement: STACKED
+                    Legend: {Visibility: VISIBLE, Position: BOTTOM}
+              - BarChartVisual:
+                  VisualId: ov-bar-confidence
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Datasets by usage confidence'}}
+                  Subtitle: {Visibility: VISIBLE, FormatText: {PlainText: 'HIGH: agent citation or direct query; MEDIUM: dashboard view or scope-level agent evidence; LOW: referenced only; NO_EVIDENCE: nothing observed'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      BarChartAggregatedFieldWells:
+                        Category:
+                          - CategoricalDimensionField: {FieldId: ov-bar-confidence-cat, Column: {DataSetIdentifier: usage, ColumnName: usage_confidence}}
+                        Values:
+                          - NumericalMeasureField: {FieldId: ov-bar-confidence-val, Column: {DataSetIdentifier: usage, ColumnName: dataset_count}, AggregationFunction: {SimpleNumericalAggregation: SUM}}
+                        Colors:
+                          - CategoricalDimensionField: {FieldId: ov-bar-confidence-color, Column: {DataSetIdentifier: usage, ColumnName: import_mode}}
+                    SortConfiguration:
+                      CategorySort:
+                        - FieldSort: {FieldId: ov-bar-confidence-val, Direction: DESC}
+                    Orientation: HORIZONTAL
+                    BarsArrangement: STACKED
+                    Legend: {Visibility: VISIBLE, Position: BOTTOM}
+              - TableVisual:
+                  VisualId: ov-tbl-failed
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Currently FAILED datasets - with reason'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      TableAggregatedFieldWells:
+                        GroupBy:
+                          - CategoricalDimensionField: {FieldId: ov-tbl-failed-g0, Column: {DataSetIdentifier: health, ColumnName: dataset_name}}
+                          - CategoricalDimensionField: {FieldId: ov-tbl-failed-g1, Column: {DataSetIdentifier: health, ColumnName: error_type}}
+                          - CategoricalDimensionField: {FieldId: ov-tbl-failed-g2, Column: {DataSetIdentifier: health, ColumnName: error_message}}
+                          - CategoricalDimensionField: {FieldId: ov-tbl-failed-g3, Column: {DataSetIdentifier: health, ColumnName: last_request_type}}
+                        Values:
+                          - DateMeasureField: {FieldId: ov-tbl-failed-m0, Column: {DataSetIdentifier: health, ColumnName: last_failed_at}, AggregationFunction: MAX, FormatConfiguration: {DateTimeFormat: 'YYYY-MM-DD HH:mm'}}
+                          - DateMeasureField: {FieldId: ov-tbl-failed-m1, Column: {DataSetIdentifier: health, ColumnName: last_success_at}, AggregationFunction: MAX, FormatConfiguration: {DateTimeFormat: 'YYYY-MM-DD HH:mm'}}
+                          - NumericalMeasureField: {FieldId: ov-tbl-failed-m2, Column: {DataSetIdentifier: health, ColumnName: window_failed}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                    SortConfiguration:
+                      RowSort:
+                        - FieldSort: {FieldId: ov-tbl-failed-m0, Direction: DESC}
+                    FieldOptions:
+                      SelectedFieldOptions:
+                        - {FieldId: ov-tbl-failed-g0, CustomLabel: 'Dataset'}
+                        - {FieldId: ov-tbl-failed-g1, CustomLabel: 'Error type'}
+                        - {FieldId: ov-tbl-failed-g2, CustomLabel: 'Error message'}
+                        - {FieldId: ov-tbl-failed-g3, CustomLabel: 'Refresh type'}
+                        - {FieldId: ov-tbl-failed-m0, CustomLabel: 'Last failed'}
+                        - {FieldId: ov-tbl-failed-m1, CustomLabel: 'Last success'}
+                        - {FieldId: ov-tbl-failed-m2, CustomLabel: 'Failures in window'}
+            TextBoxes:
+              - SheetTextBoxId: ov-txt-howto
+                Content: '<text-box><block align="left"><inline font-weight="bold">How to read usage evidence.</inline> Quick exposes no authoritative "last used" attribute, so usage is a signal with a confidence label, never a verdict. A topic-grounded agent answer can cite nothing and leave no trace; ad-hoc analyses are invisible. Never delete a dataset on this signal alone. Refresh state comes from ListIngestions (hourly); usage, lineage and capacity from the daily scan. All collection is read-only through IAM - the governance team sees the operation without becoming a co-owner of anyone''s data.</block></text-box>'
+            Layouts:
+              - Configuration:
+                  GridLayout:
+                    CanvasSizeOptions:
+                      ScreenCanvasSizeOptions: {ResizeOption: FIXED, OptimizedViewPortWidth: '1600px'}
+                    Elements:
+                      - {ElementId: ov-kpi-datasets, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 4, RowIndex: 0, RowSpan: 5}
+                      - {ElementId: ov-kpi-spice, ElementType: VISUAL, ColumnIndex: 4, ColumnSpan: 4, RowIndex: 0, RowSpan: 5}
+                      - {ElementId: ov-kpi-dq, ElementType: VISUAL, ColumnIndex: 8, ColumnSpan: 4, RowIndex: 0, RowSpan: 5}
+                      - {ElementId: ov-kpi-failed, ElementType: VISUAL, ColumnIndex: 12, ColumnSpan: 4, RowIndex: 0, RowSpan: 5}
+                      - {ElementId: ov-kpi-unref, ElementType: VISUAL, ColumnIndex: 16, ColumnSpan: 5, RowIndex: 0, RowSpan: 5}
+                      - {ElementId: ov-kpi-nouse, ElementType: VISUAL, ColumnIndex: 21, ColumnSpan: 5, RowIndex: 0, RowSpan: 5}
+                      - {ElementId: ov-kpi-gb, ElementType: VISUAL, ColumnIndex: 26, ColumnSpan: 5, RowIndex: 0, RowSpan: 5}
+                      - {ElementId: ov-kpi-cost, ElementType: VISUAL, ColumnIndex: 31, ColumnSpan: 5, RowIndex: 0, RowSpan: 5}
+                      - {ElementId: ov-bar-status, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 18, RowIndex: 5, RowSpan: 10}
+                      - {ElementId: ov-bar-confidence, ElementType: VISUAL, ColumnIndex: 18, ColumnSpan: 18, RowIndex: 5, RowSpan: 10}
+                      - {ElementId: ov-tbl-failed, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 36, RowIndex: 15, RowSpan: 10}
+                      - {ElementId: ov-txt-howto, ElementType: TEXT_BOX, ColumnIndex: 0, ColumnSpan: 36, RowIndex: 25, RowSpan: 4}
+          - SheetId: sh-health
+            Name: 'Refresh health'
+            Title: 'Refresh health'
+            Description: 'Latest SPICE refresh per dataset: typed failure reasons, duration vs average (full vs incremental), rows ingested.'
+            ParameterControls:
+              - DateTimePicker:
+                  ParameterControlId: pc-rh-start
+                  Title: 'From'
+                  SourceParameterName: pStart
+                  DisplayOptions: {DateTimeFormat: 'YYYY-MM-DD'}
+              - DateTimePicker:
+                  ParameterControlId: pc-rh-end
+                  Title: 'To (exclusive)'
+                  SourceParameterName: pEnd
+                  DisplayOptions: {DateTimeFormat: 'YYYY-MM-DD'}
+            FilterControls:
+              - Dropdown:
+                  FilterControlId: fc-rh-mode
+                  Title: 'Import mode'
+                  SourceFilterId: f-mode-rh
+                  Type: MULTI_SELECT
+                  DisplayOptions:
+                    SelectAllOptions: {Visibility: VISIBLE}
+                    TitleOptions: {Visibility: VISIBLE}
+              - Dropdown:
+                  FilterControlId: fc-rh-dataset
+                  Title: 'Dataset'
+                  SourceFilterId: f-dataset-rh
+                  Type: MULTI_SELECT
+                  DisplayOptions:
+                    SelectAllOptions: {Visibility: VISIBLE}
+                    TitleOptions: {Visibility: VISIBLE}
+            SheetControlLayouts:
+              - Configuration:
+                  GridLayout:
+                    Elements:
+                      - {ElementId: pc-rh-start, ElementType: PARAMETER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: pc-rh-end, ElementType: PARAMETER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: fc-rh-mode, ElementType: FILTER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: fc-rh-dataset, ElementType: FILTER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+            Visuals:
+              - TableVisual:
+                  VisualId: rh-tbl-failed
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'FAILED datasets'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      TableAggregatedFieldWells:
+                        GroupBy:
+                          - CategoricalDimensionField: {FieldId: rh-tbl-failed-g0, Column: {DataSetIdentifier: health, ColumnName: dataset_name}}
+                          - CategoricalDimensionField: {FieldId: rh-tbl-failed-g1, Column: {DataSetIdentifier: health, ColumnName: error_type}}
+                          - CategoricalDimensionField: {FieldId: rh-tbl-failed-g2, Column: {DataSetIdentifier: health, ColumnName: error_message}}
+                          - CategoricalDimensionField: {FieldId: rh-tbl-failed-g3, Column: {DataSetIdentifier: health, ColumnName: last_request_type}}
+                          - CategoricalDimensionField: {FieldId: rh-tbl-failed-g4, Column: {DataSetIdentifier: health, ColumnName: last_request_source}}
+                        Values:
+                          - DateMeasureField: {FieldId: rh-tbl-failed-m0, Column: {DataSetIdentifier: health, ColumnName: last_failed_at}, AggregationFunction: MAX, FormatConfiguration: {DateTimeFormat: 'YYYY-MM-DD HH:mm'}}
+                          - DateMeasureField: {FieldId: rh-tbl-failed-m1, Column: {DataSetIdentifier: health, ColumnName: last_success_at}, AggregationFunction: MAX, FormatConfiguration: {DateTimeFormat: 'YYYY-MM-DD HH:mm'}}
+                          - NumericalMeasureField: {FieldId: rh-tbl-failed-m2, Column: {DataSetIdentifier: health, ColumnName: window_failed}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                          - NumericalMeasureField: {FieldId: rh-tbl-failed-m3, Column: {DataSetIdentifier: health, ColumnName: window_runs}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                    SortConfiguration:
+                      RowSort:
+                        - FieldSort: {FieldId: rh-tbl-failed-m0, Direction: DESC}
+                    FieldOptions:
+                      SelectedFieldOptions:
+                        - {FieldId: rh-tbl-failed-g0, CustomLabel: 'Dataset'}
+                        - {FieldId: rh-tbl-failed-g1, CustomLabel: 'Error type'}
+                        - {FieldId: rh-tbl-failed-g2, CustomLabel: 'Error message'}
+                        - {FieldId: rh-tbl-failed-g3, CustomLabel: 'Refresh type'}
+                        - {FieldId: rh-tbl-failed-g4, CustomLabel: 'Source'}
+                        - {FieldId: rh-tbl-failed-m0, CustomLabel: 'Last failed'}
+                        - {FieldId: rh-tbl-failed-m1, CustomLabel: 'Last success'}
+                        - {FieldId: rh-tbl-failed-m2, CustomLabel: 'Failures'}
+                        - {FieldId: rh-tbl-failed-m3, CustomLabel: 'Runs'}
+              - TableVisual:
+                  VisualId: rh-tbl-slowest
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Slowest SPICE datasets - average vs last duration (seconds)'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      TableAggregatedFieldWells:
+                        GroupBy:
+                          - CategoricalDimensionField: {FieldId: rh-tbl-slowest-g0, Column: {DataSetIdentifier: health, ColumnName: dataset_name}}
+                          - CategoricalDimensionField: {FieldId: rh-tbl-slowest-g1, Column: {DataSetIdentifier: health, ColumnName: last_status}}
+                        Values:
+                          - NumericalMeasureField: {FieldId: rh-tbl-slowest-m0, Column: {DataSetIdentifier: health, ColumnName: avg_duration_sec}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                          - NumericalMeasureField: {FieldId: rh-tbl-slowest-m1, Column: {DataSetIdentifier: health, ColumnName: last_duration_sec}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                          - NumericalMeasureField: {FieldId: rh-tbl-slowest-m2, Column: {DataSetIdentifier: health, ColumnName: duration_ratio}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 2}}}}}
+                          - NumericalMeasureField: {FieldId: rh-tbl-slowest-m3, Column: {DataSetIdentifier: health, ColumnName: avg_full_refresh_sec}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                          - NumericalMeasureField: {FieldId: rh-tbl-slowest-m4, Column: {DataSetIdentifier: health, ColumnName: avg_incremental_sec}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                          - NumericalMeasureField: {FieldId: rh-tbl-slowest-m5, Column: {DataSetIdentifier: health, ColumnName: rows_ingested}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                          - NumericalMeasureField: {FieldId: rh-tbl-slowest-m6, Column: {DataSetIdentifier: health, ColumnName: rows_dropped}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                          - DateMeasureField: {FieldId: rh-tbl-slowest-m7, Column: {DataSetIdentifier: health, ColumnName: last_success_at}, AggregationFunction: MAX, FormatConfiguration: {DateTimeFormat: 'YYYY-MM-DD HH:mm'}}
+                    SortConfiguration:
+                      RowSort:
+                        - FieldSort: {FieldId: rh-tbl-slowest-m0, Direction: DESC}
+                    FieldOptions:
+                      SelectedFieldOptions:
+                        - {FieldId: rh-tbl-slowest-g0, CustomLabel: 'Dataset'}
+                        - {FieldId: rh-tbl-slowest-g1, CustomLabel: 'Status'}
+                        - {FieldId: rh-tbl-slowest-m0, CustomLabel: 'Avg (s)'}
+                        - {FieldId: rh-tbl-slowest-m1, CustomLabel: 'Last (s)'}
+                        - {FieldId: rh-tbl-slowest-m2, CustomLabel: 'Last / avg'}
+                        - {FieldId: rh-tbl-slowest-m3, CustomLabel: 'Avg full (s)'}
+                        - {FieldId: rh-tbl-slowest-m4, CustomLabel: 'Avg incremental (s)'}
+                        - {FieldId: rh-tbl-slowest-m5, CustomLabel: 'Rows ingested'}
+                        - {FieldId: rh-tbl-slowest-m6, CustomLabel: 'Rows dropped'}
+                        - {FieldId: rh-tbl-slowest-m7, CustomLabel: 'Last success'}
+                  ConditionalFormatting:
+                    ConditionalFormattingOptions:
+                      - Cell: {FieldId: rh-tbl-slowest-m2, TextFormat: {TextColor: {Solid: {Expression: 'sum({duration_ratio}) > 1.5', Color: '#D91515'}}}}
+              - BarChartVisual:
+                  VisualId: rh-bar-duration
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Average refresh duration by dataset (seconds)'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      BarChartAggregatedFieldWells:
+                        Category:
+                          - CategoricalDimensionField: {FieldId: rh-bar-duration-cat, Column: {DataSetIdentifier: health, ColumnName: dataset_name}}
+                        Values:
+                          - NumericalMeasureField: {FieldId: rh-bar-duration-val, Column: {DataSetIdentifier: health, ColumnName: avg_duration_sec}, AggregationFunction: {SimpleNumericalAggregation: SUM}}
+                        Colors:
+                          - CategoricalDimensionField: {FieldId: rh-bar-duration-color, Column: {DataSetIdentifier: health, ColumnName: last_status}}
+                    SortConfiguration:
+                      CategorySort:
+                        - FieldSort: {FieldId: rh-bar-duration-val, Direction: DESC}
+                      CategoryItemsLimit: {ItemsLimit: 15, OtherCategories: EXCLUDE}
+                    Orientation: HORIZONTAL
+                    BarsArrangement: STACKED
+                    Legend: {Visibility: VISIBLE, Position: BOTTOM}
+              - TableVisual:
+                  VisualId: rh-tbl-all
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'All datasets - refresh state'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      TableAggregatedFieldWells:
+                        GroupBy:
+                          - CategoricalDimensionField: {FieldId: rh-tbl-all-g0, Column: {DataSetIdentifier: health, ColumnName: dataset_name}}
+                          - CategoricalDimensionField: {FieldId: rh-tbl-all-g1, Column: {DataSetIdentifier: health, ColumnName: import_mode}}
+                          - CategoricalDimensionField: {FieldId: rh-tbl-all-g2, Column: {DataSetIdentifier: health, ColumnName: last_status}}
+                          - CategoricalDimensionField: {FieldId: rh-tbl-all-g3, Column: {DataSetIdentifier: health, ColumnName: findings}}
+                        Values:
+                          - DateMeasureField: {FieldId: rh-tbl-all-m0, Column: {DataSetIdentifier: health, ColumnName: last_attempt_at}, AggregationFunction: MAX, FormatConfiguration: {DateTimeFormat: 'YYYY-MM-DD HH:mm'}}
+                          - DateMeasureField: {FieldId: rh-tbl-all-m1, Column: {DataSetIdentifier: health, ColumnName: last_success_at}, AggregationFunction: MAX, FormatConfiguration: {DateTimeFormat: 'YYYY-MM-DD HH:mm'}}
+                          - NumericalMeasureField: {FieldId: rh-tbl-all-m2, Column: {DataSetIdentifier: health, ColumnName: window_runs}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                          - NumericalMeasureField: {FieldId: rh-tbl-all-m3, Column: {DataSetIdentifier: health, ColumnName: window_failed}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                    SortConfiguration:
+                      RowSort:
+                        - FieldSort: {FieldId: rh-tbl-all-m0, Direction: DESC}
+                    FieldOptions:
+                      SelectedFieldOptions:
+                        - {FieldId: rh-tbl-all-g0, CustomLabel: 'Dataset'}
+                        - {FieldId: rh-tbl-all-g1, CustomLabel: 'Mode'}
+                        - {FieldId: rh-tbl-all-g2, CustomLabel: 'Status'}
+                        - {FieldId: rh-tbl-all-g3, CustomLabel: 'Findings'}
+                        - {FieldId: rh-tbl-all-m0, CustomLabel: 'Last attempt'}
+                        - {FieldId: rh-tbl-all-m1, CustomLabel: 'Last success'}
+                        - {FieldId: rh-tbl-all-m2, CustomLabel: 'Runs in window'}
+                        - {FieldId: rh-tbl-all-m3, CustomLabel: 'Failed'}
+            Layouts:
+              - Configuration:
+                  GridLayout:
+                    CanvasSizeOptions:
+                      ScreenCanvasSizeOptions: {ResizeOption: FIXED, OptimizedViewPortWidth: '1600px'}
+                    Elements:
+                      - {ElementId: rh-tbl-failed, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 36, RowIndex: 0, RowSpan: 9}
+                      - {ElementId: rh-tbl-slowest, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 22, RowIndex: 9, RowSpan: 11}
+                      - {ElementId: rh-bar-duration, ElementType: VISUAL, ColumnIndex: 22, ColumnSpan: 14, RowIndex: 9, RowSpan: 11}
+                      - {ElementId: rh-tbl-all, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 36, RowIndex: 20, RowSpan: 11}
+          - SheetId: sh-usage
+            Name: 'Usage'
+            Title: 'Usage and lineage'
+            Description: 'Who depends on each dataset (dashboards, topics, spaces, agents) and the last observed use with its confidence label.'
+            ParameterControls:
+              - DateTimePicker:
+                  ParameterControlId: pc-us-start
+                  Title: 'From'
+                  SourceParameterName: pStart
+                  DisplayOptions: {DateTimeFormat: 'YYYY-MM-DD'}
+              - DateTimePicker:
+                  ParameterControlId: pc-us-end
+                  Title: 'To (exclusive)'
+                  SourceParameterName: pEnd
+                  DisplayOptions: {DateTimeFormat: 'YYYY-MM-DD'}
+            FilterControls:
+              - Dropdown:
+                  FilterControlId: fc-us-mode
+                  Title: 'Import mode'
+                  SourceFilterId: f-mode-us
+                  Type: MULTI_SELECT
+                  DisplayOptions:
+                    SelectAllOptions: {Visibility: VISIBLE}
+                    TitleOptions: {Visibility: VISIBLE}
+              - Dropdown:
+                  FilterControlId: fc-us-dataset
+                  Title: 'Dataset'
+                  SourceFilterId: f-dataset-us
+                  Type: MULTI_SELECT
+                  DisplayOptions:
+                    SelectAllOptions: {Visibility: VISIBLE}
+                    TitleOptions: {Visibility: VISIBLE}
+            SheetControlLayouts:
+              - Configuration:
+                  GridLayout:
+                    Elements:
+                      - {ElementId: pc-us-start, ElementType: PARAMETER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: pc-us-end, ElementType: PARAMETER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: fc-us-mode, ElementType: FILTER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: fc-us-dataset, ElementType: FILTER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+            Visuals:
+              - TableVisual:
+                  VisualId: us-tbl-unreferenced
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Unreferenced datasets - in no dashboard, topic or space'}}
+                  Subtitle: {Visibility: VISIBLE, FormatText: {PlainText: 'Cost vs evidence - candidates for review, not deletion'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      TableAggregatedFieldWells:
+                        GroupBy:
+                          - CategoricalDimensionField: {FieldId: us-tbl-unreferenced-g0, Column: {DataSetIdentifier: usage, ColumnName: dataset_name}}
+                          - CategoricalDimensionField: {FieldId: us-tbl-unreferenced-g1, Column: {DataSetIdentifier: usage, ColumnName: import_mode}}
+                          - CategoricalDimensionField: {FieldId: us-tbl-unreferenced-g2, Column: {DataSetIdentifier: usage, ColumnName: usage_confidence}}
+                          - CategoricalDimensionField: {FieldId: us-tbl-unreferenced-g3, Column: {DataSetIdentifier: usage, ColumnName: findings}}
+                        Values:
+                          - NumericalMeasureField: {FieldId: us-tbl-unreferenced-m0, Column: {DataSetIdentifier: usage, ColumnName: spice_gb}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 3}}}}}
+                          - NumericalMeasureField: {FieldId: us-tbl-unreferenced-m1, Column: {DataSetIdentifier: usage, ColumnName: est_monthly_cost_usd}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 2}}}}}
+                          - NumericalMeasureField: {FieldId: us-tbl-unreferenced-m2, Column: {DataSetIdentifier: usage, ColumnName: agents}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                    SortConfiguration:
+                      RowSort:
+                        - FieldSort: {FieldId: us-tbl-unreferenced-m0, Direction: DESC}
+                    FieldOptions:
+                      SelectedFieldOptions:
+                        - {FieldId: us-tbl-unreferenced-g0, CustomLabel: 'Dataset'}
+                        - {FieldId: us-tbl-unreferenced-g1, CustomLabel: 'Mode'}
+                        - {FieldId: us-tbl-unreferenced-g2, CustomLabel: 'Confidence'}
+                        - {FieldId: us-tbl-unreferenced-g3, CustomLabel: 'Findings'}
+                        - {FieldId: us-tbl-unreferenced-m0, CustomLabel: 'SPICE GB'}
+                        - {FieldId: us-tbl-unreferenced-m1, CustomLabel: 'Est. USD / month'}
+                        - {FieldId: us-tbl-unreferenced-m2, CustomLabel: 'Agents reaching it'}
+              - TableVisual:
+                  VisualId: us-tbl-lru
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Least recently used - referenced datasets with usage evidence, stalest first'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      TableAggregatedFieldWells:
+                        GroupBy:
+                          - CategoricalDimensionField: {FieldId: us-tbl-lru-g0, Column: {DataSetIdentifier: usage, ColumnName: dataset_name}}
+                          - CategoricalDimensionField: {FieldId: us-tbl-lru-g1, Column: {DataSetIdentifier: usage, ColumnName: import_mode}}
+                          - CategoricalDimensionField: {FieldId: us-tbl-lru-g2, Column: {DataSetIdentifier: usage, ColumnName: usage_confidence}}
+                          - CategoricalDimensionField: {FieldId: us-tbl-lru-g3, Column: {DataSetIdentifier: usage, ColumnName: usage_source}}
+                        Values:
+                          - NumericalMeasureField: {FieldId: us-tbl-lru-m0, Column: {DataSetIdentifier: usage, ColumnName: days_since_observed_use}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                          - DateMeasureField: {FieldId: us-tbl-lru-m1, Column: {DataSetIdentifier: usage, ColumnName: last_observed_use_at}, AggregationFunction: MAX, FormatConfiguration: {DateTimeFormat: 'YYYY-MM-DD HH:mm'}}
+                          - NumericalMeasureField: {FieldId: us-tbl-lru-m2, Column: {DataSetIdentifier: usage, ColumnName: dashboards}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                          - NumericalMeasureField: {FieldId: us-tbl-lru-m3, Column: {DataSetIdentifier: usage, ColumnName: topics}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                          - NumericalMeasureField: {FieldId: us-tbl-lru-m4, Column: {DataSetIdentifier: usage, ColumnName: spaces}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                          - NumericalMeasureField: {FieldId: us-tbl-lru-m5, Column: {DataSetIdentifier: usage, ColumnName: agents}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                    SortConfiguration:
+                      RowSort:
+                        - FieldSort: {FieldId: us-tbl-lru-m0, Direction: DESC}
+                    FieldOptions:
+                      SelectedFieldOptions:
+                        - {FieldId: us-tbl-lru-g0, CustomLabel: 'Dataset'}
+                        - {FieldId: us-tbl-lru-g1, CustomLabel: 'Mode'}
+                        - {FieldId: us-tbl-lru-g2, CustomLabel: 'Confidence'}
+                        - {FieldId: us-tbl-lru-g3, CustomLabel: 'Evidence source'}
+                        - {FieldId: us-tbl-lru-m0, CustomLabel: 'Days since use'}
+                        - {FieldId: us-tbl-lru-m1, CustomLabel: 'Last observed use'}
+                        - {FieldId: us-tbl-lru-m2, CustomLabel: 'Dashboards'}
+                        - {FieldId: us-tbl-lru-m3, CustomLabel: 'Topics'}
+                        - {FieldId: us-tbl-lru-m4, CustomLabel: 'Spaces'}
+                        - {FieldId: us-tbl-lru-m5, CustomLabel: 'Agents'}
+              - TableVisual:
+                  VisualId: us-tbl-noevidence
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'No usage evidence - telemetry saw nothing (verify before acting)'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      TableAggregatedFieldWells:
+                        GroupBy:
+                          - CategoricalDimensionField: {FieldId: us-tbl-noevidence-g0, Column: {DataSetIdentifier: usage, ColumnName: dataset_name}}
+                          - CategoricalDimensionField: {FieldId: us-tbl-noevidence-g1, Column: {DataSetIdentifier: usage, ColumnName: import_mode}}
+                          - CategoricalDimensionField: {FieldId: us-tbl-noevidence-g2, Column: {DataSetIdentifier: usage, ColumnName: reference_state}}
+                        Values:
+                          - NumericalMeasureField: {FieldId: us-tbl-noevidence-m0, Column: {DataSetIdentifier: usage, ColumnName: dashboards}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                          - NumericalMeasureField: {FieldId: us-tbl-noevidence-m1, Column: {DataSetIdentifier: usage, ColumnName: topics}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                          - NumericalMeasureField: {FieldId: us-tbl-noevidence-m2, Column: {DataSetIdentifier: usage, ColumnName: spaces}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                          - NumericalMeasureField: {FieldId: us-tbl-noevidence-m3, Column: {DataSetIdentifier: usage, ColumnName: agents}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                          - NumericalMeasureField: {FieldId: us-tbl-noevidence-m4, Column: {DataSetIdentifier: usage, ColumnName: spice_gb}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 3}}}}}
+                    SortConfiguration:
+                      RowSort:
+                        - FieldSort: {FieldId: us-tbl-noevidence-m4, Direction: DESC}
+                    FieldOptions:
+                      SelectedFieldOptions:
+                        - {FieldId: us-tbl-noevidence-g0, CustomLabel: 'Dataset'}
+                        - {FieldId: us-tbl-noevidence-g1, CustomLabel: 'Mode'}
+                        - {FieldId: us-tbl-noevidence-g2, CustomLabel: 'Referenced'}
+                        - {FieldId: us-tbl-noevidence-m0, CustomLabel: 'Dashboards'}
+                        - {FieldId: us-tbl-noevidence-m1, CustomLabel: 'Topics'}
+                        - {FieldId: us-tbl-noevidence-m2, CustomLabel: 'Spaces'}
+                        - {FieldId: us-tbl-noevidence-m3, CustomLabel: 'Agents'}
+                        - {FieldId: us-tbl-noevidence-m4, CustomLabel: 'SPICE GB'}
+              - BarChartVisual:
+                  VisualId: us-bar-refs
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Datasets by reference state and confidence'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      BarChartAggregatedFieldWells:
+                        Category:
+                          - CategoricalDimensionField: {FieldId: us-bar-refs-cat, Column: {DataSetIdentifier: usage, ColumnName: reference_state}}
+                        Values:
+                          - NumericalMeasureField: {FieldId: us-bar-refs-val, Column: {DataSetIdentifier: usage, ColumnName: dataset_count}, AggregationFunction: {SimpleNumericalAggregation: SUM}}
+                        Colors:
+                          - CategoricalDimensionField: {FieldId: us-bar-refs-color, Column: {DataSetIdentifier: usage, ColumnName: usage_confidence}}
+                    Orientation: HORIZONTAL
+                    BarsArrangement: STACKED
+                    Legend: {Visibility: VISIBLE, Position: BOTTOM}
+            Layouts:
+              - Configuration:
+                  GridLayout:
+                    CanvasSizeOptions:
+                      ScreenCanvasSizeOptions: {ResizeOption: FIXED, OptimizedViewPortWidth: '1600px'}
+                    Elements:
+                      - {ElementId: us-tbl-unreferenced, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 22, RowIndex: 0, RowSpan: 10}
+                      - {ElementId: us-bar-refs, ElementType: VISUAL, ColumnIndex: 22, ColumnSpan: 14, RowIndex: 0, RowSpan: 10}
+                      - {ElementId: us-tbl-lru, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 36, RowIndex: 10, RowSpan: 11}
+                      - {ElementId: us-tbl-noevidence, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 36, RowIndex: 21, RowSpan: 10}
+          - SheetId: sh-capacity
+            Name: 'Capacity and cost'
+            Title: 'SPICE capacity and estimated cost'
+            Description: 'Consumed SPICE per dataset with an estimated monthly cost signal - an estimate from the configured rate, not an invoice.'
+            ParameterControls:
+              - DateTimePicker:
+                  ParameterControlId: pc-cp-start
+                  Title: 'From'
+                  SourceParameterName: pStart
+                  DisplayOptions: {DateTimeFormat: 'YYYY-MM-DD'}
+              - DateTimePicker:
+                  ParameterControlId: pc-cp-end
+                  Title: 'To (exclusive)'
+                  SourceParameterName: pEnd
+                  DisplayOptions: {DateTimeFormat: 'YYYY-MM-DD'}
+            FilterControls:
+              - Dropdown:
+                  FilterControlId: fc-cp-mode
+                  Title: 'Import mode'
+                  SourceFilterId: f-mode-cp
+                  Type: MULTI_SELECT
+                  DisplayOptions:
+                    SelectAllOptions: {Visibility: VISIBLE}
+                    TitleOptions: {Visibility: VISIBLE}
+              - Dropdown:
+                  FilterControlId: fc-cp-dataset
+                  Title: 'Dataset'
+                  SourceFilterId: f-dataset-cp
+                  Type: MULTI_SELECT
+                  DisplayOptions:
+                    SelectAllOptions: {Visibility: VISIBLE}
+                    TitleOptions: {Visibility: VISIBLE}
+            SheetControlLayouts:
+              - Configuration:
+                  GridLayout:
+                    Elements:
+                      - {ElementId: pc-cp-start, ElementType: PARAMETER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: pc-cp-end, ElementType: PARAMETER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: fc-cp-mode, ElementType: FILTER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: fc-cp-dataset, ElementType: FILTER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+            Visuals:
+              - TableVisual:
+                  VisualId: cp-tbl-largest
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Largest SPICE datasets'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      TableAggregatedFieldWells:
+                        GroupBy:
+                          - CategoricalDimensionField: {FieldId: cp-tbl-largest-g0, Column: {DataSetIdentifier: usage, ColumnName: dataset_name}}
+                          - CategoricalDimensionField: {FieldId: cp-tbl-largest-g1, Column: {DataSetIdentifier: usage, ColumnName: cost_type}}
+                          - CategoricalDimensionField: {FieldId: cp-tbl-largest-g2, Column: {DataSetIdentifier: usage, ColumnName: usage_confidence}}
+                        Values:
+                          - NumericalMeasureField: {FieldId: cp-tbl-largest-m0, Column: {DataSetIdentifier: usage, ColumnName: spice_gb}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 3}}}}}
+                          - NumericalMeasureField: {FieldId: cp-tbl-largest-m1, Column: {DataSetIdentifier: usage, ColumnName: est_monthly_cost_usd}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 2}}}}}
+                          - NumericalMeasureField: {FieldId: cp-tbl-largest-m2, Column: {DataSetIdentifier: usage, ColumnName: dashboards}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                          - NumericalMeasureField: {FieldId: cp-tbl-largest-m3, Column: {DataSetIdentifier: usage, ColumnName: topics}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                          - NumericalMeasureField: {FieldId: cp-tbl-largest-m4, Column: {DataSetIdentifier: usage, ColumnName: days_since_observed_use}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                    SortConfiguration:
+                      RowSort:
+                        - FieldSort: {FieldId: cp-tbl-largest-m0, Direction: DESC}
+                    FieldOptions:
+                      SelectedFieldOptions:
+                        - {FieldId: cp-tbl-largest-g0, CustomLabel: 'Dataset'}
+                        - {FieldId: cp-tbl-largest-g1, CustomLabel: 'Cost type'}
+                        - {FieldId: cp-tbl-largest-g2, CustomLabel: 'Usage confidence'}
+                        - {FieldId: cp-tbl-largest-m0, CustomLabel: 'SPICE GB'}
+                        - {FieldId: cp-tbl-largest-m1, CustomLabel: 'Est. USD / month'}
+                        - {FieldId: cp-tbl-largest-m2, CustomLabel: 'Dashboards'}
+                        - {FieldId: cp-tbl-largest-m3, CustomLabel: 'Topics'}
+                        - {FieldId: cp-tbl-largest-m4, CustomLabel: 'Days since use'}
+              - BarChartVisual:
+                  VisualId: cp-bar-cost
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Estimated monthly cost by dataset (USD)'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      BarChartAggregatedFieldWells:
+                        Category:
+                          - CategoricalDimensionField: {FieldId: cp-bar-cost-cat, Column: {DataSetIdentifier: usage, ColumnName: dataset_name}}
+                        Values:
+                          - NumericalMeasureField: {FieldId: cp-bar-cost-val, Column: {DataSetIdentifier: usage, ColumnName: est_monthly_cost_usd}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 2}}}}}
+                        Colors:
+                          - CategoricalDimensionField: {FieldId: cp-bar-cost-color, Column: {DataSetIdentifier: usage, ColumnName: usage_confidence}}
+                    SortConfiguration:
+                      CategorySort:
+                        - FieldSort: {FieldId: cp-bar-cost-val, Direction: DESC}
+                      CategoryItemsLimit: {ItemsLimit: 15, OtherCategories: EXCLUDE}
+                    Orientation: HORIZONTAL
+                    BarsArrangement: STACKED
+                    Legend: {Visibility: VISIBLE, Position: BOTTOM}
+              - PivotTableVisual:
+                  VisualId: cp-pivot
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'SPICE GB by usage confidence and reference state'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      PivotTableAggregatedFieldWells:
+                        Rows:
+                          - CategoricalDimensionField: {FieldId: cp-pivot-row, Column: {DataSetIdentifier: usage, ColumnName: usage_confidence}}
+                        Columns:
+                          - CategoricalDimensionField: {FieldId: cp-pivot-col, Column: {DataSetIdentifier: usage, ColumnName: reference_state}}
+                        Values:
+                          - NumericalMeasureField: {FieldId: cp-pivot-val, Column: {DataSetIdentifier: usage, ColumnName: spice_gb}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 3}}}}}
+                    TotalOptions:
+                      RowTotalOptions: {TotalsVisibility: VISIBLE}
+                      ColumnTotalOptions: {TotalsVisibility: VISIBLE}
+            Layouts:
+              - Configuration:
+                  GridLayout:
+                    CanvasSizeOptions:
+                      ScreenCanvasSizeOptions: {ResizeOption: FIXED, OptimizedViewPortWidth: '1600px'}
+                    Elements:
+                      - {ElementId: cp-tbl-largest, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 36, RowIndex: 0, RowSpan: 12}
+                      - {ElementId: cp-bar-cost, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 20, RowIndex: 12, RowSpan: 12}
+                      - {ElementId: cp-pivot, ElementType: VISUAL, ColumnIndex: 20, ColumnSpan: 16, RowIndex: 12, RowSpan: 12}
+          - SheetId: sh-history
+            Name: 'History'
+            Title: 'Refresh history'
+            Description: 'Hourly refresh-state records over the selected period: failure trend and the failure feed.'
+            ParameterControls:
+              - DateTimePicker:
+                  ParameterControlId: pc-hs-start
+                  Title: 'From'
+                  SourceParameterName: pStart
+                  DisplayOptions: {DateTimeFormat: 'YYYY-MM-DD'}
+              - DateTimePicker:
+                  ParameterControlId: pc-hs-end
+                  Title: 'To (exclusive)'
+                  SourceParameterName: pEnd
+                  DisplayOptions: {DateTimeFormat: 'YYYY-MM-DD'}
+            FilterControls:
+              - Dropdown:
+                  FilterControlId: fc-hs-mode
+                  Title: 'Import mode'
+                  SourceFilterId: f-mode-hs
+                  Type: MULTI_SELECT
+                  DisplayOptions:
+                    SelectAllOptions: {Visibility: VISIBLE}
+                    TitleOptions: {Visibility: VISIBLE}
+              - Dropdown:
+                  FilterControlId: fc-hs-dataset
+                  Title: 'Dataset'
+                  SourceFilterId: f-dataset-hs
+                  Type: MULTI_SELECT
+                  DisplayOptions:
+                    SelectAllOptions: {Visibility: VISIBLE}
+                    TitleOptions: {Visibility: VISIBLE}
+            SheetControlLayouts:
+              - Configuration:
+                  GridLayout:
+                    Elements:
+                      - {ElementId: pc-hs-start, ElementType: PARAMETER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: pc-hs-end, ElementType: PARAMETER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: fc-hs-mode, ElementType: FILTER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: fc-hs-dataset, ElementType: FILTER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+            Visuals:
+              - LineChartVisual:
+                  VisualId: hs-line-failed
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Datasets in FAILED state per scan'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      LineChartAggregatedFieldWells:
+                        Category:
+                          - DateDimensionField: {FieldId: hs-line-failed-cat, Column: {DataSetIdentifier: hist, ColumnName: scan_time}, DateGranularity: HOUR}
+                        Values:
+                          - NumericalMeasureField: {FieldId: hs-line-failed-val, Column: {DataSetIdentifier: hist, ColumnName: failed_count}, AggregationFunction: {SimpleNumericalAggregation: SUM}}
+                        Colors:
+                          - CategoricalDimensionField: {FieldId: hs-line-failed-color, Column: {DataSetIdentifier: hist, ColumnName: import_mode}}
+                    Type: LINE
+                    Legend: {Visibility: VISIBLE, Position: BOTTOM}
+              - BarChartVisual:
+                  VisualId: hs-bar-status
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Records per day by status'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      BarChartAggregatedFieldWells:
+                        Category:
+                          - DateDimensionField: {FieldId: hs-bar-status-cat, Column: {DataSetIdentifier: hist, ColumnName: scan_time}, DateGranularity: DAY}
+                        Values:
+                          - NumericalMeasureField: {FieldId: hs-bar-status-val, Column: {DataSetIdentifier: hist, ColumnName: record_count}, AggregationFunction: {SimpleNumericalAggregation: SUM}}
+                        Colors:
+                          - CategoricalDimensionField: {FieldId: hs-bar-status-color, Column: {DataSetIdentifier: hist, ColumnName: last_status}}
+                    Orientation: VERTICAL
+                    BarsArrangement: STACKED
+                    Legend: {Visibility: VISIBLE, Position: BOTTOM}
+              - TableVisual:
+                  VisualId: hs-tbl-failures
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Failure feed'}}
+                  Subtitle: {Visibility: VISIBLE, FormatText: {PlainText: 'One row per hourly scan while a dataset stayed FAILED'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      TableUnaggregatedFieldWells:
+                        Values:
+                          - {FieldId: hs-tbl-failures-c0, Column: {DataSetIdentifier: hist, ColumnName: scan_time}, FormatConfiguration: {DateTimeFormatConfiguration: {DateTimeFormat: 'YYYY-MM-DD HH:mm:ss'}}}
+                          - {FieldId: hs-tbl-failures-c1, Column: {DataSetIdentifier: hist, ColumnName: dataset_name}}
+                          - {FieldId: hs-tbl-failures-c2, Column: {DataSetIdentifier: hist, ColumnName: error_type}}
+                          - {FieldId: hs-tbl-failures-c3, Column: {DataSetIdentifier: hist, ColumnName: error_message}}
+                          - {FieldId: hs-tbl-failures-c4, Column: {DataSetIdentifier: hist, ColumnName: last_request_type}}
+                          - {FieldId: hs-tbl-failures-c5, Column: {DataSetIdentifier: hist, ColumnName: last_failed_at}, FormatConfiguration: {DateTimeFormatConfiguration: {DateTimeFormat: 'YYYY-MM-DD HH:mm:ss'}}}
+                    SortConfiguration:
+                      RowSort:
+                        - FieldSort: {FieldId: hs-tbl-failures-c0, Direction: DESC}
+                      PaginationConfiguration: {PageSize: 100, PageNumber: 1}
+                    FieldOptions:
+                      SelectedFieldOptions:
+                        - {FieldId: hs-tbl-failures-c0, CustomLabel: 'Scan (UTC)'}
+                        - {FieldId: hs-tbl-failures-c1, CustomLabel: 'Dataset'}
+                        - {FieldId: hs-tbl-failures-c2, CustomLabel: 'Error type'}
+                        - {FieldId: hs-tbl-failures-c3, CustomLabel: 'Error message'}
+                        - {FieldId: hs-tbl-failures-c4, CustomLabel: 'Refresh type'}
+                        - {FieldId: hs-tbl-failures-c5, CustomLabel: 'Last failed'}
+            Layouts:
+              - Configuration:
+                  GridLayout:
+                    CanvasSizeOptions:
+                      ScreenCanvasSizeOptions: {ResizeOption: FIXED, OptimizedViewPortWidth: '1600px'}
+                    Elements:
+                      - {ElementId: hs-line-failed, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 18, RowIndex: 0, RowSpan: 11}
+                      - {ElementId: hs-bar-status, ElementType: VISUAL, ColumnIndex: 18, ColumnSpan: 18, RowIndex: 0, RowSpan: 11}
+                      - {ElementId: hs-tbl-failures, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 36, RowIndex: 11, RowSpan: 12}
+      Tags:
+        - {Key: Purpose, Value: !Ref ResourcePrefix}
+        - {Key: ManagedBy, Value: CloudFormation}
+
+Outputs:
+  DashboardUrl:
+    Description: Open the dashboard in Amazon Quick (this Region).
+    Value: !Sub 'https://${AWS::Region}.quicksight.aws.amazon.com/sn/dashboards/${ResourcePrefix}-dashboard'

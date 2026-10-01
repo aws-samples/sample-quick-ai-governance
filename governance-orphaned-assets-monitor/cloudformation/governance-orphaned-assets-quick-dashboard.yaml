@@ -1,0 +1,1215 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Amazon Quick orphaned assets monitor - native Amazon Quick dashboard for
+  administrators. Glue table over the daily ownership snapshots the module
+  writes to S3 (owner principal names are not declared), a current-state
+  dataset (latest scan per asset) and a history dataset, and a four-tab
+  dashboard: Overview, Findings, Ownership, History. Requires the governance
+  analytics foundation stack in the same Region.
+
+# Prerequisites: governance-analytics-foundation in this Region; the Orphaned
+# Assets module writing snapshots (snapshots/ownership/dt=.../run-*.jsonl);
+# console authorization of DataBucketName for Quick's service role.
+
+Parameters:
+  ResourcePrefix:
+    Type: String
+    Default: 'quick-governance-orphaned-assets'
+    AllowedPattern: '^[a-z0-9-]{1,40}$'
+    Description: Prefix for the Quick dataset and dashboard IDs.
+  FoundationStackName:
+    Type: String
+    Default: 'quick-governance-analytics-foundation'
+    AllowedPattern: '^[A-Za-z][A-Za-z0-9-]{0,127}$'
+    Description: Stack name of the governance analytics foundation (exports are imported).
+  DataBucketName:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$'
+    Description: >
+      Bucket holding the module snapshots. Empty (default) reads the shared
+      analytics bucket created by the foundation stack; set it to read a
+      module-owned bucket (<prefix>-<account-id>) together with SnapshotPrefix=snapshots/ownership/.
+  SnapshotPrefix:
+    Type: String
+    Default: 'orphaned-assets/ownership/'
+    AllowedPattern: '^([A-Za-z0-9_=./-]+/)?$'
+    Description: Prefix of the dt=... partitioned ownership snapshots.
+  QuickPrincipalArn:
+    Type: String
+    AllowedPattern: '^arn:aws[a-z-]*:quicksight:[a-z0-9-]+:[0-9]{12}:(user|group)/.+$'
+    Description: Quick user or group ARN (identity Region) that owns the datasets and dashboard.
+
+Conditions:
+  UseSharedBucket: !Equals [!Ref DataBucketName, '']
+
+Resources:
+
+  SnapshotTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref 'AWS::AccountId'
+      DatabaseName:
+        Fn::ImportValue: !Sub '${FoundationStackName}-GlueDatabase'
+      TableInput:
+        Name: orphaned_assets_snapshots
+        Description: Orphaned Assets Monitor - one record per asset per daily scan (ownerPrincipals not declared).
+        TableType: EXTERNAL_TABLE
+        Parameters: {classification: json, EXTERNAL: 'TRUE'}
+        StorageDescriptor:
+          Location: !If
+            - UseSharedBucket
+            - !Sub
+              - 's3://${Bucket}/${SnapshotPrefix}'
+              - Bucket:
+                  Fn::ImportValue: !Sub '${FoundationStackName}-AnalyticsBucket'
+            - !Sub 's3://${DataBucketName}/${SnapshotPrefix}'
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.openx.data.jsonserde.JsonSerDe
+            Parameters: {ignore.malformed.json: 'true', case.insensitive: 'true'}
+          Columns:
+            - {Name: ts, Type: string}
+            - {Name: scanid, Type: string}
+            - {Name: scanstatus, Type: string}
+            - {Name: assettype, Type: string}
+            - {Name: assetid, Type: string}
+            - {Name: assetname, Type: string}
+            - {Name: assetarn, Type: string}
+            - {Name: findingtype, Type: string}
+            - {Name: severity, Type: string}
+            - {Name: confidence, Type: string}
+            - {Name: scannote, Type: string}
+            - {Name: ownerstotal, Type: int}
+            - {Name: ownersactive, Type: int}
+            - {Name: ownersmissing, Type: int}
+            - {Name: ownerspending, Type: int}
+            - {Name: viewerstotal, Type: int}
+            - {Name: firstobservedat, Type: string}
+            - {Name: lastobservedat, Type: string}
+            - {Name: recoveredfrom, Type: string}
+
+  # Current state: the most recent scan record per asset (window function).
+  CurrentDataSet:
+    Type: AWS::QuickSight::DataSet
+    DependsOn: SnapshotTable
+    Properties:
+      AwsAccountId: !Ref 'AWS::AccountId'
+      DataSetId: !Sub '${ResourcePrefix}-current'
+      Name: Quick governance - asset ownership (current)
+      ImportMode: DIRECT_QUERY
+      PhysicalTableMap:
+        current:
+          CustomSql:
+            DataSourceArn:
+              Fn::ImportValue: !Sub '${FoundationStackName}-QuickDataSourceArn'
+            Name: ownership_current
+            SqlQuery: !Sub
+              - |
+                WITH ranked AS (
+                  SELECT s.*, row_number() OVER (PARTITION BY assettype, assetid ORDER BY ts DESC) AS rn
+                  FROM "${Db}"."orphaned_assets_snapshots" s
+                  WHERE ts IS NOT NULL
+                )
+                -- An asset whose most recent record is RECOVERED has left the estate
+                -- or been excluded: it is not current. Filtering after ranking keeps
+                -- the older open finding from resurfacing.
+                SELECT
+                  from_iso8601_timestamp(ts) AS scan_time,
+                  scanid AS scan_id,
+                  COALESCE(scanstatus, 'UNKNOWN') AS scan_status,
+                  assettype AS asset_type,
+                  assetid AS asset_id,
+                  COALESCE(assetname, assetid) AS asset_name,
+                  assetarn AS asset_arn,
+                  findingtype AS finding_type,
+                  severity,
+                  CASE severity WHEN 'HIGH' THEN 1 WHEN 'MEDIUM' THEN 2 WHEN 'LOW' THEN 3 ELSE 4 END AS severity_rank,
+                  COALESCE(confidence, 'UNKNOWN') AS confidence,
+                  scannote AS scan_note,
+                  ownerstotal AS owners_total,
+                  ownersactive AS owners_active,
+                  ownersmissing AS owners_missing,
+                  ownerspending AS owners_pending,
+                  viewerstotal AS viewers_total,
+                  TRY(from_iso8601_timestamp(firstobservedat)) AS first_observed_at,
+                  date_diff('day', TRY(from_iso8601_timestamp(firstobservedat)), from_iso8601_timestamp(ts)) AS days_open,
+                  CASE WHEN severity = 'HIGH' THEN 1 ELSE 0 END AS high_count,
+                  CASE WHEN severity = 'MEDIUM' THEN 1 ELSE 0 END AS medium_count,
+                  CASE WHEN severity = 'LOW' THEN 1 ELSE 0 END AS low_count,
+                  CASE WHEN findingtype = 'NONE' THEN 1 ELSE 0 END AS healthy_count,
+                  CASE WHEN findingtype = 'SINGLE_ACTIVE_OWNER' THEN 1 ELSE 0 END AS single_owner_count,
+                  CASE WHEN findingtype IN ('NO_OWNER_GRANTS', 'OWNER_PRINCIPAL_MISSING', 'NO_ACTIVE_OWNER') THEN 1 ELSE 0 END AS orphaned_count,
+                  1 AS asset_count
+                FROM ranked WHERE rn = 1 AND findingtype <> 'RECOVERED'
+              - Db:
+                  Fn::ImportValue: !Sub '${FoundationStackName}-GlueDatabase'
+            Columns:
+              - {Name: scan_time, Type: DATETIME}
+              - {Name: scan_id, Type: STRING}
+              - {Name: scan_status, Type: STRING}
+              - {Name: asset_type, Type: STRING}
+              - {Name: asset_id, Type: STRING}
+              - {Name: asset_name, Type: STRING}
+              - {Name: asset_arn, Type: STRING}
+              - {Name: finding_type, Type: STRING}
+              - {Name: severity, Type: STRING}
+              - {Name: severity_rank, Type: INTEGER}
+              - {Name: confidence, Type: STRING}
+              - {Name: scan_note, Type: STRING}
+              - {Name: owners_total, Type: INTEGER}
+              - {Name: owners_active, Type: INTEGER}
+              - {Name: owners_missing, Type: INTEGER}
+              - {Name: owners_pending, Type: INTEGER}
+              - {Name: viewers_total, Type: INTEGER}
+              - {Name: first_observed_at, Type: DATETIME}
+              - {Name: days_open, Type: INTEGER}
+              - {Name: high_count, Type: INTEGER}
+              - {Name: medium_count, Type: INTEGER}
+              - {Name: low_count, Type: INTEGER}
+              - {Name: healthy_count, Type: INTEGER}
+              - {Name: single_owner_count, Type: INTEGER}
+              - {Name: orphaned_count, Type: INTEGER}
+              - {Name: asset_count, Type: INTEGER}
+      LogicalTableMap:
+        current:
+          Alias: ownership_current
+          Source: {PhysicalTableId: current}
+      Permissions:
+        - Principal: !Ref QuickPrincipalArn
+          Actions: [quicksight:DescribeDataSet, quicksight:DescribeDataSetPermissions, quicksight:PassDataSet, quicksight:DescribeIngestion, quicksight:ListIngestions, quicksight:UpdateDataSet, quicksight:DeleteDataSet, quicksight:CreateIngestion, quicksight:CancelIngestion, quicksight:UpdateDataSetPermissions]
+      Tags:
+        - {Key: Purpose, Value: !Ref ResourcePrefix}
+        - {Key: ManagedBy, Value: CloudFormation}
+
+  # History: every scan record, for trends and the recovered-findings feed.
+  HistoryDataSet:
+    Type: AWS::QuickSight::DataSet
+    DependsOn: SnapshotTable
+    Properties:
+      AwsAccountId: !Ref 'AWS::AccountId'
+      DataSetId: !Sub '${ResourcePrefix}-history'
+      Name: Quick governance - asset ownership (scan history)
+      ImportMode: DIRECT_QUERY
+      PhysicalTableMap:
+        history:
+          CustomSql:
+            DataSourceArn:
+              Fn::ImportValue: !Sub '${FoundationStackName}-QuickDataSourceArn'
+            Name: ownership_history
+            SqlQuery: !Sub
+              - |
+                SELECT
+                  from_iso8601_timestamp(ts) AS scan_time,
+                  scanid AS scan_id,
+                  COALESCE(scanstatus, 'UNKNOWN') AS scan_status,
+                  assettype AS asset_type,
+                  assetid AS asset_id,
+                  COALESCE(assetname, assetid) AS asset_name,
+                  findingtype AS finding_type,
+                  severity,
+                  recoveredfrom AS recovered_from,
+                  TRY(from_iso8601_timestamp(firstobservedat)) AS first_observed_at,
+                  CASE WHEN severity = 'HIGH' THEN 1 ELSE 0 END AS high_count,
+                  CASE WHEN severity = 'MEDIUM' THEN 1 ELSE 0 END AS medium_count,
+                  CASE WHEN severity = 'LOW' THEN 1 ELSE 0 END AS low_count,
+                  CASE WHEN findingtype = 'RECOVERED' THEN 1 ELSE 0 END AS recovered_count,
+                  CASE WHEN findingtype <> 'RECOVERED' THEN 1 ELSE 0 END AS asset_count
+                FROM "${Db}"."orphaned_assets_snapshots"
+                WHERE ts IS NOT NULL
+              - Db:
+                  Fn::ImportValue: !Sub '${FoundationStackName}-GlueDatabase'
+            Columns:
+              - {Name: scan_time, Type: DATETIME}
+              - {Name: scan_id, Type: STRING}
+              - {Name: scan_status, Type: STRING}
+              - {Name: asset_type, Type: STRING}
+              - {Name: asset_id, Type: STRING}
+              - {Name: asset_name, Type: STRING}
+              - {Name: finding_type, Type: STRING}
+              - {Name: severity, Type: STRING}
+              - {Name: recovered_from, Type: STRING}
+              - {Name: first_observed_at, Type: DATETIME}
+              - {Name: high_count, Type: INTEGER}
+              - {Name: medium_count, Type: INTEGER}
+              - {Name: low_count, Type: INTEGER}
+              - {Name: recovered_count, Type: INTEGER}
+              - {Name: asset_count, Type: INTEGER}
+      LogicalTableMap:
+        history:
+          Alias: ownership_history
+          Source: {PhysicalTableId: history}
+      Permissions:
+        - Principal: !Ref QuickPrincipalArn
+          Actions: [quicksight:DescribeDataSet, quicksight:DescribeDataSetPermissions, quicksight:PassDataSet, quicksight:DescribeIngestion, quicksight:ListIngestions, quicksight:UpdateDataSet, quicksight:DeleteDataSet, quicksight:CreateIngestion, quicksight:CancelIngestion, quicksight:UpdateDataSetPermissions]
+      Tags:
+        - {Key: Purpose, Value: !Ref ResourcePrefix}
+        - {Key: ManagedBy, Value: CloudFormation}
+
+  Dashboard:
+    Type: AWS::QuickSight::Dashboard
+    Properties:
+      AwsAccountId: !Ref 'AWS::AccountId'
+      DashboardId: !Sub '${ResourcePrefix}-dashboard'
+      Name: Amazon Quick - asset ownership
+      VersionDescription: Administrator dashboard - Overview, Findings, Ownership, History.
+      DashboardPublishOptions:
+        AdHocFilteringOption: {AvailabilityStatus: ENABLED}
+        ExportToCSVOption: {AvailabilityStatus: ENABLED}
+        SheetControlsOption: {VisibilityState: EXPANDED}
+      Permissions:
+        - Principal: !Ref QuickPrincipalArn
+          Actions: [quicksight:DescribeDashboard, quicksight:ListDashboardVersions, quicksight:UpdateDashboardPermissions, quicksight:QueryDashboard, quicksight:UpdateDashboard, quicksight:DeleteDashboard, quicksight:DescribeDashboardPermissions, quicksight:UpdateDashboardPublishedVersion]
+      Definition: # GENERATED
+        DataSetIdentifierDeclarations:
+          - Identifier: cur
+            DataSetArn: !GetAtt CurrentDataSet.Arn
+          - Identifier: hist
+            DataSetArn: !GetAtt HistoryDataSet.Arn
+        ParameterDeclarations:
+          - DateTimeParameterDeclaration:
+              Name: pStart
+              TimeGranularity: DAY
+              DefaultValues:
+                RollingDate: {Expression: "addDateTime(-3, 'MM', truncDate('MM', now()))"}
+          - DateTimeParameterDeclaration:
+              Name: pEnd
+              TimeGranularity: DAY
+              DefaultValues:
+                RollingDate: {Expression: "addDateTime(1, 'DD', truncDate('DD', now()))"}
+        FilterGroups:
+          - FilterGroupId: fg-range
+            CrossDataset: SINGLE_DATASET
+            Status: ENABLED
+            Filters:
+              - TimeRangeFilter:
+                  FilterId: f-range
+                  Column: {DataSetIdentifier: hist, ColumnName: scan_time}
+                  IncludeMinimum: true
+                  IncludeMaximum: false
+                  RangeMinimumValue: {Parameter: pStart}
+                  RangeMaximumValue: {Parameter: pEnd}
+                  NullOption: NON_NULLS_ONLY
+                  TimeGranularity: DAY
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-history
+                    Scope: ALL_VISUALS
+          - FilterGroupId: fg-assettype-ov
+            CrossDataset: ALL_DATASETS
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-assettype-ov
+                  Column: {DataSetIdentifier: cur, ColumnName: asset_type}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      SelectAllOptions: FILTER_ALL_VALUES
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-overview
+                    Scope: ALL_VISUALS
+          - FilterGroupId: fg-severity-ov
+            CrossDataset: ALL_DATASETS
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-severity-ov
+                  Column: {DataSetIdentifier: cur, ColumnName: severity}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      SelectAllOptions: FILTER_ALL_VALUES
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-overview
+                    Scope: ALL_VISUALS
+          - FilterGroupId: fg-finding-ov
+            CrossDataset: ALL_DATASETS
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-finding-ov
+                  Column: {DataSetIdentifier: cur, ColumnName: finding_type}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      SelectAllOptions: FILTER_ALL_VALUES
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-overview
+                    Scope: ALL_VISUALS
+          - FilterGroupId: fg-assettype-fd
+            CrossDataset: ALL_DATASETS
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-assettype-fd
+                  Column: {DataSetIdentifier: cur, ColumnName: asset_type}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      SelectAllOptions: FILTER_ALL_VALUES
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-findings
+                    Scope: ALL_VISUALS
+          - FilterGroupId: fg-severity-fd
+            CrossDataset: ALL_DATASETS
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-severity-fd
+                  Column: {DataSetIdentifier: cur, ColumnName: severity}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      SelectAllOptions: FILTER_ALL_VALUES
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-findings
+                    Scope: ALL_VISUALS
+          - FilterGroupId: fg-finding-fd
+            CrossDataset: ALL_DATASETS
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-finding-fd
+                  Column: {DataSetIdentifier: cur, ColumnName: finding_type}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      SelectAllOptions: FILTER_ALL_VALUES
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-findings
+                    Scope: ALL_VISUALS
+          - FilterGroupId: fg-assettype-ow
+            CrossDataset: ALL_DATASETS
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-assettype-ow
+                  Column: {DataSetIdentifier: cur, ColumnName: asset_type}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      SelectAllOptions: FILTER_ALL_VALUES
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-ownership
+                    Scope: ALL_VISUALS
+          - FilterGroupId: fg-severity-ow
+            CrossDataset: ALL_DATASETS
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-severity-ow
+                  Column: {DataSetIdentifier: cur, ColumnName: severity}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      SelectAllOptions: FILTER_ALL_VALUES
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-ownership
+                    Scope: ALL_VISUALS
+          - FilterGroupId: fg-finding-ow
+            CrossDataset: ALL_DATASETS
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-finding-ow
+                  Column: {DataSetIdentifier: cur, ColumnName: finding_type}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      SelectAllOptions: FILTER_ALL_VALUES
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-ownership
+                    Scope: ALL_VISUALS
+          - FilterGroupId: fg-assettype-hs
+            CrossDataset: ALL_DATASETS
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-assettype-hs
+                  Column: {DataSetIdentifier: cur, ColumnName: asset_type}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      SelectAllOptions: FILTER_ALL_VALUES
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-history
+                    Scope: ALL_VISUALS
+          - FilterGroupId: fg-severity-hs
+            CrossDataset: ALL_DATASETS
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-severity-hs
+                  Column: {DataSetIdentifier: cur, ColumnName: severity}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      SelectAllOptions: FILTER_ALL_VALUES
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-history
+                    Scope: ALL_VISUALS
+          - FilterGroupId: fg-finding-hs
+            CrossDataset: ALL_DATASETS
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-finding-hs
+                  Column: {DataSetIdentifier: cur, ColumnName: finding_type}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      SelectAllOptions: FILTER_ALL_VALUES
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-history
+                    Scope: ALL_VISUALS
+          - FilterGroupId: fg-high-only-sh-overview
+            CrossDataset: SINGLE_DATASET
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-high-only-sh-overview
+                  Column: {DataSetIdentifier: cur, ColumnName: severity}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      CategoryValues: ['HIGH']
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-overview
+                    Scope: SELECTED_VISUALS
+                    VisualIds: [ov-tbl-oldest-high]
+          - FilterGroupId: fg-high-only-sh-findings
+            CrossDataset: SINGLE_DATASET
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-high-only-sh-findings
+                  Column: {DataSetIdentifier: cur, ColumnName: severity}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      CategoryValues: ['HIGH']
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-findings
+                    Scope: SELECTED_VISUALS
+                    VisualIds: [fd-tbl-high]
+          - FilterGroupId: fg-medium-only-sh-findings
+            CrossDataset: SINGLE_DATASET
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-medium-only-sh-findings
+                  Column: {DataSetIdentifier: cur, ColumnName: severity}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      CategoryValues: ['MEDIUM']
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-findings
+                    Scope: SELECTED_VISUALS
+                    VisualIds: [fd-tbl-medium]
+          - FilterGroupId: fg-low-only-sh-findings
+            CrossDataset: SINGLE_DATASET
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-low-only-sh-findings
+                  Column: {DataSetIdentifier: cur, ColumnName: severity}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      CategoryValues: ['LOW']
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-findings
+                    Scope: SELECTED_VISUALS
+                    VisualIds: [fd-tbl-low]
+          - FilterGroupId: fg-single-owner-sh-ownership
+            CrossDataset: SINGLE_DATASET
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-single-owner-sh-ownership
+                  Column: {DataSetIdentifier: cur, ColumnName: finding_type}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      CategoryValues: ['SINGLE_ACTIVE_OWNER']
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-ownership
+                    Scope: SELECTED_VISUALS
+                    VisualIds: [ow-tbl-single]
+          - FilterGroupId: fg-recovered-only-sh-history
+            CrossDataset: SINGLE_DATASET
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-recovered-only-sh-history
+                  Column: {DataSetIdentifier: hist, ColumnName: finding_type}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      CategoryValues: ['RECOVERED']
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-history
+                    Scope: SELECTED_VISUALS
+                    VisualIds: [hs-tbl-recovered]
+        Sheets:
+          - SheetId: sh-overview
+            Name: 'Overview'
+            Title: 'Asset ownership - overview'
+            Description: 'Latest daily scan: who owns every Quick asset, which assets nobody can manage, and which are one departure from being orphaned.'
+            ParameterControls:
+              - DateTimePicker:
+                  ParameterControlId: pc-ov-start
+                  Title: 'From'
+                  SourceParameterName: pStart
+                  DisplayOptions: {DateTimeFormat: 'YYYY-MM-DD'}
+              - DateTimePicker:
+                  ParameterControlId: pc-ov-end
+                  Title: 'To (exclusive)'
+                  SourceParameterName: pEnd
+                  DisplayOptions: {DateTimeFormat: 'YYYY-MM-DD'}
+            FilterControls:
+              - Dropdown:
+                  FilterControlId: fc-ov-assettype
+                  Title: 'Asset type'
+                  SourceFilterId: f-assettype-ov
+                  Type: MULTI_SELECT
+                  DisplayOptions:
+                    SelectAllOptions: {Visibility: VISIBLE}
+                    TitleOptions: {Visibility: VISIBLE}
+              - Dropdown:
+                  FilterControlId: fc-ov-severity
+                  Title: 'Severity'
+                  SourceFilterId: f-severity-ov
+                  Type: MULTI_SELECT
+                  DisplayOptions:
+                    SelectAllOptions: {Visibility: VISIBLE}
+                    TitleOptions: {Visibility: VISIBLE}
+              - Dropdown:
+                  FilterControlId: fc-ov-finding
+                  Title: 'Finding'
+                  SourceFilterId: f-finding-ov
+                  Type: MULTI_SELECT
+                  DisplayOptions:
+                    SelectAllOptions: {Visibility: VISIBLE}
+                    TitleOptions: {Visibility: VISIBLE}
+            SheetControlLayouts:
+              - Configuration:
+                  GridLayout:
+                    Elements:
+                      - {ElementId: pc-ov-start, ElementType: PARAMETER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: pc-ov-end, ElementType: PARAMETER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: fc-ov-assettype, ElementType: FILTER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: fc-ov-severity, ElementType: FILTER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: fc-ov-finding, ElementType: FILTER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+            Visuals:
+              - KPIVisual:
+                  VisualId: ov-kpi-assets
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Assets scanned'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      Values:
+                        - NumericalMeasureField: {FieldId: ov-kpi-assets-v, Column: {DataSetIdentifier: cur, ColumnName: asset_count}, AggregationFunction: {SimpleNumericalAggregation: SUM}}
+              - KPIVisual:
+                  VisualId: ov-kpi-orphaned
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Orphaned (HIGH)'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      Values:
+                        - NumericalMeasureField: {FieldId: ov-kpi-orphaned-v, Column: {DataSetIdentifier: cur, ColumnName: orphaned_count}, AggregationFunction: {SimpleNumericalAggregation: SUM}}
+              - KPIVisual:
+                  VisualId: ov-kpi-high
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'HIGH findings'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      Values:
+                        - NumericalMeasureField: {FieldId: ov-kpi-high-v, Column: {DataSetIdentifier: cur, ColumnName: high_count}, AggregationFunction: {SimpleNumericalAggregation: SUM}}
+              - KPIVisual:
+                  VisualId: ov-kpi-medium
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'MEDIUM findings'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      Values:
+                        - NumericalMeasureField: {FieldId: ov-kpi-medium-v, Column: {DataSetIdentifier: cur, ColumnName: medium_count}, AggregationFunction: {SimpleNumericalAggregation: SUM}}
+              - KPIVisual:
+                  VisualId: ov-kpi-single
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Single owner (bus factor 1)'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      Values:
+                        - NumericalMeasureField: {FieldId: ov-kpi-single-v, Column: {DataSetIdentifier: cur, ColumnName: single_owner_count}, AggregationFunction: {SimpleNumericalAggregation: SUM}}
+              - KPIVisual:
+                  VisualId: ov-kpi-healthy
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Healthy (2+ active owners)'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      Values:
+                        - NumericalMeasureField: {FieldId: ov-kpi-healthy-v, Column: {DataSetIdentifier: cur, ColumnName: healthy_count}, AggregationFunction: {SimpleNumericalAggregation: SUM}}
+              - KPIVisual:
+                  VisualId: ov-kpi-scan
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Asset types covered'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      Values:
+                        - CategoricalMeasureField: {FieldId: ov-kpi-scan-v, Column: {DataSetIdentifier: cur, ColumnName: asset_type}, AggregationFunction: DISTINCT_COUNT}
+              - BarChartVisual:
+                  VisualId: ov-bar-coverage
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Ownership coverage by asset type'}}
+                  Subtitle: {Visibility: VISIBLE, FormatText: {PlainText: 'Assets per type, coloured by finding severity'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      BarChartAggregatedFieldWells:
+                        Category:
+                          - CategoricalDimensionField: {FieldId: ov-bar-coverage-cat, Column: {DataSetIdentifier: cur, ColumnName: asset_type}}
+                        Values:
+                          - NumericalMeasureField: {FieldId: ov-bar-coverage-val, Column: {DataSetIdentifier: cur, ColumnName: asset_count}, AggregationFunction: {SimpleNumericalAggregation: SUM}}
+                        Colors:
+                          - CategoricalDimensionField: {FieldId: ov-bar-coverage-color, Column: {DataSetIdentifier: cur, ColumnName: severity}}
+                    SortConfiguration:
+                      CategorySort:
+                        - FieldSort: {FieldId: ov-bar-coverage-val, Direction: DESC}
+                    Orientation: HORIZONTAL
+                    BarsArrangement: STACKED
+                    Legend: {Visibility: VISIBLE, Position: BOTTOM}
+              - BarChartVisual:
+                  VisualId: ov-bar-findings
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Findings by type'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      BarChartAggregatedFieldWells:
+                        Category:
+                          - CategoricalDimensionField: {FieldId: ov-bar-findings-cat, Column: {DataSetIdentifier: cur, ColumnName: finding_type}}
+                        Values:
+                          - NumericalMeasureField: {FieldId: ov-bar-findings-val, Column: {DataSetIdentifier: cur, ColumnName: asset_count}, AggregationFunction: {SimpleNumericalAggregation: SUM}}
+                        Colors:
+                          - CategoricalDimensionField: {FieldId: ov-bar-findings-color, Column: {DataSetIdentifier: cur, ColumnName: asset_type}}
+                    SortConfiguration:
+                      CategorySort:
+                        - FieldSort: {FieldId: ov-bar-findings-val, Direction: DESC}
+                    Orientation: HORIZONTAL
+                    BarsArrangement: STACKED
+                    Legend: {Visibility: VISIBLE, Position: BOTTOM}
+              - TableVisual:
+                  VisualId: ov-tbl-oldest-high
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Act now - HIGH findings, oldest first'}}
+                  Subtitle: {Visibility: VISIBLE, FormatText: {PlainText: 'Nobody can manage these assets. Transfer them in Manage Quick -> Manage assets'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      TableAggregatedFieldWells:
+                        GroupBy:
+                          - CategoricalDimensionField: {FieldId: ov-tbl-oldest-high-g0, Column: {DataSetIdentifier: cur, ColumnName: asset_type}}
+                          - CategoricalDimensionField: {FieldId: ov-tbl-oldest-high-g1, Column: {DataSetIdentifier: cur, ColumnName: asset_name}}
+                          - CategoricalDimensionField: {FieldId: ov-tbl-oldest-high-g2, Column: {DataSetIdentifier: cur, ColumnName: finding_type}}
+                          - CategoricalDimensionField: {FieldId: ov-tbl-oldest-high-g3, Column: {DataSetIdentifier: cur, ColumnName: confidence}}
+                        Values:
+                          - NumericalMeasureField: {FieldId: ov-tbl-oldest-high-m0, Column: {DataSetIdentifier: cur, ColumnName: days_open}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                          - NumericalMeasureField: {FieldId: ov-tbl-oldest-high-m1, Column: {DataSetIdentifier: cur, ColumnName: owners_total}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                          - NumericalMeasureField: {FieldId: ov-tbl-oldest-high-m2, Column: {DataSetIdentifier: cur, ColumnName: owners_missing}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                          - NumericalMeasureField: {FieldId: ov-tbl-oldest-high-m3, Column: {DataSetIdentifier: cur, ColumnName: viewers_total}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                          - DateMeasureField: {FieldId: ov-tbl-oldest-high-m4, Column: {DataSetIdentifier: cur, ColumnName: first_observed_at}, AggregationFunction: MIN, FormatConfiguration: {DateTimeFormat: 'YYYY-MM-DD HH:mm'}}
+                    SortConfiguration:
+                      RowSort:
+                        - FieldSort: {FieldId: ov-tbl-oldest-high-m0, Direction: DESC}
+                    FieldOptions:
+                      SelectedFieldOptions:
+                        - {FieldId: ov-tbl-oldest-high-g0, CustomLabel: 'Type'}
+                        - {FieldId: ov-tbl-oldest-high-g1, CustomLabel: 'Asset'}
+                        - {FieldId: ov-tbl-oldest-high-g2, CustomLabel: 'Finding'}
+                        - {FieldId: ov-tbl-oldest-high-g3, CustomLabel: 'Confidence'}
+                        - {FieldId: ov-tbl-oldest-high-m0, CustomLabel: 'Days open'}
+                        - {FieldId: ov-tbl-oldest-high-m1, CustomLabel: 'Owner grants'}
+                        - {FieldId: ov-tbl-oldest-high-m2, CustomLabel: 'Missing owners'}
+                        - {FieldId: ov-tbl-oldest-high-m3, CustomLabel: 'Viewers'}
+                        - {FieldId: ov-tbl-oldest-high-m4, CustomLabel: 'First observed'}
+            TextBoxes:
+              - SheetTextBoxId: ov-txt-howto
+                Content: '<text-box><block align="left"><inline font-weight="bold">How to read ownership findings.</inline> An owner is any grant that carries quicksight:Update&lt;Type&gt;Permissions. HIGH (NO_OWNER_GRANTS, OWNER_PRINCIPAL_MISSING, NO_ACTIVE_OWNER): nobody can manage the asset - transfer it. MEDIUM (SINGLE_ACTIVE_OWNER): one departure away from orphaned - add an admin or recovery group as co-owner. Confidence PROBABLE means a missing principal is inferred from the Quick inventory, not confirmed. This monitor is audit-only; remediation stays manual in the Quick asset management console. Owner principal names are kept out of this dashboard by design.</block></text-box>'
+            Layouts:
+              - Configuration:
+                  GridLayout:
+                    CanvasSizeOptions:
+                      ScreenCanvasSizeOptions: {ResizeOption: FIXED, OptimizedViewPortWidth: '1600px'}
+                    Elements:
+                      - {ElementId: ov-kpi-assets, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 5, RowIndex: 0, RowSpan: 5}
+                      - {ElementId: ov-kpi-orphaned, ElementType: VISUAL, ColumnIndex: 5, ColumnSpan: 5, RowIndex: 0, RowSpan: 5}
+                      - {ElementId: ov-kpi-high, ElementType: VISUAL, ColumnIndex: 10, ColumnSpan: 5, RowIndex: 0, RowSpan: 5}
+                      - {ElementId: ov-kpi-medium, ElementType: VISUAL, ColumnIndex: 15, ColumnSpan: 5, RowIndex: 0, RowSpan: 5}
+                      - {ElementId: ov-kpi-single, ElementType: VISUAL, ColumnIndex: 20, ColumnSpan: 5, RowIndex: 0, RowSpan: 5}
+                      - {ElementId: ov-kpi-healthy, ElementType: VISUAL, ColumnIndex: 25, ColumnSpan: 5, RowIndex: 0, RowSpan: 5}
+                      - {ElementId: ov-kpi-scan, ElementType: VISUAL, ColumnIndex: 30, ColumnSpan: 6, RowIndex: 0, RowSpan: 5}
+                      - {ElementId: ov-bar-coverage, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 18, RowIndex: 5, RowSpan: 11}
+                      - {ElementId: ov-bar-findings, ElementType: VISUAL, ColumnIndex: 18, ColumnSpan: 18, RowIndex: 5, RowSpan: 11}
+                      - {ElementId: ov-tbl-oldest-high, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 36, RowIndex: 16, RowSpan: 12}
+                      - {ElementId: ov-txt-howto, ElementType: TEXT_BOX, ColumnIndex: 0, ColumnSpan: 36, RowIndex: 28, RowSpan: 4}
+          - SheetId: sh-findings
+            Name: 'Findings'
+            Title: 'Findings by severity'
+            Description: 'The complete action lists from the latest scan, ordered by how long each finding has been open.'
+            ParameterControls:
+              - DateTimePicker:
+                  ParameterControlId: pc-fd-start
+                  Title: 'From'
+                  SourceParameterName: pStart
+                  DisplayOptions: {DateTimeFormat: 'YYYY-MM-DD'}
+              - DateTimePicker:
+                  ParameterControlId: pc-fd-end
+                  Title: 'To (exclusive)'
+                  SourceParameterName: pEnd
+                  DisplayOptions: {DateTimeFormat: 'YYYY-MM-DD'}
+            FilterControls:
+              - Dropdown:
+                  FilterControlId: fc-fd-assettype
+                  Title: 'Asset type'
+                  SourceFilterId: f-assettype-fd
+                  Type: MULTI_SELECT
+                  DisplayOptions:
+                    SelectAllOptions: {Visibility: VISIBLE}
+                    TitleOptions: {Visibility: VISIBLE}
+              - Dropdown:
+                  FilterControlId: fc-fd-severity
+                  Title: 'Severity'
+                  SourceFilterId: f-severity-fd
+                  Type: MULTI_SELECT
+                  DisplayOptions:
+                    SelectAllOptions: {Visibility: VISIBLE}
+                    TitleOptions: {Visibility: VISIBLE}
+              - Dropdown:
+                  FilterControlId: fc-fd-finding
+                  Title: 'Finding'
+                  SourceFilterId: f-finding-fd
+                  Type: MULTI_SELECT
+                  DisplayOptions:
+                    SelectAllOptions: {Visibility: VISIBLE}
+                    TitleOptions: {Visibility: VISIBLE}
+            SheetControlLayouts:
+              - Configuration:
+                  GridLayout:
+                    Elements:
+                      - {ElementId: pc-fd-start, ElementType: PARAMETER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: pc-fd-end, ElementType: PARAMETER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: fc-fd-assettype, ElementType: FILTER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: fc-fd-severity, ElementType: FILTER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: fc-fd-finding, ElementType: FILTER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+            Visuals:
+              - TableVisual:
+                  VisualId: fd-tbl-high
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'HIGH - orphaned or missing-owner assets'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      TableAggregatedFieldWells:
+                        GroupBy:
+                          - CategoricalDimensionField: {FieldId: fd-tbl-high-g0, Column: {DataSetIdentifier: cur, ColumnName: asset_type}}
+                          - CategoricalDimensionField: {FieldId: fd-tbl-high-g1, Column: {DataSetIdentifier: cur, ColumnName: asset_name}}
+                          - CategoricalDimensionField: {FieldId: fd-tbl-high-g2, Column: {DataSetIdentifier: cur, ColumnName: asset_id}}
+                          - CategoricalDimensionField: {FieldId: fd-tbl-high-g3, Column: {DataSetIdentifier: cur, ColumnName: finding_type}}
+                          - CategoricalDimensionField: {FieldId: fd-tbl-high-g4, Column: {DataSetIdentifier: cur, ColumnName: confidence}}
+                          - CategoricalDimensionField: {FieldId: fd-tbl-high-g5, Column: {DataSetIdentifier: cur, ColumnName: scan_note}}
+                        Values:
+                          - NumericalMeasureField: {FieldId: fd-tbl-high-m0, Column: {DataSetIdentifier: cur, ColumnName: days_open}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                          - NumericalMeasureField: {FieldId: fd-tbl-high-m1, Column: {DataSetIdentifier: cur, ColumnName: owners_total}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                          - NumericalMeasureField: {FieldId: fd-tbl-high-m2, Column: {DataSetIdentifier: cur, ColumnName: owners_missing}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                          - NumericalMeasureField: {FieldId: fd-tbl-high-m3, Column: {DataSetIdentifier: cur, ColumnName: owners_pending}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                          - NumericalMeasureField: {FieldId: fd-tbl-high-m4, Column: {DataSetIdentifier: cur, ColumnName: viewers_total}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                          - DateMeasureField: {FieldId: fd-tbl-high-m5, Column: {DataSetIdentifier: cur, ColumnName: first_observed_at}, AggregationFunction: MIN, FormatConfiguration: {DateTimeFormat: 'YYYY-MM-DD HH:mm'}}
+                    SortConfiguration:
+                      RowSort:
+                        - FieldSort: {FieldId: fd-tbl-high-m0, Direction: DESC}
+                    FieldOptions:
+                      SelectedFieldOptions:
+                        - {FieldId: fd-tbl-high-g0, CustomLabel: 'Type'}
+                        - {FieldId: fd-tbl-high-g1, CustomLabel: 'Asset'}
+                        - {FieldId: fd-tbl-high-g2, CustomLabel: 'Asset ID'}
+                        - {FieldId: fd-tbl-high-g3, CustomLabel: 'Finding'}
+                        - {FieldId: fd-tbl-high-g4, CustomLabel: 'Confidence'}
+                        - {FieldId: fd-tbl-high-g5, CustomLabel: 'Scan note'}
+                        - {FieldId: fd-tbl-high-m0, CustomLabel: 'Days open'}
+                        - {FieldId: fd-tbl-high-m1, CustomLabel: 'Owner grants'}
+                        - {FieldId: fd-tbl-high-m2, CustomLabel: 'Missing'}
+                        - {FieldId: fd-tbl-high-m3, CustomLabel: 'Pending'}
+                        - {FieldId: fd-tbl-high-m4, CustomLabel: 'Viewers'}
+                        - {FieldId: fd-tbl-high-m5, CustomLabel: 'First observed'}
+              - TableVisual:
+                  VisualId: fd-tbl-medium
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'MEDIUM - at-risk assets (single owner, inactive-only owners)'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      TableAggregatedFieldWells:
+                        GroupBy:
+                          - CategoricalDimensionField: {FieldId: fd-tbl-medium-g0, Column: {DataSetIdentifier: cur, ColumnName: asset_type}}
+                          - CategoricalDimensionField: {FieldId: fd-tbl-medium-g1, Column: {DataSetIdentifier: cur, ColumnName: asset_name}}
+                          - CategoricalDimensionField: {FieldId: fd-tbl-medium-g2, Column: {DataSetIdentifier: cur, ColumnName: asset_id}}
+                          - CategoricalDimensionField: {FieldId: fd-tbl-medium-g3, Column: {DataSetIdentifier: cur, ColumnName: finding_type}}
+                        Values:
+                          - NumericalMeasureField: {FieldId: fd-tbl-medium-m0, Column: {DataSetIdentifier: cur, ColumnName: days_open}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                          - NumericalMeasureField: {FieldId: fd-tbl-medium-m1, Column: {DataSetIdentifier: cur, ColumnName: owners_active}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                          - NumericalMeasureField: {FieldId: fd-tbl-medium-m2, Column: {DataSetIdentifier: cur, ColumnName: owners_pending}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                          - NumericalMeasureField: {FieldId: fd-tbl-medium-m3, Column: {DataSetIdentifier: cur, ColumnName: viewers_total}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                    SortConfiguration:
+                      RowSort:
+                        - FieldSort: {FieldId: fd-tbl-medium-m0, Direction: DESC}
+                    FieldOptions:
+                      SelectedFieldOptions:
+                        - {FieldId: fd-tbl-medium-g0, CustomLabel: 'Type'}
+                        - {FieldId: fd-tbl-medium-g1, CustomLabel: 'Asset'}
+                        - {FieldId: fd-tbl-medium-g2, CustomLabel: 'Asset ID'}
+                        - {FieldId: fd-tbl-medium-g3, CustomLabel: 'Finding'}
+                        - {FieldId: fd-tbl-medium-m0, CustomLabel: 'Days open'}
+                        - {FieldId: fd-tbl-medium-m1, CustomLabel: 'Active owners'}
+                        - {FieldId: fd-tbl-medium-m2, CustomLabel: 'Pending'}
+                        - {FieldId: fd-tbl-medium-m3, CustomLabel: 'Viewers'}
+              - TableVisual:
+                  VisualId: fd-tbl-low
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'LOW - mixed or unknown owner status'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      TableAggregatedFieldWells:
+                        GroupBy:
+                          - CategoricalDimensionField: {FieldId: fd-tbl-low-g0, Column: {DataSetIdentifier: cur, ColumnName: asset_type}}
+                          - CategoricalDimensionField: {FieldId: fd-tbl-low-g1, Column: {DataSetIdentifier: cur, ColumnName: asset_name}}
+                          - CategoricalDimensionField: {FieldId: fd-tbl-low-g2, Column: {DataSetIdentifier: cur, ColumnName: finding_type}}
+                          - CategoricalDimensionField: {FieldId: fd-tbl-low-g3, Column: {DataSetIdentifier: cur, ColumnName: scan_note}}
+                        Values:
+                          - NumericalMeasureField: {FieldId: fd-tbl-low-m0, Column: {DataSetIdentifier: cur, ColumnName: owners_active}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                          - NumericalMeasureField: {FieldId: fd-tbl-low-m1, Column: {DataSetIdentifier: cur, ColumnName: owners_missing}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                          - NumericalMeasureField: {FieldId: fd-tbl-low-m2, Column: {DataSetIdentifier: cur, ColumnName: days_open}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                    SortConfiguration:
+                      RowSort:
+                        - FieldSort: {FieldId: fd-tbl-low-m0, Direction: DESC}
+                    FieldOptions:
+                      SelectedFieldOptions:
+                        - {FieldId: fd-tbl-low-g0, CustomLabel: 'Type'}
+                        - {FieldId: fd-tbl-low-g1, CustomLabel: 'Asset'}
+                        - {FieldId: fd-tbl-low-g2, CustomLabel: 'Finding'}
+                        - {FieldId: fd-tbl-low-g3, CustomLabel: 'Scan note'}
+                        - {FieldId: fd-tbl-low-m0, CustomLabel: 'Active owners'}
+                        - {FieldId: fd-tbl-low-m1, CustomLabel: 'Missing'}
+                        - {FieldId: fd-tbl-low-m2, CustomLabel: 'Days open'}
+            Layouts:
+              - Configuration:
+                  GridLayout:
+                    CanvasSizeOptions:
+                      ScreenCanvasSizeOptions: {ResizeOption: FIXED, OptimizedViewPortWidth: '1600px'}
+                    Elements:
+                      - {ElementId: fd-tbl-high, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 36, RowIndex: 0, RowSpan: 12}
+                      - {ElementId: fd-tbl-medium, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 36, RowIndex: 12, RowSpan: 10}
+                      - {ElementId: fd-tbl-low, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 36, RowIndex: 22, RowSpan: 8}
+          - SheetId: sh-ownership
+            Name: 'Ownership'
+            Title: 'Ownership coverage'
+            Description: 'How ownership is distributed across the estate: coverage per asset type and the bus-factor-1 list to review before offboarding.'
+            ParameterControls:
+              - DateTimePicker:
+                  ParameterControlId: pc-ow-start
+                  Title: 'From'
+                  SourceParameterName: pStart
+                  DisplayOptions: {DateTimeFormat: 'YYYY-MM-DD'}
+              - DateTimePicker:
+                  ParameterControlId: pc-ow-end
+                  Title: 'To (exclusive)'
+                  SourceParameterName: pEnd
+                  DisplayOptions: {DateTimeFormat: 'YYYY-MM-DD'}
+            FilterControls:
+              - Dropdown:
+                  FilterControlId: fc-ow-assettype
+                  Title: 'Asset type'
+                  SourceFilterId: f-assettype-ow
+                  Type: MULTI_SELECT
+                  DisplayOptions:
+                    SelectAllOptions: {Visibility: VISIBLE}
+                    TitleOptions: {Visibility: VISIBLE}
+              - Dropdown:
+                  FilterControlId: fc-ow-severity
+                  Title: 'Severity'
+                  SourceFilterId: f-severity-ow
+                  Type: MULTI_SELECT
+                  DisplayOptions:
+                    SelectAllOptions: {Visibility: VISIBLE}
+                    TitleOptions: {Visibility: VISIBLE}
+              - Dropdown:
+                  FilterControlId: fc-ow-finding
+                  Title: 'Finding'
+                  SourceFilterId: f-finding-ow
+                  Type: MULTI_SELECT
+                  DisplayOptions:
+                    SelectAllOptions: {Visibility: VISIBLE}
+                    TitleOptions: {Visibility: VISIBLE}
+            SheetControlLayouts:
+              - Configuration:
+                  GridLayout:
+                    Elements:
+                      - {ElementId: pc-ow-start, ElementType: PARAMETER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: pc-ow-end, ElementType: PARAMETER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: fc-ow-assettype, ElementType: FILTER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: fc-ow-severity, ElementType: FILTER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: fc-ow-finding, ElementType: FILTER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+            Visuals:
+              - TableVisual:
+                  VisualId: ow-tbl-coverage
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Coverage by asset type'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      TableAggregatedFieldWells:
+                        GroupBy:
+                          - CategoricalDimensionField: {FieldId: ow-tbl-coverage-g0, Column: {DataSetIdentifier: cur, ColumnName: asset_type}}
+                        Values:
+                          - NumericalMeasureField: {FieldId: ow-tbl-coverage-m0, Column: {DataSetIdentifier: cur, ColumnName: asset_count}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                          - NumericalMeasureField: {FieldId: ow-tbl-coverage-m1, Column: {DataSetIdentifier: cur, ColumnName: healthy_count}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                          - NumericalMeasureField: {FieldId: ow-tbl-coverage-m2, Column: {DataSetIdentifier: cur, ColumnName: single_owner_count}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                          - NumericalMeasureField: {FieldId: ow-tbl-coverage-m3, Column: {DataSetIdentifier: cur, ColumnName: orphaned_count}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                          - NumericalMeasureField: {FieldId: ow-tbl-coverage-m4, Column: {DataSetIdentifier: cur, ColumnName: high_count}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                          - NumericalMeasureField: {FieldId: ow-tbl-coverage-m5, Column: {DataSetIdentifier: cur, ColumnName: medium_count}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                          - NumericalMeasureField: {FieldId: ow-tbl-coverage-m6, Column: {DataSetIdentifier: cur, ColumnName: low_count}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                          - NumericalMeasureField: {FieldId: ow-tbl-coverage-m7, Column: {DataSetIdentifier: cur, ColumnName: owners_active}, AggregationFunction: {SimpleNumericalAggregation: AVERAGE}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 1}}}}}
+                          - NumericalMeasureField: {FieldId: ow-tbl-coverage-m8, Column: {DataSetIdentifier: cur, ColumnName: viewers_total}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                    SortConfiguration:
+                      RowSort:
+                        - FieldSort: {FieldId: ow-tbl-coverage-m0, Direction: DESC}
+                    FieldOptions:
+                      SelectedFieldOptions:
+                        - {FieldId: ow-tbl-coverage-g0, CustomLabel: 'Asset type'}
+                        - {FieldId: ow-tbl-coverage-m0, CustomLabel: 'Assets'}
+                        - {FieldId: ow-tbl-coverage-m1, CustomLabel: 'Healthy'}
+                        - {FieldId: ow-tbl-coverage-m2, CustomLabel: 'Single owner'}
+                        - {FieldId: ow-tbl-coverage-m3, CustomLabel: 'Orphaned'}
+                        - {FieldId: ow-tbl-coverage-m4, CustomLabel: 'HIGH'}
+                        - {FieldId: ow-tbl-coverage-m5, CustomLabel: 'MEDIUM'}
+                        - {FieldId: ow-tbl-coverage-m6, CustomLabel: 'LOW'}
+                        - {FieldId: ow-tbl-coverage-m7, CustomLabel: 'Avg active owners'}
+                        - {FieldId: ow-tbl-coverage-m8, CustomLabel: 'Viewers'}
+              - PivotTableVisual:
+                  VisualId: ow-pivot
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Assets by type and finding'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      PivotTableAggregatedFieldWells:
+                        Rows:
+                          - CategoricalDimensionField: {FieldId: ow-pivot-row, Column: {DataSetIdentifier: cur, ColumnName: asset_type}}
+                        Columns:
+                          - CategoricalDimensionField: {FieldId: ow-pivot-col, Column: {DataSetIdentifier: cur, ColumnName: finding_type}}
+                        Values:
+                          - NumericalMeasureField: {FieldId: ow-pivot-val, Column: {DataSetIdentifier: cur, ColumnName: asset_count}, AggregationFunction: {SimpleNumericalAggregation: SUM}}
+                    TotalOptions:
+                      RowTotalOptions: {TotalsVisibility: VISIBLE}
+                      ColumnTotalOptions: {TotalsVisibility: VISIBLE}
+              - TableVisual:
+                  VisualId: ow-tbl-single
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Single-owner assets - add a co-owner before the owner leaves'}}
+                  Subtitle: {Visibility: VISIBLE, FormatText: {PlainText: 'Quick never deletes an asset that has more than one owner when a user is removed'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      TableAggregatedFieldWells:
+                        GroupBy:
+                          - CategoricalDimensionField: {FieldId: ow-tbl-single-g0, Column: {DataSetIdentifier: cur, ColumnName: asset_type}}
+                          - CategoricalDimensionField: {FieldId: ow-tbl-single-g1, Column: {DataSetIdentifier: cur, ColumnName: asset_name}}
+                          - CategoricalDimensionField: {FieldId: ow-tbl-single-g2, Column: {DataSetIdentifier: cur, ColumnName: asset_id}}
+                        Values:
+                          - NumericalMeasureField: {FieldId: ow-tbl-single-m0, Column: {DataSetIdentifier: cur, ColumnName: viewers_total}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                          - NumericalMeasureField: {FieldId: ow-tbl-single-m1, Column: {DataSetIdentifier: cur, ColumnName: days_open}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                          - DateMeasureField: {FieldId: ow-tbl-single-m2, Column: {DataSetIdentifier: cur, ColumnName: first_observed_at}, AggregationFunction: MIN, FormatConfiguration: {DateTimeFormat: 'YYYY-MM-DD HH:mm'}}
+                    SortConfiguration:
+                      RowSort:
+                        - FieldSort: {FieldId: ow-tbl-single-m0, Direction: DESC}
+                    FieldOptions:
+                      SelectedFieldOptions:
+                        - {FieldId: ow-tbl-single-g0, CustomLabel: 'Type'}
+                        - {FieldId: ow-tbl-single-g1, CustomLabel: 'Asset'}
+                        - {FieldId: ow-tbl-single-g2, CustomLabel: 'Asset ID'}
+                        - {FieldId: ow-tbl-single-m0, CustomLabel: 'Viewers'}
+                        - {FieldId: ow-tbl-single-m1, CustomLabel: 'Days single-owned'}
+                        - {FieldId: ow-tbl-single-m2, CustomLabel: 'Since'}
+            Layouts:
+              - Configuration:
+                  GridLayout:
+                    CanvasSizeOptions:
+                      ScreenCanvasSizeOptions: {ResizeOption: FIXED, OptimizedViewPortWidth: '1600px'}
+                    Elements:
+                      - {ElementId: ow-tbl-coverage, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 36, RowIndex: 0, RowSpan: 9}
+                      - {ElementId: ow-pivot, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 16, RowIndex: 9, RowSpan: 12}
+                      - {ElementId: ow-tbl-single, ElementType: VISUAL, ColumnIndex: 16, ColumnSpan: 20, RowIndex: 9, RowSpan: 12}
+          - SheetId: sh-history
+            Name: 'History'
+            Title: 'Scan history'
+            Description: 'Daily scans over the selected period: how the finding ladder evolves and which HIGH findings were recovered.'
+            ParameterControls:
+              - DateTimePicker:
+                  ParameterControlId: pc-hs-start
+                  Title: 'From'
+                  SourceParameterName: pStart
+                  DisplayOptions: {DateTimeFormat: 'YYYY-MM-DD'}
+              - DateTimePicker:
+                  ParameterControlId: pc-hs-end
+                  Title: 'To (exclusive)'
+                  SourceParameterName: pEnd
+                  DisplayOptions: {DateTimeFormat: 'YYYY-MM-DD'}
+            FilterControls:
+              - Dropdown:
+                  FilterControlId: fc-hs-assettype
+                  Title: 'Asset type'
+                  SourceFilterId: f-assettype-hs
+                  Type: MULTI_SELECT
+                  DisplayOptions:
+                    SelectAllOptions: {Visibility: VISIBLE}
+                    TitleOptions: {Visibility: VISIBLE}
+              - Dropdown:
+                  FilterControlId: fc-hs-severity
+                  Title: 'Severity'
+                  SourceFilterId: f-severity-hs
+                  Type: MULTI_SELECT
+                  DisplayOptions:
+                    SelectAllOptions: {Visibility: VISIBLE}
+                    TitleOptions: {Visibility: VISIBLE}
+              - Dropdown:
+                  FilterControlId: fc-hs-finding
+                  Title: 'Finding'
+                  SourceFilterId: f-finding-hs
+                  Type: MULTI_SELECT
+                  DisplayOptions:
+                    SelectAllOptions: {Visibility: VISIBLE}
+                    TitleOptions: {Visibility: VISIBLE}
+            SheetControlLayouts:
+              - Configuration:
+                  GridLayout:
+                    Elements:
+                      - {ElementId: pc-hs-start, ElementType: PARAMETER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: pc-hs-end, ElementType: PARAMETER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: fc-hs-assettype, ElementType: FILTER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: fc-hs-severity, ElementType: FILTER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: fc-hs-finding, ElementType: FILTER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+            Visuals:
+              - LineChartVisual:
+                  VisualId: hs-line-severity
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Findings per scan by severity'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      LineChartAggregatedFieldWells:
+                        Category:
+                          - DateDimensionField: {FieldId: hs-line-severity-cat, Column: {DataSetIdentifier: hist, ColumnName: scan_time}, DateGranularity: DAY}
+                        Values:
+                          - NumericalMeasureField: {FieldId: hs-line-severity-val, Column: {DataSetIdentifier: hist, ColumnName: high_count}, AggregationFunction: {SimpleNumericalAggregation: SUM}}
+                        Colors:
+                          - CategoricalDimensionField: {FieldId: hs-line-severity-color, Column: {DataSetIdentifier: hist, ColumnName: severity}}
+                    Type: LINE
+                    Legend: {Visibility: VISIBLE, Position: BOTTOM}
+              - BarChartVisual:
+                  VisualId: hs-bar-assets
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Assets scanned per day by type'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      BarChartAggregatedFieldWells:
+                        Category:
+                          - DateDimensionField: {FieldId: hs-bar-assets-cat, Column: {DataSetIdentifier: hist, ColumnName: scan_time}, DateGranularity: DAY}
+                        Values:
+                          - NumericalMeasureField: {FieldId: hs-bar-assets-val, Column: {DataSetIdentifier: hist, ColumnName: asset_count}, AggregationFunction: {SimpleNumericalAggregation: SUM}}
+                        Colors:
+                          - CategoricalDimensionField: {FieldId: hs-bar-assets-color, Column: {DataSetIdentifier: hist, ColumnName: asset_type}}
+                    Orientation: VERTICAL
+                    BarsArrangement: STACKED
+                    Legend: {Visibility: VISIBLE, Position: BOTTOM}
+              - TableVisual:
+                  VisualId: hs-tbl-recovered
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Recovered findings'}}
+                  Subtitle: {Visibility: VISIBLE, FormatText: {PlainText: 'HIGH findings that cleared after a complete scan - ownership restored or asset removed'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      TableAggregatedFieldWells:
+                        GroupBy:
+                          - CategoricalDimensionField: {FieldId: hs-tbl-recovered-g0, Column: {DataSetIdentifier: hist, ColumnName: asset_type}}
+                          - CategoricalDimensionField: {FieldId: hs-tbl-recovered-g1, Column: {DataSetIdentifier: hist, ColumnName: asset_name}}
+                          - CategoricalDimensionField: {FieldId: hs-tbl-recovered-g2, Column: {DataSetIdentifier: hist, ColumnName: recovered_from}}
+                        Values:
+                          - DateMeasureField: {FieldId: hs-tbl-recovered-m0, Column: {DataSetIdentifier: hist, ColumnName: scan_time}, AggregationFunction: MAX, FormatConfiguration: {DateTimeFormat: 'YYYY-MM-DD HH:mm'}}
+                          - DateMeasureField: {FieldId: hs-tbl-recovered-m1, Column: {DataSetIdentifier: hist, ColumnName: first_observed_at}, AggregationFunction: MIN, FormatConfiguration: {DateTimeFormat: 'YYYY-MM-DD HH:mm'}}
+                    SortConfiguration:
+                      RowSort:
+                        - FieldSort: {FieldId: hs-tbl-recovered-m0, Direction: DESC}
+                    FieldOptions:
+                      SelectedFieldOptions:
+                        - {FieldId: hs-tbl-recovered-g0, CustomLabel: 'Type'}
+                        - {FieldId: hs-tbl-recovered-g1, CustomLabel: 'Asset'}
+                        - {FieldId: hs-tbl-recovered-g2, CustomLabel: 'Recovered from'}
+                        - {FieldId: hs-tbl-recovered-m0, CustomLabel: 'Recovered on'}
+                        - {FieldId: hs-tbl-recovered-m1, CustomLabel: 'First observed'}
+              - TableVisual:
+                  VisualId: hs-tbl-scans
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Scans'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      TableAggregatedFieldWells:
+                        GroupBy:
+                          - CategoricalDimensionField: {FieldId: hs-tbl-scans-g0, Column: {DataSetIdentifier: hist, ColumnName: scan_id}}
+                          - CategoricalDimensionField: {FieldId: hs-tbl-scans-g1, Column: {DataSetIdentifier: hist, ColumnName: scan_status}}
+                        Values:
+                          - DateMeasureField: {FieldId: hs-tbl-scans-m0, Column: {DataSetIdentifier: hist, ColumnName: scan_time}, AggregationFunction: MAX, FormatConfiguration: {DateTimeFormat: 'YYYY-MM-DD HH:mm'}}
+                          - NumericalMeasureField: {FieldId: hs-tbl-scans-m1, Column: {DataSetIdentifier: hist, ColumnName: asset_count}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                          - NumericalMeasureField: {FieldId: hs-tbl-scans-m2, Column: {DataSetIdentifier: hist, ColumnName: high_count}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                          - NumericalMeasureField: {FieldId: hs-tbl-scans-m3, Column: {DataSetIdentifier: hist, ColumnName: medium_count}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                          - NumericalMeasureField: {FieldId: hs-tbl-scans-m4, Column: {DataSetIdentifier: hist, ColumnName: recovered_count}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                    SortConfiguration:
+                      RowSort:
+                        - FieldSort: {FieldId: hs-tbl-scans-m0, Direction: DESC}
+                    FieldOptions:
+                      SelectedFieldOptions:
+                        - {FieldId: hs-tbl-scans-g0, CustomLabel: 'Scan'}
+                        - {FieldId: hs-tbl-scans-g1, CustomLabel: 'Status'}
+                        - {FieldId: hs-tbl-scans-m0, CustomLabel: 'Time'}
+                        - {FieldId: hs-tbl-scans-m1, CustomLabel: 'Assets'}
+                        - {FieldId: hs-tbl-scans-m2, CustomLabel: 'HIGH'}
+                        - {FieldId: hs-tbl-scans-m3, CustomLabel: 'MEDIUM'}
+                        - {FieldId: hs-tbl-scans-m4, CustomLabel: 'Recovered'}
+            Layouts:
+              - Configuration:
+                  GridLayout:
+                    CanvasSizeOptions:
+                      ScreenCanvasSizeOptions: {ResizeOption: FIXED, OptimizedViewPortWidth: '1600px'}
+                    Elements:
+                      - {ElementId: hs-line-severity, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 18, RowIndex: 0, RowSpan: 11}
+                      - {ElementId: hs-bar-assets, ElementType: VISUAL, ColumnIndex: 18, ColumnSpan: 18, RowIndex: 0, RowSpan: 11}
+                      - {ElementId: hs-tbl-recovered, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 18, RowIndex: 11, RowSpan: 12}
+                      - {ElementId: hs-tbl-scans, ElementType: VISUAL, ColumnIndex: 18, ColumnSpan: 18, RowIndex: 11, RowSpan: 12}
+      Tags:
+        - {Key: Purpose, Value: !Ref ResourcePrefix}
+        - {Key: ManagedBy, Value: CloudFormation}
+
+Outputs:
+  DashboardUrl:
+    Description: Open the dashboard in Amazon Quick (this Region).
+    Value: !Sub 'https://${AWS::Region}.quicksight.aws.amazon.com/sn/dashboards/${ResourcePrefix}-dashboard'

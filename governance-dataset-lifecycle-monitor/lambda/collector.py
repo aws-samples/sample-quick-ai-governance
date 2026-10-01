@@ -37,12 +37,12 @@ Design rules honored (see module README):
     with adaptive backoff; a partial scan is flagged, never hidden.
 
 Storage layout (cost-optimized, no database):
-  * CloudWatch Logs (DATA_LOG_GROUP): one JSON event per dataset per run —
-    system of record queried by the dashboard (Logs Insights).
+  * S3 (STATE_BUCKET / SNAPSHOT_BUCKET, the shared analytics bucket): per-run
+    JSONL snapshots under dataset-lifecycle/fast/ and slow/ - the system of
+    record read by the Amazon Quick dashboard through Athena - and the
+    collector's alert-dedupe + lineage + usage state under dataset-lifecycle/state/.
   * CloudWatch metrics (QuickGovernance/DatasetLifecycle): low-cardinality
-    fleet KPIs only.
-  * S3 (STATE_BUCKET): alert-dedupe + lineage + usage state, and per-run
-    JSONL snapshots for Athena/Grafana.
+    fleet KPIs that drive the alarms.
 """
 
 from __future__ import annotations
@@ -64,8 +64,30 @@ from botocore.exceptions import ClientError
 
 ACCOUNT_ID = os.environ["QS_ACCOUNT_ID"]
 REGION = os.environ.get("AWS_REGION", "us-east-1")
-DATA_LOG_GROUP = os.environ["DATA_LOG_GROUP"]
 STATE_BUCKET = os.environ["STATE_BUCKET"]
+# State key prefix. Empty (default) keeps the module-owned layout (state/*.json
+# at the bucket root); the shared analytics bucket uses STATE_BUCKET=<analytics
+# bucket> and STATE_PREFIX=dataset-lifecycle/, so state lives under
+# dataset-lifecycle/state/ - outside the Glue table locations and denied to Quick.
+STATE_PREFIX = os.environ.get("STATE_PREFIX", "").strip("/")
+# Snapshot sink. Defaults reproduce the module-owned layout (snapshots/<mode>/...
+# in the state bucket); the shared analytics bucket uses
+# SNAPSHOT_BUCKET=<analytics bucket> and SNAPSHOT_PREFIX=dataset-lifecycle/.
+SNAPSHOT_BUCKET = os.environ.get("SNAPSHOT_BUCKET") or STATE_BUCKET
+SNAPSHOT_PREFIX = os.environ.get("SNAPSHOT_PREFIX", "snapshots/").strip("/")
+# Datasets whose ID starts with one of these prefixes are not scanned. Default:
+# the Quick datasets the governance stacks create themselves (their IDs are
+# deterministic, quick-governance-*), so the monitor does not flag its own
+# Direct Query datasets as unreferenced. Comma-separated; empty disables.
+EXCLUDE_ASSET_ID_PREFIXES = tuple(
+    p.strip() for p in os.environ.get(
+        "EXCLUDE_ASSET_ID_PREFIXES", "quick-governance-"
+    ).split(",") if p.strip()
+)
+
+
+def is_excluded_asset(asset_id: str | None) -> bool:
+    return bool(asset_id) and asset_id.startswith(EXCLUDE_ASSET_ID_PREFIXES)
 SNS_TOPIC_ARN = os.environ.get("SNS_TOPIC_ARN", "")
 ENABLE_CLOUDTRAIL = os.environ.get("ENABLE_CLOUDTRAIL", "true").lower() == "true"
 SPICE_RATE_PER_GB_MONTH = float(os.environ.get("SPICE_RATE_PER_GB_MONTH", "0.38"))
@@ -193,6 +215,9 @@ def reconcile_deleted_datasets(mode: str, current: list[dict]) -> list[dict]:
         if dataset_id in current_ids:
             known[dataset_id].pop("deletedAt", None)
             continue
+        if is_excluded_asset(dataset_id):
+            known.pop(dataset_id)  # newly excluded, not deleted: forget silently
+            continue
         entry = known[dataset_id]
         deleted_at = _parse_iso(entry.get("deletedAt"))
         if deleted_at is None:
@@ -217,9 +242,13 @@ def reconcile_deleted_datasets(mode: str, current: list[dict]) -> list[dict]:
     return tombstones
 
 
+def _state_key(key: str) -> str:
+    return f"{STATE_PREFIX}/{key}" if STATE_PREFIX else key
+
+
 def load_state(key: str) -> dict:
     try:
-        response = s3.get_object(Bucket=STATE_BUCKET, Key=key)
+        response = s3.get_object(Bucket=STATE_BUCKET, Key=_state_key(key))
         return json.loads(response["Body"].read())
     except ClientError as error:
         if error.response["Error"]["Code"] in ("NoSuchKey", "404"):
@@ -230,7 +259,7 @@ def load_state(key: str) -> dict:
 def save_state(key: str, obj: dict) -> None:
     s3.put_object(
         Bucket=STATE_BUCKET,
-        Key=key,
+        Key=_state_key(key),
         Body=json.dumps(obj, default=str).encode("utf-8"),
         ContentType="application/json",
     )
@@ -241,37 +270,12 @@ def write_snapshot(mode: str, records: list[dict]) -> None:
     now = _utcnow()
     body = "\n".join(json.dumps(r, default=str) for r in records).encode("utf-8")
     dated_key = (
-        f"snapshots/{mode}/dt={now:%Y-%m-%d}/run-{now:%H%M%S}.jsonl"
+        f"{SNAPSHOT_PREFIX}/{mode}/dt={now:%Y-%m-%d}/run-{now:%H%M%S}.jsonl"
     )
-    for key in (dated_key, f"snapshots/latest-{mode}.jsonl"):
+    for key in (dated_key, f"{SNAPSHOT_PREFIX}/latest-{mode}.jsonl"):
         s3.put_object(
-            Bucket=STATE_BUCKET, Key=key, Body=body,
+            Bucket=SNAPSHOT_BUCKET, Key=key, Body=body,
             ContentType="application/x-ndjson",
-        )
-
-
-def put_data_events(mode: str, records: list[dict]) -> None:
-    """Write one JSON log event per dataset to the data log group."""
-    if not records:
-        return
-    stream_name = f"{mode}-{_utcnow():%Y-%m-%d}"
-    try:
-        logs.create_log_stream(
-            logGroupName=DATA_LOG_GROUP, logStreamName=stream_name
-        )
-    except ClientError as error:
-        if error.response["Error"]["Code"] != "ResourceAlreadyExistsException":
-            raise
-    timestamp_ms = int(_utcnow().timestamp() * 1000)
-    events = [
-        {"timestamp": timestamp_ms, "message": json.dumps(r, default=str)}
-        for r in records
-    ]
-    for start in range(0, len(events), 500):
-        logs.put_log_events(
-            logGroupName=DATA_LOG_GROUP,
-            logStreamName=stream_name,
-            logEvents=events[start:start + 500],
         )
 
 
@@ -291,11 +295,19 @@ def put_kpis(metrics: dict[str, float]) -> None:
 # ---------------------------------------------------------------------------
 
 def list_datasets() -> list[dict]:
+    """All datasets except the excluded IDs (see EXCLUDE_ASSET_ID_PREFIXES).
+
+    Filtering here keeps both loops and the deleted-dataset reconciliation on
+    one consistent inventory, and excluded datasets never cost an API call.
+    """
     datasets: list[dict] = []
     paginator = quicksight.get_paginator("list_data_sets")
     for page in paginator.paginate(AwsAccountId=ACCOUNT_ID):
         qs_pacer.wait()
-        datasets.extend(page.get("DataSetSummaries", []))
+        datasets.extend(
+            s for s in page.get("DataSetSummaries", [])
+            if not is_excluded_asset(s.get("DataSetId"))
+        )
     return datasets
 
 
@@ -482,7 +494,6 @@ def run_fast_loop() -> dict:
 
     save_state("state/alert-state.json", alert_state)
     records.extend(reconcile_deleted_datasets("fast", datasets))
-    put_data_events("fast", records)
     write_snapshot("fast", records)
 
     scan_seconds = round(time.monotonic() - started)
@@ -1384,7 +1395,6 @@ def run_slow_loop() -> dict:
         })
 
     records.extend(reconcile_deleted_datasets("slow", datasets))
-    put_data_events("slow", records)
     write_snapshot("slow", records)
 
     scan_seconds = round(time.monotonic() - started)

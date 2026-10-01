@@ -3,23 +3,20 @@
 # remove-governance-agent-hours-monitor.sh
 #
 # Tears down the Amazon Quick agent-hours monitor deployed by
-# apply-governance-agent-hours-monitor.sh (deletes the CloudFormation stack).
+# apply-governance-agent-hours-monitor.sh: the Quick dashboard stack first
+# (skip with --keep-dashboard), then the module stack (the vended-log delivery).
 #
-# The S3 log bucket is RETAINED by the stack (DeletionPolicy: Retain) so
-# historical logs survive teardown. Pass --delete-bucket to empty and delete
-# it after the stack is gone.
+# Nothing in S3 is deleted: the feed lives in the shared analytics bucket owned
+# by the Analytics Foundation stack, under agent-hours/. Remove that data, or
+# the foundation itself, through governance-analytics-foundation/scripts.
 #
 # Credentials: uses your default AWS credentials, or pass --profile <name>
 # (equivalently, set the AWS_PROFILE environment variable).
 #
 # Usage examples:
 #
-#   # Delete the stack, keep the S3 bucket and its logs
 #   ./remove-governance-agent-hours-monitor.sh --region us-east-1
-#
-#   # Use a named profile and also delete the S3 bucket (irreversible)
-#   ./remove-governance-agent-hours-monitor.sh \
-#       --region us-east-1 --profile my-profile --delete-bucket
+#   ./remove-governance-agent-hours-monitor.sh --region us-east-1 --profile my-profile --keep-dashboard
 
 set -euo pipefail
 
@@ -27,7 +24,10 @@ set -euo pipefail
 REGION=""
 PROFILE=""
 STACK_NAME="quick-governance-agent-hours-monitor"
-DELETE_BUCKET="false"
+KEEP_DASHBOARD="false"
+
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+DASHBOARD_SCRIPT="${SCRIPT_DIR}/remove-governance-agent-hours-quick-dashboard.sh"
 
 # ---------- helpers ----------
 err() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
@@ -43,11 +43,11 @@ usage() {
 # ---------- arg parsing ----------
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --region)         REGION="$2";           shift 2 ;;
-    --profile)        PROFILE="$2";          shift 2 ;;
-    --stack-name)     STACK_NAME="$2";       shift 2 ;;
-    --delete-bucket)  DELETE_BUCKET="true";  shift ;;
-    -h|--help)        usage ;;
+    --region)          REGION="$2";            shift 2 ;;
+    --profile)         PROFILE="$2";           shift 2 ;;
+    --stack-name)      STACK_NAME="$2";        shift 2 ;;
+    --keep-dashboard)  KEEP_DASHBOARD="true";  shift ;;
+    -h|--help)         usage ;;
     *) err "Unknown argument: $1" ;;
   esac
 done
@@ -59,35 +59,20 @@ command -v aws >/dev/null 2>&1 || err "aws CLI not found in PATH"
 # Route every aws call through the requested named profile, if any.
 [[ -n "$PROFILE" ]] && export AWS_PROFILE="$PROFILE"
 
-# ---------- capture the retained bucket name before deleting the stack ----------
-BUCKET_NAME=""
-if [[ "$DELETE_BUCKET" == "true" ]]; then
-  BUCKET_NAME=$(aws cloudformation describe-stacks \
-    --region "$REGION" --stack-name "$STACK_NAME" \
-    --query "Stacks[0].Outputs[?OutputKey=='LogBucketName'].OutputValue | [0]" \
-    --output text 2>/dev/null || true)
+# ---------- Quick dashboard ----------
+if [[ "$KEEP_DASHBOARD" == "true" ]]; then
+  log "Keeping the Quick dashboard stack (--keep-dashboard)."
+elif [[ -x "$DASHBOARD_SCRIPT" ]]; then
+  "$DASHBOARD_SCRIPT" --region "$REGION" ${PROFILE:+--profile "$PROFILE"} || log "  (dashboard removal returned non-zero, continuing)"
+else
+  log "Dashboard remove script not found at $DASHBOARD_SCRIPT; skipping."
 fi
 
-# ---------- delete the stack ----------
+# ---------- delete the module stack ----------
 log "Deleting stack '$STACK_NAME'${PROFILE:+ (profile: $PROFILE)}."
 aws cloudformation delete-stack --region "$REGION" --stack-name "$STACK_NAME"
 log "Waiting for stack deletion to complete..."
 aws cloudformation wait stack-delete-complete --region "$REGION" --stack-name "$STACK_NAME" \
   || log "  (wait returned non-zero; check the console if the stack lingers)"
 
-# ---------- optionally remove the retained bucket ----------
-if [[ "$DELETE_BUCKET" == "true" ]]; then
-  if [[ -n "$BUCKET_NAME" && "$BUCKET_NAME" != "None" ]]; then
-    log "Emptying and deleting retained S3 bucket '$BUCKET_NAME' (irreversible)."
-    aws s3 rm "s3://${BUCKET_NAME}" --recursive --region "$REGION" >/dev/null 2>&1 \
-      || log "  (nothing to empty, continuing)"
-    aws s3api delete-bucket --bucket "$BUCKET_NAME" --region "$REGION" >/dev/null 2>&1 \
-      || log "  (bucket not found or not empty, continuing)"
-  else
-    log "Could not resolve the bucket name from stack outputs; delete it manually if needed."
-  fi
-else
-  log "S3 log bucket (if any) preserved. Re-run with --delete-bucket to remove it."
-fi
-
-log "Done."
+log "Done. Data under agent-hours/ in the shared analytics bucket is preserved."

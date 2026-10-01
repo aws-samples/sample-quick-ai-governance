@@ -54,8 +54,30 @@ from botocore.exceptions import ClientError
 
 ACCOUNT_ID = os.environ["QS_ACCOUNT_ID"]
 REGION = os.environ.get("AWS_REGION", "us-east-1")
-DATA_LOG_GROUP = os.environ["DATA_LOG_GROUP"]
 STATE_BUCKET = os.environ["STATE_BUCKET"]
+# State key prefix. Empty (default) keeps the module-owned layout (state/*.json
+# at the bucket root); the shared analytics bucket uses STATE_BUCKET=<analytics
+# bucket> and STATE_PREFIX=orphaned-assets/, so state lives under
+# orphaned-assets/state/ - outside the Glue table location and denied to Quick.
+STATE_PREFIX = os.environ.get("STATE_PREFIX", "").strip("/")
+# Snapshot sink. Defaults reproduce the module-owned layout
+# (snapshots/ownership/... in the state bucket); the shared analytics bucket
+# uses SNAPSHOT_BUCKET=<analytics bucket> and SNAPSHOT_PREFIX=orphaned-assets/.
+SNAPSHOT_BUCKET = os.environ.get("SNAPSHOT_BUCKET") or STATE_BUCKET
+SNAPSHOT_PREFIX = os.environ.get("SNAPSHOT_PREFIX", "snapshots/").strip("/")
+# Assets whose ID starts with one of these prefixes are not scanned. Default:
+# the Quick assets the governance stacks create themselves (their IDs are
+# deterministic, quick-governance-*), so the monitor does not report on its
+# own dashboards and datasets. Comma-separated; empty disables the filter.
+EXCLUDE_ASSET_ID_PREFIXES = tuple(
+    p.strip() for p in os.environ.get(
+        "EXCLUDE_ASSET_ID_PREFIXES", "quick-governance-"
+    ).split(",") if p.strip()
+)
+
+
+def is_excluded_asset(asset_id: str | None) -> bool:
+    return bool(asset_id) and asset_id.startswith(EXCLUDE_ASSET_ID_PREFIXES)
 SNS_TOPIC_ARN = os.environ.get("SNS_TOPIC_ARN", "")
 IDENTITY_REGION = os.environ.get("IDENTITY_REGION", "")  # empty = discover
 NAMESPACES = [
@@ -80,7 +102,6 @@ IDENTITY_REGION_RE = re.compile(r"identity region is ([a-z0-9-]+)")
 _RETRY_CONFIG = Config(retries={"max_attempts": 8, "mode": "adaptive"})
 
 quicksight = boto3.client("quicksight", config=_RETRY_CONFIG)
-logs = boto3.client("logs", config=_RETRY_CONFIG)
 cloudwatch = boto3.client("cloudwatch", config=_RETRY_CONFIG)
 s3 = boto3.client("s3", config=_RETRY_CONFIG)
 sns = boto3.client("sns", config=_RETRY_CONFIG)
@@ -118,9 +139,13 @@ def _iso(value: dt.datetime | None) -> str | None:
     return value.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _state_key(key: str) -> str:
+    return f"{STATE_PREFIX}/{key}" if STATE_PREFIX else key
+
+
 def load_state(key: str) -> dict:
     try:
-        response = s3.get_object(Bucket=STATE_BUCKET, Key=key)
+        response = s3.get_object(Bucket=STATE_BUCKET, Key=_state_key(key))
         return json.loads(response["Body"].read())
     except ClientError as error:
         if error.response["Error"]["Code"] in ("NoSuchKey", "404"):
@@ -131,7 +156,7 @@ def load_state(key: str) -> dict:
 def save_state(key: str, obj: dict) -> None:
     s3.put_object(
         Bucket=STATE_BUCKET,
-        Key=key,
+        Key=_state_key(key),
         Body=json.dumps(obj, default=str).encode("utf-8"),
         ContentType="application/json",
     )
@@ -140,35 +165,11 @@ def save_state(key: str, obj: dict) -> None:
 def write_snapshot(records: list[dict]) -> None:
     now = _utcnow()
     body = "\n".join(json.dumps(r, default=str) for r in records).encode("utf-8")
-    dated_key = f"snapshots/ownership/dt={now:%Y-%m-%d}/run-{now:%H%M%S}.jsonl"
-    for key in (dated_key, "snapshots/latest-ownership.jsonl"):
+    dated_key = f"{SNAPSHOT_PREFIX}/ownership/dt={now:%Y-%m-%d}/run-{now:%H%M%S}.jsonl"
+    for key in (dated_key, f"{SNAPSHOT_PREFIX}/latest-ownership.jsonl"):
         s3.put_object(
-            Bucket=STATE_BUCKET, Key=key, Body=body,
+            Bucket=SNAPSHOT_BUCKET, Key=key, Body=body,
             ContentType="application/x-ndjson",
-        )
-
-
-def put_data_events(records: list[dict]) -> None:
-    if not records:
-        return
-    stream_name = f"ownership-{_utcnow():%Y-%m-%d}"
-    try:
-        logs.create_log_stream(
-            logGroupName=DATA_LOG_GROUP, logStreamName=stream_name
-        )
-    except ClientError as error:
-        if error.response["Error"]["Code"] != "ResourceAlreadyExistsException":
-            raise
-    timestamp_ms = int(_utcnow().timestamp() * 1000)
-    events = [
-        {"timestamp": timestamp_ms, "message": json.dumps(r, default=str)}
-        for r in records
-    ]
-    for start in range(0, len(events), 500):
-        logs.put_log_events(
-            logGroupName=DATA_LOG_GROUP,
-            logStreamName=stream_name,
-            logEvents=events[start:start + 500],
         )
 
 
@@ -361,7 +362,7 @@ def _list_spaces() -> list[dict]:
 
 
 def _list_agents() -> list[dict]:
-    # The SYSTEM default agent is platform-managed (Creator: Auto_Created)
+    # The SYSTEM default agent is service-managed (Creator: Auto_Created)
     # and legitimately carries no owner grants — excluded (verified live).
     return [
         {
@@ -537,7 +538,7 @@ def scan_asset_type(
     api_errors = 0
     for asset in assets:
         asset_id = asset.get("id")
-        if not asset_id:
+        if not asset_id or is_excluded_asset(asset_id):
             continue
         record: dict[str, Any] = {
             "ts": now_iso,
@@ -734,8 +735,11 @@ def run_scan() -> dict:
         for key, old in previous.items():
             if key in current:
                 continue
-            recovered += 1
             asset_type, asset_id = key.split("#", 1)
+            if is_excluded_asset(asset_id):
+                # Newly excluded, not recovered: drop it from state silently.
+                continue
+            recovered += 1
             records.append({
                 "ts": now_iso,
                 "scanId": scan_id,
@@ -755,8 +759,6 @@ def run_scan() -> dict:
         merged = dict(previous)
         merged.update(current)
         save_state("state/findings.json", merged)
-
-    put_data_events(records)
     write_snapshot(records)
 
     open_by_severity = {"HIGH": 0, "MEDIUM": 0, "LOW": 0}

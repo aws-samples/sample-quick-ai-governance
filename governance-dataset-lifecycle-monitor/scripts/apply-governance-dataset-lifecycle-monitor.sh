@@ -18,7 +18,7 @@
 #   * Collector Lambda (Python 3.14, arm64) on two EventBridge schedules
 #     (fast: sync health / slow: usage + lineage + capacity)
 #   * CloudWatch Logs data log group (one JSON event per dataset per run)
-#   * CloudWatch dashboard (fleet health, durations, last-used, cost signal)
+#   * the Amazon Quick dashboard stack (fleet health, durations, last-used, cost signal)
 #   * Low-cardinality KPI metrics (QuickGovernance/DatasetLifecycle)
 #   * S3 state/snapshot bucket (retained on stack delete)
 #   * Native ingestion-failure alarm + collector error alarm
@@ -59,8 +59,10 @@
 #                             and Feedback Monitor default; '' disables)
 #   --spice-rate              USD per SPICE GB-month for the estimate (default 0.38)
 #   --unused-threshold-days   no-observed-use threshold (default 30)
-#   --log-retention-days      CloudWatch Logs retention (default 90)
-#   --snapshot-expiration-days  S3 snapshot expiry (default 180)
+#   --log-retention-days      CloudWatch Logs retention of the collector's own log group (default 90)
+#   --foundation-stack        Analytics Foundation stack name (default quick-governance-analytics-foundation);
+#                             its bucket receives snapshots and state under dataset-lifecycle/
+#   --skip-dashboard          deploy the module stack only, not its Amazon Quick dashboard
 
 set -euo pipefail
 
@@ -77,11 +79,13 @@ CHAT_LOG_GROUP="/aws/vendedlogs/quick/chat-feedback"
 SPICE_RATE="0.38"
 UNUSED_THRESHOLD_DAYS="30"
 LOG_RETENTION_DAYS="90"
-SNAPSHOT_EXPIRATION_DAYS="180"
+FOUNDATION_STACK="quick-governance-analytics-foundation"
+SKIP_DASHBOARD="false"
 
 # Resolve script dir so we can locate ../cloudformation regardless of cwd
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 TEMPLATE="${SCRIPT_DIR}/../cloudformation/governance-dataset-lifecycle-monitor.yaml"
+DASHBOARD_SCRIPT="${SCRIPT_DIR}/apply-governance-dataset-lifecycle-quick-dashboard.sh"
 
 # ---------- helpers ----------
 err() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
@@ -109,7 +113,8 @@ while [[ $# -gt 0 ]]; do
     --spice-rate)               SPICE_RATE="$2";               shift 2 ;;
     --unused-threshold-days)    UNUSED_THRESHOLD_DAYS="$2";    shift 2 ;;
     --log-retention-days)       LOG_RETENTION_DAYS="$2";       shift 2 ;;
-    --snapshot-expiration-days) SNAPSHOT_EXPIRATION_DAYS="$2"; shift 2 ;;
+    --foundation-stack)         FOUNDATION_STACK="$2";         shift 2 ;;
+    --skip-dashboard)           SKIP_DASHBOARD="true";         shift ;;
     -h|--help)                  usage ;;
     *) err "Unknown argument: $1" ;;
   esac
@@ -126,9 +131,18 @@ command -v aws >/dev/null 2>&1 || err "aws CLI not found in PATH"
 # Route every sam/aws call through the requested named profile, if any.
 [[ -n "$PROFILE" ]] && export AWS_PROFILE="$PROFILE"
 
+# ---------- resolve the foundation ----------
+ANALYTICS_BUCKET="$(aws cloudformation describe-stacks \
+  --region "$REGION" --stack-name "$FOUNDATION_STACK" \
+  --query "Stacks[0].Outputs[?OutputKey=='AnalyticsBucketName'].OutputValue" \
+  --output text 2>/dev/null || true)"
+[[ -n "$ANALYTICS_BUCKET" && "$ANALYTICS_BUCKET" != "None" ]] \
+  || err "Foundation stack '$FOUNDATION_STACK' not found in $REGION - deploy governance-analytics-foundation first"
+
 # ---------- build + deploy ----------
 log "Deploying stack '$STACK_NAME' in $REGION${PROFILE:+ (profile: $PROFILE)}."
 log "Fast loop: $FAST_SCHEDULE | slow loop: $SLOW_SCHEDULE | CloudTrail evidence: $ENABLE_CLOUDTRAIL"
+log "Snapshots and state -> s3://$ANALYTICS_BUCKET/dataset-lifecycle/"
 [[ -n "$ALERT_EMAIL" ]] && log "Alerts will be emailed to: $ALERT_EMAIL (confirm the SNS subscription!)"
 
 # sam build resolves lambda/requirements.txt (bundles a boto3 recent enough
@@ -158,7 +172,7 @@ sam deploy \
       "SpiceRatePerGBMonth=\"$SPICE_RATE\"" \
       "UnusedThresholdDays=\"$UNUSED_THRESHOLD_DAYS\"" \
       "LogRetentionDays=\"$LOG_RETENTION_DAYS\"" \
-      "SnapshotExpirationDays=\"$SNAPSHOT_EXPIRATION_DAYS\""
+      "AnalyticsBucketName=\"$ANALYTICS_BUCKET\""
 
 # ---------- report outputs ----------
 log "Stack outputs:"
@@ -169,3 +183,12 @@ aws cloudformation describe-stacks \
 
 log "Done. Trigger a first scan now with the RunFastLoopNowCommand /"
 log "RunSlowLoopNowCommand outputs above, or wait for the schedules."
+
+# ---------- Quick dashboard ----------
+if [[ "$SKIP_DASHBOARD" == "true" ]]; then
+  log "Module only (--skip-dashboard); the Quick dashboard was not deployed."
+  exit 0
+fi
+[[ -x "$DASHBOARD_SCRIPT" ]] || err "Dashboard script not found or not executable: $DASHBOARD_SCRIPT"
+log "Deploying the Amazon Quick dashboard."
+"$DASHBOARD_SCRIPT" --region "$REGION" ${PROFILE:+--profile "$PROFILE"} --foundation-stack "$FOUNDATION_STACK"

@@ -1,13 +1,16 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
   Amazon Quick agent-hours usage monitor. Delivers the Quick AGENT_HOURS_LOGS
-  vended-log feed to a CloudWatch Logs log group (for an account- and user-level
-  CloudWatch dashboard built on Logs Insights) and, optionally, to an Amazon S3
-  bucket for downstream Athena / Grafana / Datadog analysis. One delivery source
-  fans out to two deliveries (CloudWatch Logs and S3). Assumes the Quick
-  subscription is in the same AWS account as this stack.
+  vended-log feed to the shared analytics bucket created by the Analytics
+  Foundation stack, under the agent-hours/ prefix, where the module's Amazon
+  Quick dashboard (governance-agent-hours-quick-dashboard.yaml) reads it through
+  Athena. Assumes the Quick subscription is in the same AWS account as this stack.
 
 # Prerequisites (NOT created by this stack):
+#   * The Analytics Foundation stack (../../governance-analytics-foundation) in
+#     this account and Region. Its AnalyticsBucketName output is this template's
+#     AnalyticsBucketName parameter (the apply script resolves it for you); its
+#     bucket policy already lets delivery.logs.amazonaws.com write agent-hours/.
 #   * Quick AI features enabled (Enterprise or Professional subscription).
 #   * The deploying principal must hold the IAM permission
 #     quicksight:AllowVendedLogDeliveryForResource on the Quick account.
@@ -15,82 +18,45 @@ Description: >
 # Cross-account delivery (Quick in a different account) needs an extra
 # delivery-destination policy and is out of scope for this template.
 #
-# Deploy directly (or use scripts/apply-governance-agent-hours-monitor.sh):
+# Deploy with scripts/apply-governance-agent-hours-monitor.sh (deploys this
+# stack and the Quick dashboard), or directly:
 #   aws cloudformation deploy \
 #       --stack-name quick-governance-agent-hours-monitor \
-#       --template-file governance-agent-hours-monitor.yaml --region <REGION>
+#       --template-file governance-agent-hours-monitor.yaml --region <REGION> \
+#       --parameter-overrides AnalyticsBucketName=<foundation bucket>
 
 Parameters:
   ResourcePrefix:
     Type: String
     Default: 'quick-governance-agent-hours-monitor'
-    Description: >
-      Prefix applied to every resource name. When EnableS3Delivery is true this
-      is also part of the S3 bucket name, so keep it lowercase and DNS-safe.
+    Description: Prefix applied to every resource name (lowercase, DNS-safe).
     AllowedPattern: '^[a-z0-9-]{1,40}$'
     ConstraintDescription: 1-40 chars, lowercase letters, digits, hyphens.
 
-  LogGroupName:
+  AnalyticsBucketName:
     Type: String
-    Default: '/aws/vendedlogs/quick/agent-hours'
-    Description: CloudWatch Logs log group that receives the agent-hours feed.
+    Description: >
+      Shared analytics bucket created by the Analytics Foundation stack (its
+      AnalyticsBucketName output). The feed lands under agent-hours/.
+    AllowedPattern: '^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$'
+    ConstraintDescription: An existing S3 bucket name (3-63 chars).
 
-  LogRetentionDays:
-    Type: Number
-    Default: 90
-    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096, 1827, 2192, 2557, 2922, 3288, 3653]
-    Description: Retention (days) for the CloudWatch Logs log group.
-
-  EnableS3Delivery:
+  S3HiveCompatiblePath:
     Type: String
     Default: 'true'
     AllowedValues: ['true', 'false']
     Description: >
-      Also deliver the feed to an S3 bucket for Athena / Grafana / Datadog.
-      Set to false to deploy the CloudWatch dashboard path only.
-
-  S3ExpirationDays:
-    Type: Number
-    Default: 365
-    MinValue: 1
-    MaxValue: 3650
-    Description: Days before objects in the S3 log bucket expire (lifecycle rule).
+      Write S3 objects under Hive-style key=value partitions (Athena partition
+      projection, no crawler). Set to false to keep the legacy
+      AWSLogs/<account-id>/... layout, for example when an existing Athena table
+      or pipeline already reads that layout. The Quick dashboard's Glue table
+      reads the whole agent-hours/ prefix, so either layout works for it.
 
 Conditions:
-  WithS3: !Equals [!Ref EnableS3Delivery, 'true']
+  WithHivePath: !Equals [!Ref S3HiveCompatiblePath, 'true']
 
 Resources:
-
-  # ----- CloudWatch Logs log group (feeds the dashboard) ---------------------
-
-  LogGroup:
-    Type: AWS::Logs::LogGroup
-    Properties:
-      LogGroupName: !Ref LogGroupName
-      RetentionInDays: !Ref LogRetentionDays
-      Tags:
-        - Key: Purpose
-          Value: !Ref ResourcePrefix
-        - Key: ManagedBy
-          Value: CloudFormation
-
-  # ----- Metric filter: account-total AgentHours metric (KPI tile + alarms) --
-  # Turns each event's numeric usage_hours into a metric. Applies to events
-  # ingested after creation (no backfill). No dimensions = one cheap metric.
-  AgentHoursMetricFilter:
-    Type: AWS::Logs::MetricFilter
-    Properties:
-      LogGroupName: !Ref LogGroup
-      FilterName: !Sub '${ResourcePrefix}-agent-hours'
-      FilterPattern: '{ $.usage_hours >= 0 }'
-      MetricTransformations:
-        - MetricNamespace: QuickGovernance/AgentHours
-          MetricName: AgentHours
-          MetricValue: '$.usage_hours'
-          Unit: None
-
-  # ----- Vended-log delivery SOURCE (one source, fans out to 2 deliveries) ---
-
+  # ----- Vended-log delivery: Quick AGENT_HOURS_LOGS -> shared bucket ---------
   DeliverySource:
     Type: AWS::Logs::DeliverySource
     Properties:
@@ -101,185 +67,26 @@ Resources:
         - Key: Purpose
           Value: !Ref ResourcePrefix
 
-  # ----- Delivery #1: source -> CloudWatch Logs ------------------------------
-
-  CwlDeliveryDestination:
-    Type: AWS::Logs::DeliveryDestination
-    Properties:
-      Name: !Sub '${ResourcePrefix}-cwl-dest'
-      DeliveryDestinationType: CWL
-      DestinationResourceArn: !GetAtt LogGroup.Arn
-      Tags:
-        - Key: Purpose
-          Value: !Ref ResourcePrefix
-
-  CwlDelivery:
-    Type: AWS::Logs::Delivery
-    DependsOn: DeliverySource
-    Properties:
-      DeliverySourceName: !Sub '${ResourcePrefix}-source'
-      DeliveryDestinationArn: !GetAtt CwlDeliveryDestination.Arn
-      Tags:
-        - Key: Purpose
-          Value: !Ref ResourcePrefix
-
-  # ----- CloudWatch dashboard (CIO view): single time picker drives all -------
-  # Every widget honors the dashboard time range. The two trend charts use daily
-  # buckets (bin 1d); all other widgets report totals for the selected range.
-  # Set the analysis timeframe with the dashboard time picker. Defaults to 3 months.
-
-  Dashboard:
-    Type: AWS::CloudWatch::Dashboard
-    Properties:
-      DashboardName: !Sub '${ResourcePrefix}-dashboard'
-      DashboardBody: !Sub |
-        {
-          "start": "-P3M",
-          "periodOverride": "auto",
-          "widgets": [
-            {
-              "type":"metric","x":0,"y":0,"width":6,"height":6,
-              "properties":{
-                "title":"Total agent hours (selected range)",
-                "view":"singleValue","region":"${AWS::Region}",
-                "stat":"Sum","setPeriodToTimeRange":true,
-                "metrics":[["QuickGovernance/AgentHours","AgentHours",{"label":"Agent hours"}]]
-              }
-            },
-            {
-              "type":"log","x":6,"y":0,"width":18,"height":6,
-              "properties":{
-                "title":"Top consumers (user, or automation resource)",
-                "region":"${AWS::Region}","view":"table",
-                "query":"SOURCE '${LogGroupName}' | fields coalesce(user_arn, service_resource_arn) as principal | stats sum(usage_hours) as agent_hours by principal | sort agent_hours desc | limit 25"
-              }
-            },
-            {
-              "type":"log","x":0,"y":6,"width":12,"height":6,
-              "properties":{
-                "title":"Agent hours by feature",
-                "region":"${AWS::Region}","view":"timeSeries","stacked":false,
-                "query":"SOURCE '${LogGroupName}' | stats sum(usage_hours) as hours by bin(1d), reporting_service"
-              }
-            },
-            {
-              "type":"log","x":12,"y":6,"width":12,"height":6,
-              "properties":{
-                "title":"License coverage - Included vs Extra",
-                "region":"${AWS::Region}","view":"timeSeries","stacked":true,
-                "query":"SOURCE '${LogGroupName}' | stats sum(usage_hours) as hours by bin(1d), usage_group"
-              }
-            },
-            {
-              "type":"log","x":0,"y":12,"width":12,"height":6,
-              "properties":{
-                "title":"Extra (chargeable) hours by feature",
-                "region":"${AWS::Region}","view":"table",
-                "query":"SOURCE '${LogGroupName}' | filter usage_group = \"Extra\" | stats sum(usage_hours) as extra_hours by reporting_service | sort extra_hours desc"
-              }
-            },
-            {
-              "type":"log","x":12,"y":12,"width":12,"height":6,
-              "properties":{
-                "title":"Extra hours by user (people over entitlement)",
-                "region":"${AWS::Region}","view":"table",
-                "query":"SOURCE '${LogGroupName}' | filter usage_group = \"Extra\" and ispresent(user_arn) | stats sum(usage_hours) as extra_hours by user_arn | sort extra_hours desc | limit 25"
-              }
-            },
-            {
-              "type":"log","x":0,"y":18,"width":24,"height":6,
-              "properties":{
-                "title":"Extra hours by automation (scheduled/deployed)",
-                "region":"${AWS::Region}","view":"table",
-                "query":"SOURCE '${LogGroupName}' | filter usage_group = \"Extra\" and not ispresent(user_arn) | stats sum(usage_hours) as extra_hours by service_resource_arn | sort extra_hours desc | limit 25"
-              }
-            }
-          ]
-        }
-
-  # ----- Delivery #2 (optional): source -> Amazon S3 -------------------------
-  # Bucket is RETAINED on stack delete so historical logs are not lost.
-
-  LogBucket:
-    Type: AWS::S3::Bucket
-    Condition: WithS3
-    DeletionPolicy: Retain
-    UpdateReplacePolicy: Retain
-    Properties:
-      BucketName: !Sub '${ResourcePrefix}-${AWS::AccountId}'
-      PublicAccessBlockConfiguration:
-        BlockPublicAcls: true
-        BlockPublicPolicy: true
-        IgnorePublicAcls: true
-        RestrictPublicBuckets: true
-      BucketEncryption:
-        ServerSideEncryptionConfiguration:
-          - ServerSideEncryptionByDefault:
-              SSEAlgorithm: AES256
-      LifecycleConfiguration:
-        Rules:
-          - Id: expire-agent-hours-logs
-            Status: Enabled
-            ExpirationInDays: !Ref S3ExpirationDays
-      Tags:
-        - Key: Purpose
-          Value: !Ref ResourcePrefix
-        - Key: ManagedBy
-          Value: CloudFormation
-
-  LogBucketPolicy:
-    Type: AWS::S3::BucketPolicy
-    Condition: WithS3
-    Properties:
-      Bucket: !Ref LogBucket
-      PolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Sid: AWSLogsDeliveryWrite
-            Effect: Allow
-            Principal:
-              Service: delivery.logs.amazonaws.com
-            Action: s3:PutObject
-            Resource: !Sub 'arn:${AWS::Partition}:s3:::${LogBucket}/AWSLogs/${AWS::AccountId}/*'
-            Condition:
-              StringEquals:
-                s3:x-amz-acl: bucket-owner-full-control
-                aws:SourceAccount: !Ref 'AWS::AccountId'
-              ArnLike:
-                aws:SourceArn: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:delivery-source:${ResourcePrefix}-source'
-          - Sid: AWSLogsDeliveryAclCheck
-            Effect: Allow
-            Principal:
-              Service: delivery.logs.amazonaws.com
-            Action: s3:GetBucketAcl
-            Resource: !GetAtt LogBucket.Arn
-            Condition:
-              StringEquals:
-                aws:SourceAccount: !Ref 'AWS::AccountId'
-              ArnLike:
-                aws:SourceArn: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:delivery-source:${ResourcePrefix}-source'
-
+  # Logical IDs and names are those of the shared-bucket variant of the previous
+  # release, so existing stacks update the live delivery in place.
   S3DeliveryDestination:
     Type: AWS::Logs::DeliveryDestination
-    Condition: WithS3
     Properties:
-      Name: !Sub '${ResourcePrefix}-s3-dest'
+      Name: !Sub '${ResourcePrefix}-shared-s3-dest'
       DeliveryDestinationType: S3
-      DestinationResourceArn: !GetAtt LogBucket.Arn
+      DestinationResourceArn: !Sub 'arn:${AWS::Partition}:s3:::${AnalyticsBucketName}/agent-hours'
       OutputFormat: json
       Tags:
         - Key: Purpose
           Value: !Ref ResourcePrefix
 
-  S3Delivery:
+  S3DeliverySharedBucket:
     Type: AWS::Logs::Delivery
-    Condition: WithS3
-    DependsOn:
-      - DeliverySource
-      - LogBucketPolicy
+    DependsOn: DeliverySource
     Properties:
       DeliverySourceName: !Sub '${ResourcePrefix}-source'
       DeliveryDestinationArn: !GetAtt S3DeliveryDestination.Arn
+      S3EnableHiveCompatiblePath: !If [WithHivePath, true, false]
       Tags:
         - Key: Purpose
           Value: !Ref ResourcePrefix
@@ -291,27 +98,14 @@ Outputs:
     Export:
       Name: !Sub '${AWS::StackName}-DeliverySource'
 
-  LogGroupName:
-    Description: Log group that receives AGENT_HOURS_LOGS (queried by the dashboard).
-    Value: !Ref LogGroupName
-    Export:
-      Name: !Sub '${AWS::StackName}-LogGroup'
-
-  DashboardName:
-    Description: Name of the agent-hours CloudWatch dashboard.
-    Value: !Sub '${ResourcePrefix}-dashboard'
-
-  DashboardUrl:
-    Description: Direct link to the agent-hours CloudWatch dashboard.
-    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ResourcePrefix}-dashboard'
-
   LogBucketName:
-    Condition: WithS3
-    Description: S3 bucket receiving the agent-hours feed (for Athena/Grafana/Datadog).
-    Value: !Ref LogBucket
+    Description: Shared analytics bucket receiving the agent-hours feed.
+    Value: !Ref AnalyticsBucketName
     Export:
       Name: !Sub '${AWS::StackName}-LogBucket'
 
-  TailFeedCommand:
-    Description: Convenience command to confirm the feed is being delivered.
-    Value: !Sub "aws logs tail '${LogGroupName}' --since 1h --follow --region ${AWS::Region}"
+  S3DataLocation:
+    Description: >
+      S3 prefix under which the feed lands (the Quick dashboard's Glue table
+      location). Objects are partitioned per S3HiveCompatiblePath.
+    Value: !Sub 's3://${AnalyticsBucketName}/agent-hours/'

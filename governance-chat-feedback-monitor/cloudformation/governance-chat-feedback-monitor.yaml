@@ -1,19 +1,24 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
   Amazon Quick chat and feedback monitor. Delivers the regional CHAT_LOGS and
-  FEEDBACK_LOGS vended-log feeds to an encrypted CloudWatch Logs log group and
-  creates a CloudWatch dashboard for messages, users, agent and flow usage,
-  response status, and Useful or Not Useful feedback. A minimal daily Lambda
-  refreshes an agent ID-to-name lookup table for dashboard enrichment. Log
-  delivery is not retroactive. Assumes Quick is in the same AWS account.
+  FEEDBACK_LOGS vended-log feeds to an encrypted CloudWatch Logs log group (the
+  content audit trail) and, field-minimized, to the shared analytics bucket of
+  the Analytics Foundation stack, where the module's Amazon Quick dashboard
+  reads them through Athena. A small Lambda exports the agent ID-to-name CSV the
+  dashboard joins on, refreshed daily and on every agent create/rename/delete.
+  Log delivery is not retroactive. Assumes Quick is in the same AWS account.
 
 # Prerequisites (not created by this stack):
+#   * The Analytics Foundation stack in this account and Region (its
+#     AnalyticsBucketName output is this template's AnalyticsBucketName parameter;
+#     the apply script resolves it).
 #   * Amazon Quick AI features enabled (Enterprise or Professional subscription).
 #   * The deploying principal must hold the IAM permission
 #     quicksight:AllowVendedLogDeliveryForResource on the Quick account.
 #
 # Chat logs contain prompts, responses, resource names, and attachment metadata.
-# Restrict access to the log group and dashboard according to your data policy.
+# Only the CloudWatch log group holds that content; the S3 copies exclude it.
+# Restrict access to the log group according to your data policy.
 # Vended-log delivery is regional; deploy once in each active Quick Region.
 
 Parameters:
@@ -42,12 +47,6 @@ Parameters:
     AllowedValues: ['true', 'false']
     Description: Encrypt the log group with a dedicated customer managed KMS key.
 
-  AgentLookupTableName:
-    Type: String
-    Default: quick_agent_catalog
-    AllowedPattern: '^[A-Za-z0-9_]{1,256}$'
-    Description: CloudWatch Logs lookup table refreshed daily with Quick agent names.
-
   CreateChatDeliverySource:
     Type: String
     Default: 'true'
@@ -72,13 +71,34 @@ Parameters:
     AllowedPattern: '^$|^[\w-]{1,60}$'
     Description: Existing FEEDBACK_LOGS source name when creation is disabled.
 
+  AnalyticsBucketName:
+    Type: String
+    AllowedPattern: '^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$'
+    ConstraintDescription: An existing S3 bucket name (3-63 chars).
+    Description: >
+      Shared analytics bucket created by the Analytics Foundation stack (its
+      AnalyticsBucketName output; the apply script resolves it). The
+      field-minimized copies of both feeds land under chat-feedback/chat/ and
+      chat-feedback/feedback/, the agent-name lookup under chat-feedback/agent-names/.
+
+  EnableAgentLifecycleTrigger:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: >
+      Deliver the AGENT_METADATA_LOGS feed (agent create/update/delete events,
+      identifiers and names only) to a small log group and refresh agent
+      friendly names as soon as an agent is renamed, created or deleted,
+      instead of waiting for the daily refresh. Set to false if another stack
+      already owns a delivery source for that log type.
+
 Conditions:
   WithKms: !Equals [!Ref EnableKmsEncryption, 'true']
+  WithAgentMetadata: !Equals [!Ref EnableAgentLifecycleTrigger, 'true']
   CreateChatSource: !Equals [!Ref CreateChatDeliverySource, 'true']
   ReuseChatSource: !Equals [!Ref CreateChatDeliverySource, 'false']
   CreateFeedbackSource: !Equals [!Ref CreateFeedbackDeliverySource, 'true']
   ReuseFeedbackSource: !Equals [!Ref CreateFeedbackDeliverySource, 'false']
-
 Resources:
   LogsKey:
     Type: AWS::KMS::Key
@@ -108,7 +128,9 @@ Resources:
             Resource: '*'
             Condition:
               ArnLike:
-                kms:EncryptionContext:aws:logs:arn: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${LogGroupName}'
+                kms:EncryptionContext:aws:logs:arn:
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${LogGroupName}'
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${LogGroupName}-agent-metadata'
           - Sid: AllowVendedLogDeliveryUse
             Effect: Allow
             Principal:
@@ -118,7 +140,10 @@ Resources:
               - kms:Decrypt
             Resource: '*'
             Condition:
-              StringEquals:
+              # StringLike, as the Amazon Quick documentation prescribes: the
+              # value carries a wildcard, which StringEquals would take literally
+              # (security review M1).
+              StringLike:
                 kms:EncryptionContext:SourceArn: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*'
       Tags:
         - Key: Purpose
@@ -146,42 +171,6 @@ Resources:
           Value: Sensitive
         - Key: ManagedBy
           Value: CloudFormation
-
-  MessageCountMetricFilter:
-    Type: AWS::Logs::MetricFilter
-    Properties:
-      LogGroupName: !Ref InteractionLogGroup
-      FilterName: !Sub '${ResourcePrefix}-messages'
-      FilterPattern: '{ $.logType = "CHAT_LOGS" }'
-      MetricTransformations:
-        - MetricNamespace: QuickGovernance/ChatFeedback
-          MetricName: !Sub '${ResourcePrefix}-Messages'
-          MetricValue: '1'
-          Unit: Count
-
-  UsefulCountMetricFilter:
-    Type: AWS::Logs::MetricFilter
-    Properties:
-      LogGroupName: !Ref InteractionLogGroup
-      FilterName: !Sub '${ResourcePrefix}-useful'
-      FilterPattern: '{ $.logType = "FEEDBACK_LOGS" && $.feedback_type = "Useful" }'
-      MetricTransformations:
-        - MetricNamespace: QuickGovernance/ChatFeedback
-          MetricName: !Sub '${ResourcePrefix}-Useful'
-          MetricValue: '1'
-          Unit: Count
-
-  NotUsefulCountMetricFilter:
-    Type: AWS::Logs::MetricFilter
-    Properties:
-      LogGroupName: !Ref InteractionLogGroup
-      FilterName: !Sub '${ResourcePrefix}-not-useful'
-      FilterPattern: '{ $.logType = "FEEDBACK_LOGS" && $.feedback_type = "Not Useful" }'
-      MetricTransformations:
-        - MetricNamespace: QuickGovernance/ChatFeedback
-          MetricName: !Sub '${ResourcePrefix}-NotUseful'
-          MetricValue: '1'
-          Unit: Count
 
   ChatDeliverySource:
     Type: AWS::Logs::DeliverySource
@@ -267,6 +256,168 @@ Resources:
         - Key: Purpose
           Value: !Ref ResourcePrefix
 
+  # ----- Optional S3 copy: field-minimized, into the shared analytics bucket ----
+  # RecordFields lists every field the log type offers except the three that
+  # carry conversation content (user_message, system_text_message,
+  # feedback_details). Field lists per DescribeConfigurationTemplates; mandatory
+  # fields (resource_arn, event_timestamp, logType, accountId, feedback_type)
+  # are included. A delivery source may carry several S3 deliveries, so this
+  # coexists with any console-created delivery of the full feed.
+
+  ChatS3DeliveryDestination:
+    Type: AWS::Logs::DeliveryDestination
+    Properties:
+      Name: !Sub '${ResourcePrefix}-chat-shared-s3'
+      DeliveryDestinationType: S3
+      DestinationResourceArn: !Sub 'arn:${AWS::Partition}:s3:::${AnalyticsBucketName}/chat-feedback/chat'
+      OutputFormat: json
+      Tags:
+        - Key: Purpose
+          Value: !Ref ResourcePrefix
+
+  FeedbackS3DeliveryDestination:
+    Type: AWS::Logs::DeliveryDestination
+    Properties:
+      Name: !Sub '${ResourcePrefix}-feedback-shared-s3'
+      DeliveryDestinationType: S3
+      DestinationResourceArn: !Sub 'arn:${AWS::Partition}:s3:::${AnalyticsBucketName}/chat-feedback/feedback'
+      OutputFormat: json
+      Tags:
+        - Key: Purpose
+          Value: !Ref ResourcePrefix
+
+  ChatS3DeliveryWithNewSource:
+    Type: AWS::Logs::Delivery
+    Condition: CreateChatSource
+    DependsOn: ChatDeliverySource
+    Properties:
+      DeliverySourceName: !Sub '${ResourcePrefix}-chat-source'
+      DeliveryDestinationArn: !GetAtt ChatS3DeliveryDestination.Arn
+      S3EnableHiveCompatiblePath: true
+      RecordFields:
+        - timestamp
+        - resource_arn
+        - resource_id
+        - event_timestamp
+        - logType
+        - accountId
+        - user_arn
+        - user_type
+        - namespace
+        - status_code
+        - conversation_id
+        - system_message_id
+        - latency
+        - time_to_first_token
+        - message_scope
+        - user_message_id
+        - agent_id
+        - flow_id
+        - surface_type
+        - web_search
+        - user_selected_resources
+        - action_connectors
+        - cited_resource
+        - file_attachment
+      Tags:
+        - Key: Purpose
+          Value: !Ref ResourcePrefix
+
+  ChatS3DeliveryWithExistingSource:
+    Type: AWS::Logs::Delivery
+    Condition: ReuseChatSource
+    Properties:
+      DeliverySourceName: !Ref ExistingChatDeliverySourceName
+      DeliveryDestinationArn: !GetAtt ChatS3DeliveryDestination.Arn
+      S3EnableHiveCompatiblePath: true
+      RecordFields:
+        - timestamp
+        - resource_arn
+        - resource_id
+        - event_timestamp
+        - logType
+        - accountId
+        - user_arn
+        - user_type
+        - namespace
+        - status_code
+        - conversation_id
+        - system_message_id
+        - latency
+        - time_to_first_token
+        - message_scope
+        - user_message_id
+        - agent_id
+        - flow_id
+        - surface_type
+        - web_search
+        - user_selected_resources
+        - action_connectors
+        - cited_resource
+        - file_attachment
+      Tags:
+        - Key: Purpose
+          Value: !Ref ResourcePrefix
+
+  FeedbackS3DeliveryWithNewSource:
+    Type: AWS::Logs::Delivery
+    Condition: CreateFeedbackSource
+    DependsOn: FeedbackDeliverySource
+    Properties:
+      DeliverySourceName: !Sub '${ResourcePrefix}-feedback-source'
+      DeliveryDestinationArn: !GetAtt FeedbackS3DeliveryDestination.Arn
+      S3EnableHiveCompatiblePath: true
+      RecordFields:
+        - timestamp
+        - resource_arn
+        - resource_id
+        - event_timestamp
+        - logType
+        - accountId
+        - user_arn
+        - user_type
+        - namespace
+        - status_code
+        - conversation_id
+        - research_id
+        - system_message_id
+        - user_message_id
+        - feedback_type
+        - feedback_reason
+        - rating
+      Tags:
+        - Key: Purpose
+          Value: !Ref ResourcePrefix
+
+  FeedbackS3DeliveryWithExistingSource:
+    Type: AWS::Logs::Delivery
+    Condition: ReuseFeedbackSource
+    Properties:
+      DeliverySourceName: !Ref ExistingFeedbackDeliverySourceName
+      DeliveryDestinationArn: !GetAtt FeedbackS3DeliveryDestination.Arn
+      S3EnableHiveCompatiblePath: true
+      RecordFields:
+        - timestamp
+        - resource_arn
+        - resource_id
+        - event_timestamp
+        - logType
+        - accountId
+        - user_arn
+        - user_type
+        - namespace
+        - status_code
+        - conversation_id
+        - research_id
+        - system_message_id
+        - user_message_id
+        - feedback_type
+        - feedback_reason
+        - rating
+      Tags:
+        - Key: Purpose
+          Value: !Ref ResourcePrefix
+
   AgentLookupFunctionLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
@@ -297,20 +448,16 @@ Resources:
                 Effect: Allow
                 Action: quicksight:ListAgents
                 Resource: '*'
-              - Sid: ManageLookupTable
-                Effect: Allow
-                Action:
-                  - logs:CreateLookupTable
-                  - logs:UpdateLookupTable
-                  - logs:DeleteLookupTable
-                  - logs:DescribeLookupTables
-                Resource: '*'
               - Sid: WriteFunctionLogs
                 Effect: Allow
                 Action:
                   - logs:CreateLogStream
                   - logs:PutLogEvents
                 Resource: !Sub '${AgentLookupFunctionLogGroup.Arn}:*'
+              - Sid: ExportAgentNamesCsv
+                Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${AnalyticsBucketName}/chat-feedback/agent-names/*'
       Tags:
         - Key: Purpose
           Value: !Ref ResourcePrefix
@@ -322,7 +469,7 @@ Resources:
     DependsOn: AgentLookupFunctionLogGroup
     Properties:
       FunctionName: !Sub '${ResourcePrefix}-agent-name-resolver'
-      Description: Refreshes the Quick agent ID-to-name CloudWatch Logs lookup table.
+      Description: Exports the Quick agent ID-to-name CSV that the Quick dashboard joins on.
       Runtime: python3.14
       Architectures: [arm64]
       Handler: index.handler
@@ -332,7 +479,8 @@ Resources:
       Environment:
         Variables:
           AWS_ACCOUNT_ID: !Ref 'AWS::AccountId'
-          LOOKUP_TABLE_NAME: !Ref AgentLookupTableName
+          EXPORT_BUCKET: !Ref AnalyticsBucketName
+          EXPORT_PREFIX: 'chat-feedback/agent-names/'
       Code:
         ZipFile: |
           import boto3
@@ -341,28 +489,11 @@ Resources:
           from botocore.auth import SigV4Auth
           from botocore.awsrequest import AWSRequest
 
-          logs = boto3.client("logs")
           session = boto3.Session()
           account_id = os.environ["AWS_ACCOUNT_ID"]
-          table_name = os.environ["LOOKUP_TABLE_NAME"]
           region = os.environ["AWS_REGION"]
-
-          def find_table(name):
-              try:
-                  response = logs.describe_lookup_tables(
-                      lookupTableNamePrefix=name, maxResults=100)
-              except Exception as error:
-                  code = getattr(error, "response", {}).get("Error", {}).get("Code")
-                  if code == "ResourceNotFoundException":
-                      return None
-                  raise
-              return next((item for item in response.get("lookupTables", [])
-                           if item["lookupTableName"] == name), None)
-
-          def delete_table(name):
-              table = find_table(name)
-              if table:
-                  logs.delete_lookup_table(lookupTableArn=table["lookupTableArn"])
+          export_bucket = os.environ["EXPORT_BUCKET"]
+          export_prefix = os.environ.get("EXPORT_PREFIX", "chat-feedback/agent-names/")
 
           def list_agents():
               token = None
@@ -385,23 +516,21 @@ Resources:
                   if not token:
                       break
 
-          def refresh_table():
+          def refresh_export():
               rows = list(list_agents())
               output = io.StringIO()
               writer = csv.writer(output, lineterminator="\n")
               writer.writerow(["agent_id", "agent_name"])
               writer.writerows(sorted(rows))
               body = output.getvalue()
-              table = find_table(table_name)
-              if table:
-                  logs.update_lookup_table(
-                      lookupTableArn=table["lookupTableArn"], tableBody=body)
-                  arn = table["lookupTableArn"]
-              else:
-                  created = logs.create_lookup_table(
-                      lookupTableName=table_name, tableBody=body)
-                  arn = created["lookupTableArn"]
-              return {"AgentCount": len(rows), "LookupTableArn": arn}
+              # The Quick dashboard joins this CSV (Glue table chat_agent_names)
+              # to show agent names instead of IDs.
+              key = export_prefix + "agent-names.csv"
+              boto3.client("s3").put_object(
+                  Bucket=export_bucket, Key=key,
+                  Body=body.encode("utf-8"), ContentType="text/csv")
+              return {"AgentCount": len(rows),
+                      "S3Export": f"s3://{export_bucket}/{key}"}
 
           def respond(event, context, status, data, physical_id, reason=None):
               body = json.dumps({
@@ -419,17 +548,23 @@ Resources:
 
           def handler(event, context):
               is_custom = "RequestType" in event
-              physical_id = event.get("PhysicalResourceId", "lookup-table:" + table_name)
+              physical_id = event.get("PhysicalResourceId",
+                                      "agent-names:" + export_bucket)
+              # Triggers: CloudFormation custom resource (deploy), EventBridge
+              # schedule (daily), CloudWatch Logs subscription filter (an agent
+              # lifecycle event such as UpdateAgent - i.e. a rename - landed in
+              # the AGENT_METADATA_LOGS log group), or a manual invoke.
+              trigger = ("custom-resource" if is_custom
+                         else "agent-metadata-event" if "awslogs" in event
+                         else "schedule-or-manual")
+              print(f"Refreshing agent names, trigger={trigger}")
               try:
                   if is_custom and event["RequestType"] == "Delete":
-                      delete_table(event.get("ResourceProperties", {}).get(
-                          "LookupTableName", table_name))
+                      # The CSV stays in the shared bucket with the rest of the
+                      # module's data; nothing to tear down here.
                       result = {"Deleted": True}
                   else:
-                      result = refresh_table()
-                      old_name = event.get("OldResourceProperties", {}).get("LookupTableName")
-                      if old_name and old_name != table_name:
-                          delete_table(old_name)
+                      result = refresh_export()
                   if is_custom:
                       respond(event, context, "SUCCESS", result, physical_id)
                   return result
@@ -450,8 +585,8 @@ Resources:
     Type: Custom::QuickAgentLookup
     Properties:
       ServiceToken: !GetAtt AgentLookupFunction.Arn
-      LookupTableName: !Ref AgentLookupTableName
-      ResolverVersion: '2'
+      ExportBucket: !Ref AnalyticsBucketName
+      ResolverVersion: '3'
 
   AgentLookupSchedule:
     Type: AWS::Events::Rule
@@ -475,108 +610,107 @@ Resources:
       Principal: events.amazonaws.com
       SourceArn: !GetAtt AgentLookupSchedule.Arn
 
-  Dashboard:
-    Type: AWS::CloudWatch::Dashboard
-    DependsOn: AgentLookupInitializer
+  # ----- Agent lifecycle trigger: rename, create, delete -> refresh names ------
+  # Quick emits one AGENT_METADATA_LOGS record per agent operation
+  # (CreateAgent, UpdateAgent, DeleteAgent, UpdateAgentPermissions, ...). The
+  # feed lands in a small dedicated log group and a subscription filter invokes
+  # the resolver, so a renamed agent shows its new name within a minute instead
+  # of at the next daily run. RecordFields keeps the record to identifiers and
+  # names: the documented sensitive fields (custom_prompt_input,
+  # welcome_message, starter_prompts, instructions, magic_builder_query) are
+  # not delivered. The daily schedule remains as the safety net.
+
+  AgentMetadataLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: WithAgentMetadata
     Properties:
-      DashboardName: !Sub '${ResourcePrefix}-dashboard'
-      DashboardBody: !Sub |
-        {
-          "start":"-P30D",
-          "periodOverride":"auto",
-          "widgets":[
-            {
-              "type":"text","x":0,"y":0,"width":24,"height":2,
-              "properties":{"markdown":"# Amazon Quick chat and feedback\nUse the dashboard time picker to control every widget. **Sensitive:** tables can contain prompts, responses, feedback comments, resource names, and attachment metadata. Metric totals begin when this stack is deployed; log widgets reflect retained events."}
-            },
-            {
-              "type":"metric","x":0,"y":2,"width":8,"height":5,
-              "properties":{
-                "title":"Messages (selected range)","view":"singleValue","region":"${AWS::Region}",
-                "stat":"Sum","setPeriodToTimeRange":true,
-                "metrics":[["QuickGovernance/ChatFeedback","${ResourcePrefix}-Messages",{"label":"Messages"}]]
-              }
-            },
-            {
-              "type":"metric","x":8,"y":2,"width":8,"height":5,
-              "properties":{
-                "title":"Thumbs up - Useful (selected range)","view":"singleValue","region":"${AWS::Region}",
-                "stat":"Sum","setPeriodToTimeRange":true,
-                "metrics":[["QuickGovernance/ChatFeedback","${ResourcePrefix}-Useful",{"label":"Useful"}]]
-              }
-            },
-            {
-              "type":"metric","x":16,"y":2,"width":8,"height":5,
-              "properties":{
-                "title":"Thumbs down - Not Useful (selected range)","view":"singleValue","region":"${AWS::Region}",
-                "stat":"Sum","setPeriodToTimeRange":true,
-                "metrics":[["QuickGovernance/ChatFeedback","${ResourcePrefix}-NotUseful",{"label":"Not Useful"}]]
-              }
-            },
-            {
-              "type":"log","x":0,"y":7,"width":12,"height":6,
-              "properties":{
-                "title":"Users sending the most messages - highest to lowest","region":"${AWS::Region}","view":"table",
-                "query":"SOURCE '${LogGroupName}' | filter logType = \"CHAT_LOGS\" | stats count(*) as message_count by user_arn, user_type | sort message_count desc | limit 100"
-              }
-            },
-            {
-              "type":"log","x":12,"y":7,"width":12,"height":6,
-              "properties":{
-                "title":"Most-used agents by name - highest to lowest","region":"${AWS::Region}","view":"table",
-                "query":"SOURCE '${LogGroupName}' | filter logType = \"CHAT_LOGS\" | lookup ${AgentLookupTableName} agent_id OUTPUT agent_name | fields coalesce(agent_name, agent_id) as resolved_agent_name, agent_id | stats count(*) as message_count by resolved_agent_name, agent_id | sort message_count desc | display resolved_agent_name, message_count, agent_id | limit 100"
-              }
-            },
-            {
-              "type":"log","x":0,"y":13,"width":12,"height":6,
-              "properties":{
-                "title":"Message status trend","region":"${AWS::Region}","view":"timeSeries","stacked":false,
-                "query":"SOURCE '${LogGroupName}' | filter logType = \"CHAT_LOGS\" | stats count(*) as messages by bin(1d), status_code"
-              }
-            },
-            {
-              "type":"log","x":12,"y":13,"width":12,"height":6,
-              "properties":{
-                "title":"Feedback trend","region":"${AWS::Region}","view":"timeSeries","stacked":false,
-                "query":"SOURCE '${LogGroupName}' | filter logType = \"FEEDBACK_LOGS\" | stats count(*) as feedback by bin(1d), feedback_type"
-              }
-            },
-            {
-              "type":"log","x":0,"y":19,"width":12,"height":6,
-              "properties":{
-                "title":"Feedback reasons","region":"${AWS::Region}","view":"table",
-                "query":"SOURCE '${LogGroupName}' | filter logType = \"FEEDBACK_LOGS\" | stats count(*) as feedback by feedback_type, feedback_reason | sort feedback desc | limit 100"
-              }
-            },
-            {
-              "type":"log","x":12,"y":19,"width":12,"height":6,
-              "properties":{
-                "title":"Blocked and unanswered messages","region":"${AWS::Region}","view":"table",
-                "query":"SOURCE '${LogGroupName}' | filter logType = \"CHAT_LOGS\" and status_code != \"success\" | fields @timestamp, user_arn, status_code, agent_id, flow_id, user_message | sort @timestamp desc | limit 1000"
-              }
-            },
-            {
-              "type":"log","x":0,"y":25,"width":24,"height":8,
-              "properties":{
-                "title":"Latest user messages and Quick responses - up to 10,000","region":"${AWS::Region}","view":"table",
-                "query":"SOURCE '${LogGroupName}' | filter logType = \"CHAT_LOGS\" | fields @timestamp, user_arn, user_type, agent_id, flow_id, status_code, message_scope, user_message, system_text_message, conversation_id, user_message_id, system_message_id | sort @timestamp desc | limit 10000"
-              }
-            },
-            {
-              "type":"log","x":0,"y":33,"width":24,"height":8,
-              "properties":{
-                "title":"Latest feedback details - up to 10,000","region":"${AWS::Region}","view":"table",
-                "query":"SOURCE '${LogGroupName}' | filter logType = \"FEEDBACK_LOGS\" | fields @timestamp, user_arn, user_type, feedback_type, feedback_reason, feedback_details, conversation_id, user_message_id, system_message_id | sort @timestamp desc | limit 10000"
-              }
-            }
-          ]
-        }
+      LogGroupName: !Sub '${LogGroupName}-agent-metadata'
+      RetentionInDays: 30
+      KmsKeyId: !If [WithKms, !GetAtt LogsKey.Arn, !Ref 'AWS::NoValue']
+      Tags:
+        - Key: Purpose
+          Value: !Ref ResourcePrefix
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  AgentMetadataDeliverySource:
+    Type: AWS::Logs::DeliverySource
+    Condition: WithAgentMetadata
+    Properties:
+      Name: !Sub '${ResourcePrefix}-agent-metadata-source'
+      LogType: AGENT_METADATA_LOGS
+      ResourceArn: !Sub 'arn:${AWS::Partition}:quicksight:${AWS::Region}:${AWS::AccountId}:account/${AWS::AccountId}'
+      Tags:
+        - Key: Purpose
+          Value: !Ref ResourcePrefix
+
+  AgentMetadataDeliveryDestination:
+    Type: AWS::Logs::DeliveryDestination
+    Condition: WithAgentMetadata
+    Properties:
+      Name: !Sub '${ResourcePrefix}-agent-metadata-cwl'
+      DeliveryDestinationType: CWL
+      DestinationResourceArn: !GetAtt AgentMetadataLogGroup.Arn
+      Tags:
+        - Key: Purpose
+          Value: !Ref ResourcePrefix
+
+  AgentMetadataDelivery:
+    Type: AWS::Logs::Delivery
+    Condition: WithAgentMetadata
+    DependsOn: AgentMetadataDeliverySource
+    Properties:
+      DeliverySourceName: !Sub '${ResourcePrefix}-agent-metadata-source'
+      DeliveryDestinationArn: !GetAtt AgentMetadataDeliveryDestination.Arn
+      RecordFields:
+        - timestamp
+        - resource_arn
+        - resource_id
+        - event_timestamp
+        - log_type
+        - account_id
+        - user_arn
+        - event_version
+        - event_name
+        - agent_id
+        - request_id
+        - agent_arn
+        - agent_name
+        - agent_status
+        - update_action
+        - version
+      Tags:
+        - Key: Purpose
+          Value: !Ref ResourcePrefix
+
+  # Invocation is limited to this account's agent-metadata log group through
+  # SourceAccount and SourceArn (the exact log group ARN; the ":*" form is not
+  # accepted here). Principal is the global CloudWatch Logs service principal
+  # as documented for subscription filters, written as a literal string: the
+  # regional !Sub form is an intrinsic-function map that policy scanners such
+  # as cfn-guard (LAMBDA_FUNCTION_PUBLIC_ACCESS_PROHIBITED) cannot evaluate,
+  # which reports this permission as public although it never was.
+  AgentMetadataInvokePermission:
+    Type: AWS::Lambda::Permission
+    Condition: WithAgentMetadata
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref AgentLookupFunction
+      Principal: logs.amazonaws.com
+      SourceAccount: !Ref 'AWS::AccountId'
+      SourceArn: !GetAtt AgentMetadataLogGroup.Arn
+
+  AgentMetadataSubscription:
+    Type: AWS::Logs::SubscriptionFilter
+    Condition: WithAgentMetadata
+    DependsOn: AgentMetadataInvokePermission
+    Properties:
+      LogGroupName: !Ref AgentMetadataLogGroup
+      FilterName: !Sub '${ResourcePrefix}-agent-lifecycle'
+      FilterPattern: '{ $.event_name = * }'
+      DestinationArn: !GetAtt AgentLookupFunction.Arn
 
 Outputs:
-  AgentLookupTableName:
-    Description: CloudWatch Logs lookup table refreshed daily with Quick agent names.
-    Value: !Ref AgentLookupTableName
-
   AgentLookupFunctionName:
     Description: Daily Lambda function that refreshes the agent lookup table.
     Value: !Ref AgentLookupFunction
@@ -593,14 +727,6 @@ Outputs:
     Description: Log group receiving regional CHAT_LOGS and FEEDBACK_LOGS events.
     Value: !Ref InteractionLogGroup
 
-  DashboardName:
-    Description: Name of the CloudWatch dashboard.
-    Value: !Sub '${ResourcePrefix}-dashboard'
-
-  DashboardUrl:
-    Description: Direct link to the CloudWatch dashboard.
-    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ResourcePrefix}-dashboard'
-
   KmsKeyArn:
     Condition: WithKms
     Description: KMS key encrypting the log group.
@@ -609,3 +735,9 @@ Outputs:
   TailFeedCommand:
     Description: Command to confirm chat and feedback events are arriving.
     Value: !Sub "aws logs tail '${LogGroupName}' --since 1h --follow --region ${AWS::Region}"
+
+  S3DataLocation:
+    Description: >
+      Shared analytics bucket prefixes receiving the field-minimized copies
+      (chat/ and feedback/ below it) - Glue table locations for the Quick dashboard.
+    Value: !Sub 's3://${AnalyticsBucketName}/chat-feedback/'

@@ -33,8 +33,10 @@
 #   --identity-region         Quick identity region (empty = auto-discover)
 #   --namespaces              comma-separated namespaces (default 'default')
 #   --asset-types             comma-separated asset types (default: all 8)
-#   --log-retention-days      CloudWatch Logs retention (default 90)
-#   --snapshot-expiration-days  S3 snapshot expiry (default 365)
+#   --log-retention-days      CloudWatch Logs retention of the collector's own log group (default 90)
+#   --foundation-stack        Analytics Foundation stack name (default quick-governance-analytics-foundation);
+#                             its bucket receives snapshots and state under orphaned-assets/
+#   --skip-dashboard          deploy the module stack only, not its Amazon Quick dashboard
 
 set -euo pipefail
 
@@ -48,10 +50,12 @@ IDENTITY_REGION=""
 NAMESPACES="default"
 ASSET_TYPES="DATASET,DASHBOARD,ANALYSIS,DATA_SOURCE,FOLDER,SPACE,AGENT,TOPIC"
 LOG_RETENTION_DAYS="90"
-SNAPSHOT_EXPIRATION_DAYS="365"
+FOUNDATION_STACK="quick-governance-analytics-foundation"
+SKIP_DASHBOARD="false"
 
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 TEMPLATE="${SCRIPT_DIR}/../cloudformation/governance-orphaned-assets-monitor.yaml"
+DASHBOARD_SCRIPT="${SCRIPT_DIR}/apply-governance-orphaned-assets-quick-dashboard.sh"
 
 err() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 log() { printf '[orphaned-assets] %s\n' "$*"; }
@@ -73,7 +77,8 @@ while [[ $# -gt 0 ]]; do
     --namespaces)               NAMESPACES="$2";               shift 2 ;;
     --asset-types)              ASSET_TYPES="$2";              shift 2 ;;
     --log-retention-days)       LOG_RETENTION_DAYS="$2";       shift 2 ;;
-    --snapshot-expiration-days) SNAPSHOT_EXPIRATION_DAYS="$2"; shift 2 ;;
+    --foundation-stack)         FOUNDATION_STACK="$2";         shift 2 ;;
+    --skip-dashboard)           SKIP_DASHBOARD="true";         shift ;;
     -h|--help)                  usage ;;
     *) err "Unknown argument: $1" ;;
   esac
@@ -88,8 +93,16 @@ command -v aws >/dev/null 2>&1 || err "aws CLI not found in PATH"
 
 [[ -n "$PROFILE" ]] && export AWS_PROFILE="$PROFILE"
 
+# ---------- resolve the foundation ----------
+ANALYTICS_BUCKET="$(aws cloudformation describe-stacks \
+  --region "$REGION" --stack-name "$FOUNDATION_STACK" \
+  --query "Stacks[0].Outputs[?OutputKey=='AnalyticsBucketName'].OutputValue" \
+  --output text 2>/dev/null || true)"
+[[ -n "$ANALYTICS_BUCKET" && "$ANALYTICS_BUCKET" != "None" ]] \
+  || err "Foundation stack '$FOUNDATION_STACK' not found in $REGION - deploy governance-analytics-foundation first"
+
 log "Deploying stack '$STACK_NAME' in $REGION${PROFILE:+ (profile: $PROFILE)}."
-log "Schedule: $SCHEDULE | asset types: $ASSET_TYPES"
+log "Schedule: $SCHEDULE | asset types: $ASSET_TYPES | snapshots and state -> s3://$ANALYTICS_BUCKET/orphaned-assets/"
 [[ -n "$ALERT_EMAIL" ]] && log "Alerts will be emailed to: $ALERT_EMAIL (confirm the SNS subscription!)"
 
 BUILD_DIR="${SCRIPT_DIR}/../.aws-sam/build"
@@ -115,7 +128,7 @@ sam deploy \
       "Namespaces=\"$NAMESPACES\"" \
       "AssetTypes=\"$ASSET_TYPES\"" \
       "LogRetentionDays=\"$LOG_RETENTION_DAYS\"" \
-      "SnapshotExpirationDays=\"$SNAPSHOT_EXPIRATION_DAYS\""
+      "AnalyticsBucketName=\"$ANALYTICS_BUCKET\""
 
 log "Stack outputs:"
 aws cloudformation describe-stacks \
@@ -125,3 +138,12 @@ aws cloudformation describe-stacks \
 
 log "Done. Trigger a first scan now with the RunScanNowCommand output above,"
 log "or wait for the schedule."
+
+# ---------- Quick dashboard ----------
+if [[ "$SKIP_DASHBOARD" == "true" ]]; then
+  log "Module only (--skip-dashboard); the Quick dashboard was not deployed."
+  exit 0
+fi
+[[ -x "$DASHBOARD_SCRIPT" ]] || err "Dashboard script not found or not executable: $DASHBOARD_SCRIPT"
+log "Deploying the Amazon Quick dashboard."
+"$DASHBOARD_SCRIPT" --region "$REGION" ${PROFILE:+--profile "$PROFILE"} --foundation-stack "$FOUNDATION_STACK"

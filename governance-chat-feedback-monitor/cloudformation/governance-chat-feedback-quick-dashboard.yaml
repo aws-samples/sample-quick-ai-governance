@@ -1,0 +1,1535 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Amazon Quick chat and feedback monitor - native Amazon Quick dashboard for
+  administrators. Creates Glue tables over the CHAT_LOGS and FEEDBACK_LOGS
+  objects delivered to S3 (message text and comment fields are deliberately
+  not declared), two Direct Query datasets (Athena, custom SQL) and a five-tab
+  dashboard: Overview, Users, Agents, Quality, Events. Requires the governance
+  analytics foundation stack in the same Region.
+
+# Prerequisites (NOT created by this stack):
+#   * governance-analytics-foundation deployed in this Region.
+#   * CHAT_LOGS and FEEDBACK_LOGS delivered to S3 (the Chat and Feedback module's
+#     field-minimized deliveries, or the S3 deliveries Quick's console creates).
+#   * Optional: an agent_id,agent_name CSV under AgentNamesLocation (the module's
+#     agent-name resolver exports it) - without it agents show their IDs.
+#   * Manual, console only: Manage Quick -> Security & permissions -> AWS
+#     resources -> Manage: Amazon Athena enabled and DataBucketName selected.
+#
+# Privacy by construction: the Glue tables omit user_message,
+# system_text_message and feedback_details, so neither Athena nor Quick can
+# read conversation content through this stack. Correlation IDs are kept so
+# investigators can pivot to the CloudWatch Logs audit trail.
+
+Parameters:
+  ResourcePrefix:
+    Type: String
+    Default: 'quick-governance-chat-feedback'
+    AllowedPattern: '^[a-z0-9-]{1,40}$'
+    Description: Prefix for the Quick dataset and dashboard IDs.
+
+  FoundationStackName:
+    Type: String
+    Default: 'quick-governance-analytics-foundation'
+    AllowedPattern: '^[A-Za-z][A-Za-z0-9-]{0,127}$'
+    Description: Stack name of the governance analytics foundation (exports are imported).
+
+  DataBucketName:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$'
+    Description: >
+      Bucket holding the CHAT_LOGS and FEEDBACK_LOGS objects. Empty (default)
+      reads the shared analytics bucket created by the foundation stack; set it
+      to read another bucket (for example the console-created deliveries),
+      together with ChatPrefix and FeedbackPrefix.
+
+  ChatPrefix:
+    Type: String
+    Default: 'chat-feedback/chat/'
+    AllowedPattern: '^([A-Za-z0-9_=./-]+/)?$'
+    Description: Prefix of the CHAT_LOGS objects (for console-created deliveries, AWSLogs/<account-id>/quicksuitelogs/chat-logs/).
+
+  FeedbackPrefix:
+    Type: String
+    Default: 'chat-feedback/feedback/'
+    AllowedPattern: '^([A-Za-z0-9_=./-]+/)?$'
+    Description: Prefix of the FEEDBACK_LOGS objects (for console-created deliveries, AWSLogs/<account-id>/quicksuitelogs/feedback-logs/).
+
+  AgentNamesLocation:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^s3://[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]/([A-Za-z0-9_=./-]+/)?$'
+    Description: >
+      S3 location (s3://bucket/prefix/) of the agent_id,agent_name CSV. Empty
+      uses chat-feedback/agent-names/ in the foundation analytics bucket.
+
+  QuickPrincipalArn:
+    Type: String
+    AllowedPattern: '^arn:aws[a-z-]*:quicksight:[a-z0-9-]+:[0-9]{12}:(user|group)/.+$'
+    Description: Quick user or group ARN (identity Region) that owns the datasets and dashboard.
+
+Conditions:
+  DefaultAgentNamesLocation: !Equals [!Ref AgentNamesLocation, '']
+  UseSharedBucket: !Equals [!Ref DataBucketName, '']
+
+Resources:
+
+  # ----- Glue tables ------------------------------------------------------------
+  # OpenX JSON SerDe over gzip JSON lines, no partitions (same modeling as the
+  # agent-hours table). Content fields are not declared on purpose.
+
+  ChatTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref 'AWS::AccountId'
+      DatabaseName:
+        Fn::ImportValue: !Sub '${FoundationStackName}-GlueDatabase'
+      TableInput:
+        Name: chat_logs
+        Description: Amazon Quick CHAT_LOGS events - metadata only (user_message and system_text_message not declared).
+        TableType: EXTERNAL_TABLE
+        Parameters: {classification: json, EXTERNAL: 'TRUE'}
+        StorageDescriptor:
+          Location: !If
+            - UseSharedBucket
+            - !Sub
+              - 's3://${Bucket}/${ChatPrefix}'
+              - Bucket:
+                  Fn::ImportValue: !Sub '${FoundationStackName}-AnalyticsBucket'
+            - !Sub 's3://${DataBucketName}/${ChatPrefix}'
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          Compressed: true
+          SerdeInfo:
+            SerializationLibrary: org.openx.data.jsonserde.JsonSerDe
+            Parameters: {ignore.malformed.json: 'true', case.insensitive: 'true'}
+          Columns:
+            - {Name: resource_arn, Type: string}
+            - {Name: resource_id, Type: string}
+            - {Name: event_timestamp, Type: bigint}
+            - {Name: logtype, Type: string}
+            - {Name: accountid, Type: string}
+            - {Name: user_arn, Type: string}
+            - {Name: user_type, Type: string}
+            - {Name: namespace, Type: string}
+            - {Name: status_code, Type: string}
+            - {Name: conversation_id, Type: string}
+            - {Name: system_message_id, Type: string}
+            - {Name: user_message_id, Type: string}
+            - {Name: latency, Type: string}
+            - {Name: time_to_first_token, Type: string}
+            - {Name: message_scope, Type: string}
+            - {Name: agent_id, Type: string}
+            - {Name: flow_id, Type: string}
+            - {Name: surface_type, Type: string}
+            - {Name: web_search, Type: string}
+            - {Name: user_selected_resources, Type: string}
+            - {Name: action_connectors, Type: string}
+            - {Name: cited_resource, Type: string}
+            - {Name: file_attachment, Type: string}
+
+  FeedbackTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref 'AWS::AccountId'
+      DatabaseName:
+        Fn::ImportValue: !Sub '${FoundationStackName}-GlueDatabase'
+      TableInput:
+        Name: feedback_logs
+        Description: Amazon Quick FEEDBACK_LOGS events - metadata only (feedback_details not declared).
+        TableType: EXTERNAL_TABLE
+        Parameters: {classification: json, EXTERNAL: 'TRUE'}
+        StorageDescriptor:
+          Location: !If
+            - UseSharedBucket
+            - !Sub
+              - 's3://${Bucket}/${FeedbackPrefix}'
+              - Bucket:
+                  Fn::ImportValue: !Sub '${FoundationStackName}-AnalyticsBucket'
+            - !Sub 's3://${DataBucketName}/${FeedbackPrefix}'
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          Compressed: true
+          SerdeInfo:
+            SerializationLibrary: org.openx.data.jsonserde.JsonSerDe
+            Parameters: {ignore.malformed.json: 'true', case.insensitive: 'true'}
+          Columns:
+            - {Name: resource_arn, Type: string}
+            - {Name: resource_id, Type: string}
+            - {Name: event_timestamp, Type: bigint}
+            - {Name: logtype, Type: string}
+            - {Name: accountid, Type: string}
+            - {Name: user_arn, Type: string}
+            - {Name: user_type, Type: string}
+            - {Name: namespace, Type: string}
+            - {Name: status_code, Type: string}
+            - {Name: conversation_id, Type: string}
+            - {Name: research_id, Type: string}
+            - {Name: system_message_id, Type: string}
+            - {Name: user_message_id, Type: string}
+            - {Name: feedback_type, Type: string}
+            - {Name: feedback_reason, Type: string}
+            - {Name: rating, Type: string}
+
+  # agent_id,agent_name CSV with a header row. Empty until the resolver exports
+  # it; the datasets fall back to the agent ID.
+  AgentNamesTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref 'AWS::AccountId'
+      DatabaseName:
+        Fn::ImportValue: !Sub '${FoundationStackName}-GlueDatabase'
+      TableInput:
+        Name: chat_agent_names
+        Description: Quick agent ID to friendly name (CSV exported by the Chat and Feedback module).
+        TableType: EXTERNAL_TABLE
+        Parameters: {classification: csv, EXTERNAL: 'TRUE', skip.header.line.count: '1'}
+        StorageDescriptor:
+          Location: !If
+            - DefaultAgentNamesLocation
+            - !Sub
+              - 's3://${Bucket}/chat-feedback/agent-names/'
+              - Bucket:
+                  Fn::ImportValue: !Sub '${FoundationStackName}-AnalyticsBucket'
+            - !Ref AgentNamesLocation
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.serde2.OpenCSVSerde
+            Parameters: {separatorChar: ',', quoteChar: '"', escapeChar: '\'}
+          Columns:
+            - {Name: agent_id, Type: string}
+            - {Name: agent_name, Type: string}
+
+  # ----- Datasets: Direct Query, metadata only ---------------------------------
+
+  ChatDataSet:
+    Type: AWS::QuickSight::DataSet
+    DependsOn: [ChatTable, AgentNamesTable]
+    Properties:
+      AwsAccountId: !Ref 'AWS::AccountId'
+      DataSetId: !Sub '${ResourcePrefix}-chat'
+      Name: Quick governance - chat messages (metadata)
+      ImportMode: DIRECT_QUERY
+      PhysicalTableMap:
+        chat:
+          CustomSql:
+            DataSourceArn:
+              Fn::ImportValue: !Sub '${FoundationStackName}-QuickDataSourceArn'
+            Name: chat
+            SqlQuery: !Sub
+              - |
+                SELECT
+                  CAST(from_unixtime(CASE WHEN c.event_timestamp > 100000000000 THEN c.event_timestamp / 1000 ELSE c.event_timestamp END) AS TIMESTAMP) AS event_time,
+                  c.user_arn,
+                  regexp_replace(c.user_arn, '^.*:user/', '') AS user_label,
+                  COALESCE(c.user_type, 'unknown') AS user_type,
+                  c.namespace,
+                  COALESCE(c.status_code, 'unknown') AS status_code,
+                  CASE WHEN c.status_code = 'success' THEN 1 ELSE 0 END AS success_count,
+                  CASE WHEN c.status_code IS NULL OR c.status_code <> 'success' THEN 1 ELSE 0 END AS not_success_count,
+                  c.conversation_id,
+                  c.user_message_id,
+                  c.system_message_id,
+                  c.agent_id,
+                  COALESCE(a.agent_name, CASE WHEN c.agent_id = 'SYSTEM' THEN 'Default chat agent' END, c.agent_id, '(no agent)') AS agent_label,
+                  c.flow_id,
+                  COALESCE(c.message_scope, 'unknown') AS message_scope,
+                  COALESCE(c.surface_type, 'unknown') AS surface_type,
+                  TRY_CAST(c.latency AS DOUBLE) AS latency,
+                  TRY_CAST(c.time_to_first_token AS DOUBLE) AS time_to_first_token,
+                  CASE WHEN c.cited_resource IS NOT NULL AND c.cited_resource NOT IN ('', '[]', 'null') THEN 1 ELSE 0 END AS cited_count,
+                  CASE WHEN c.flow_id IS NOT NULL AND c.flow_id <> '' THEN 1 ELSE 0 END AS flow_count,
+                  1 AS message_count
+                FROM "${Db}"."chat_logs" c
+                LEFT JOIN "${Db}"."chat_agent_names" a ON a.agent_id = c.agent_id
+                WHERE c.event_timestamp IS NOT NULL
+              - Db:
+                  Fn::ImportValue: !Sub '${FoundationStackName}-GlueDatabase'
+            Columns:
+              - {Name: event_time, Type: DATETIME}
+              - {Name: user_arn, Type: STRING}
+              - {Name: user_label, Type: STRING}
+              - {Name: user_type, Type: STRING}
+              - {Name: namespace, Type: STRING}
+              - {Name: status_code, Type: STRING}
+              - {Name: success_count, Type: INTEGER}
+              - {Name: not_success_count, Type: INTEGER}
+              - {Name: conversation_id, Type: STRING}
+              - {Name: user_message_id, Type: STRING}
+              - {Name: system_message_id, Type: STRING}
+              - {Name: agent_id, Type: STRING}
+              - {Name: agent_label, Type: STRING}
+              - {Name: flow_id, Type: STRING}
+              - {Name: message_scope, Type: STRING}
+              - {Name: surface_type, Type: STRING}
+              - {Name: latency, Type: DECIMAL}
+              - {Name: time_to_first_token, Type: DECIMAL}
+              - {Name: cited_count, Type: INTEGER}
+              - {Name: flow_count, Type: INTEGER}
+              - {Name: message_count, Type: INTEGER}
+      LogicalTableMap:
+        chat:
+          Alias: chat
+          Source: {PhysicalTableId: chat}
+      Permissions:
+        - Principal: !Ref QuickPrincipalArn
+          Actions:
+            - quicksight:DescribeDataSet
+            - quicksight:DescribeDataSetPermissions
+            - quicksight:PassDataSet
+            - quicksight:DescribeIngestion
+            - quicksight:ListIngestions
+            - quicksight:UpdateDataSet
+            - quicksight:DeleteDataSet
+            - quicksight:CreateIngestion
+            - quicksight:CancelIngestion
+            - quicksight:UpdateDataSetPermissions
+      Tags:
+        - {Key: Purpose, Value: !Ref ResourcePrefix}
+        - {Key: ManagedBy, Value: CloudFormation}
+
+  # Feedback joined to the rated message so ratings can be attributed to an
+  # agent and a surface. Positive / negative classification tolerates the
+  # naming variants seen across Quick releases.
+  FeedbackDataSet:
+    Type: AWS::QuickSight::DataSet
+    DependsOn: [ChatTable, FeedbackTable, AgentNamesTable]
+    Properties:
+      AwsAccountId: !Ref 'AWS::AccountId'
+      DataSetId: !Sub '${ResourcePrefix}-feedback'
+      Name: Quick governance - feedback (metadata)
+      ImportMode: DIRECT_QUERY
+      PhysicalTableMap:
+        feedback:
+          CustomSql:
+            DataSourceArn:
+              Fn::ImportValue: !Sub '${FoundationStackName}-QuickDataSourceArn'
+            Name: feedback
+            SqlQuery: !Sub
+              - |
+                SELECT
+                  CAST(from_unixtime(CASE WHEN f.event_timestamp > 100000000000 THEN f.event_timestamp / 1000 ELSE f.event_timestamp END) AS TIMESTAMP) AS event_time,
+                  f.user_arn,
+                  regexp_replace(f.user_arn, '^.*:user/', '') AS user_label,
+                  COALESCE(f.user_type, 'unknown') AS user_type,
+                  COALESCE(f.feedback_type, 'unknown') AS feedback_type,
+                  COALESCE(f.feedback_reason, '(no reason given)') AS feedback_reason,
+                  TRY_CAST(f.rating AS DOUBLE) AS rating,
+                  CASE WHEN lower(replace(f.feedback_type, '_', ' ')) IN ('useful', 'thumbs up', 'positive', 'up', 'like', 'helpful') THEN 1 ELSE 0 END AS positive_count,
+                  CASE WHEN lower(replace(f.feedback_type, '_', ' ')) IN ('not useful', 'notuseful', 'thumbs down', 'negative', 'down', 'dislike', 'not helpful') THEN 1 ELSE 0 END AS negative_count,
+                  f.conversation_id,
+                  f.user_message_id,
+                  f.system_message_id,
+                  f.research_id,
+                  COALESCE(a.agent_name, CASE WHEN c.agent_id = 'SYSTEM' THEN 'Default chat agent' END, c.agent_id, '(not linked to a message)') AS agent_label,
+                  COALESCE(c.surface_type, 'unknown') AS surface_type,
+                  1 AS feedback_count
+                FROM "${Db}"."feedback_logs" f
+                LEFT JOIN "${Db}"."chat_logs" c ON c.system_message_id = f.system_message_id
+                LEFT JOIN "${Db}"."chat_agent_names" a ON a.agent_id = c.agent_id
+                WHERE f.event_timestamp IS NOT NULL
+              - Db:
+                  Fn::ImportValue: !Sub '${FoundationStackName}-GlueDatabase'
+            Columns:
+              - {Name: event_time, Type: DATETIME}
+              - {Name: user_arn, Type: STRING}
+              - {Name: user_label, Type: STRING}
+              - {Name: user_type, Type: STRING}
+              - {Name: feedback_type, Type: STRING}
+              - {Name: feedback_reason, Type: STRING}
+              - {Name: rating, Type: DECIMAL}
+              - {Name: positive_count, Type: INTEGER}
+              - {Name: negative_count, Type: INTEGER}
+              - {Name: conversation_id, Type: STRING}
+              - {Name: user_message_id, Type: STRING}
+              - {Name: system_message_id, Type: STRING}
+              - {Name: research_id, Type: STRING}
+              - {Name: agent_label, Type: STRING}
+              - {Name: surface_type, Type: STRING}
+              - {Name: feedback_count, Type: INTEGER}
+      LogicalTableMap:
+        feedback:
+          Alias: feedback
+          Source: {PhysicalTableId: feedback}
+      Permissions:
+        - Principal: !Ref QuickPrincipalArn
+          Actions:
+            - quicksight:DescribeDataSet
+            - quicksight:DescribeDataSetPermissions
+            - quicksight:PassDataSet
+            - quicksight:DescribeIngestion
+            - quicksight:ListIngestions
+            - quicksight:UpdateDataSet
+            - quicksight:DeleteDataSet
+            - quicksight:CreateIngestion
+            - quicksight:CancelIngestion
+            - quicksight:UpdateDataSetPermissions
+      Tags:
+        - {Key: Purpose, Value: !Ref ResourcePrefix}
+        - {Key: ManagedBy, Value: CloudFormation}
+
+  # ----- Dashboard: administrator view, five tabs -------------------------------
+
+  Dashboard:
+    Type: AWS::QuickSight::Dashboard
+    Properties:
+      AwsAccountId: !Ref 'AWS::AccountId'
+      DashboardId: !Sub '${ResourcePrefix}-dashboard'
+      Name: Amazon Quick - chat and feedback
+      VersionDescription: Administrator dashboard - Overview, Users, Agents, Quality, Events (metadata only).
+      DashboardPublishOptions:
+        AdHocFilteringOption: {AvailabilityStatus: ENABLED}
+        ExportToCSVOption: {AvailabilityStatus: ENABLED}
+        SheetControlsOption: {VisibilityState: EXPANDED}
+      Permissions:
+        - Principal: !Ref QuickPrincipalArn
+          Actions:
+            - quicksight:DescribeDashboard
+            - quicksight:ListDashboardVersions
+            - quicksight:UpdateDashboardPermissions
+            - quicksight:QueryDashboard
+            - quicksight:UpdateDashboard
+            - quicksight:DeleteDashboard
+            - quicksight:DescribeDashboardPermissions
+            - quicksight:UpdateDashboardPublishedVersion
+      Definition:
+        DataSetIdentifierDeclarations:
+          - Identifier: chat
+            DataSetArn: !GetAtt ChatDataSet.Arn
+          - Identifier: feedback
+            DataSetArn: !GetAtt FeedbackDataSet.Arn
+        ParameterDeclarations:
+          - DateTimeParameterDeclaration:
+              Name: pStart
+              TimeGranularity: DAY
+              DefaultValues:
+                RollingDate: {Expression: "addDateTime(-3, 'MM', truncDate('MM', now()))"}
+          - DateTimeParameterDeclaration:
+              Name: pEnd
+              TimeGranularity: DAY
+              DefaultValues:
+                RollingDate: {Expression: "addDateTime(1, 'DD', truncDate('DD', now()))"}
+        CalculatedFields:
+          - DataSetIdentifier: chat
+            Name: success_rate
+            Expression: "ifelse(sum({message_count}) = 0, 0, sum({success_count}) / sum({message_count}))"
+          - DataSetIdentifier: feedback
+            Name: satisfaction
+            Expression: "ifelse(sum({positive_count}) + sum({negative_count}) = 0, 0, sum({positive_count}) / (sum({positive_count}) + sum({negative_count})))"
+        FilterGroups:
+          # Time range: parameter-driven, both datasets, every sheet.
+          - FilterGroupId: fg-range
+            CrossDataset: ALL_DATASETS
+            Status: ENABLED
+            Filters:
+              - TimeRangeFilter:
+                  FilterId: f-range
+                  Column: {DataSetIdentifier: chat, ColumnName: event_time}
+                  IncludeMinimum: true
+                  IncludeMaximum: false
+                  RangeMinimumValue: {Parameter: pStart}
+                  RangeMaximumValue: {Parameter: pEnd}
+                  NullOption: NON_NULLS_ONLY
+                  TimeGranularity: DAY
+            ScopeConfiguration:
+              AllSheets: {}
+          # Quality tab: only messages that did not succeed / negative feedback.
+          - FilterGroupId: fg-not-success
+            CrossDataset: SINGLE_DATASET
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-not-success
+                  Column: {DataSetIdentifier: chat, ColumnName: status_code}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: DOES_NOT_CONTAIN
+                      CategoryValues: [success]
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-quality
+                    Scope: SELECTED_VISUALS
+                    VisualIds: [tbl-not-success]
+          - FilterGroupId: fg-negative
+            CrossDataset: SINGLE_DATASET
+            Status: ENABLED
+            Filters:
+              - NumericEqualityFilter:
+                  FilterId: f-negative
+                  Column: {DataSetIdentifier: feedback, ColumnName: negative_count}
+                  MatchOperator: EQUALS
+                  Value: 1
+                  NullOption: NON_NULLS_ONLY
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-quality
+                    Scope: SELECTED_VISUALS
+                    VisualIds: [tbl-negative]
+          - FilterGroupId: fg-agent-ov
+            CrossDataset: ALL_DATASETS
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-agent-ov
+                  Column: {DataSetIdentifier: chat, ColumnName: agent_label}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      SelectAllOptions: FILTER_ALL_VALUES
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-overview
+                    Scope: ALL_VISUALS
+          - FilterGroupId: fg-surface-ov
+            CrossDataset: ALL_DATASETS
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-surface-ov
+                  Column: {DataSetIdentifier: chat, ColumnName: surface_type}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      SelectAllOptions: FILTER_ALL_VALUES
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-overview
+                    Scope: ALL_VISUALS
+          - FilterGroupId: fg-usertype-ov
+            CrossDataset: ALL_DATASETS
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-usertype-ov
+                  Column: {DataSetIdentifier: chat, ColumnName: user_type}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      SelectAllOptions: FILTER_ALL_VALUES
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-overview
+                    Scope: ALL_VISUALS
+          - FilterGroupId: fg-agent-us
+            CrossDataset: ALL_DATASETS
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-agent-us
+                  Column: {DataSetIdentifier: chat, ColumnName: agent_label}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      SelectAllOptions: FILTER_ALL_VALUES
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-users
+                    Scope: ALL_VISUALS
+          - FilterGroupId: fg-surface-us
+            CrossDataset: ALL_DATASETS
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-surface-us
+                  Column: {DataSetIdentifier: chat, ColumnName: surface_type}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      SelectAllOptions: FILTER_ALL_VALUES
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-users
+                    Scope: ALL_VISUALS
+          - FilterGroupId: fg-usertype-us
+            CrossDataset: ALL_DATASETS
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-usertype-us
+                  Column: {DataSetIdentifier: chat, ColumnName: user_type}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      SelectAllOptions: FILTER_ALL_VALUES
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-users
+                    Scope: ALL_VISUALS
+          - FilterGroupId: fg-agent-ag
+            CrossDataset: ALL_DATASETS
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-agent-ag
+                  Column: {DataSetIdentifier: chat, ColumnName: agent_label}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      SelectAllOptions: FILTER_ALL_VALUES
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-agents
+                    Scope: ALL_VISUALS
+          - FilterGroupId: fg-surface-ag
+            CrossDataset: ALL_DATASETS
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-surface-ag
+                  Column: {DataSetIdentifier: chat, ColumnName: surface_type}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      SelectAllOptions: FILTER_ALL_VALUES
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-agents
+                    Scope: ALL_VISUALS
+          - FilterGroupId: fg-usertype-ag
+            CrossDataset: ALL_DATASETS
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-usertype-ag
+                  Column: {DataSetIdentifier: chat, ColumnName: user_type}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      SelectAllOptions: FILTER_ALL_VALUES
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-agents
+                    Scope: ALL_VISUALS
+          - FilterGroupId: fg-agent-qa
+            CrossDataset: ALL_DATASETS
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-agent-qa
+                  Column: {DataSetIdentifier: chat, ColumnName: agent_label}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      SelectAllOptions: FILTER_ALL_VALUES
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-quality
+                    Scope: ALL_VISUALS
+          - FilterGroupId: fg-surface-qa
+            CrossDataset: ALL_DATASETS
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-surface-qa
+                  Column: {DataSetIdentifier: chat, ColumnName: surface_type}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      SelectAllOptions: FILTER_ALL_VALUES
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-quality
+                    Scope: ALL_VISUALS
+          - FilterGroupId: fg-usertype-qa
+            CrossDataset: ALL_DATASETS
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-usertype-qa
+                  Column: {DataSetIdentifier: chat, ColumnName: user_type}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      SelectAllOptions: FILTER_ALL_VALUES
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-quality
+                    Scope: ALL_VISUALS
+          - FilterGroupId: fg-agent-ev
+            CrossDataset: ALL_DATASETS
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-agent-ev
+                  Column: {DataSetIdentifier: chat, ColumnName: agent_label}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      SelectAllOptions: FILTER_ALL_VALUES
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-events
+                    Scope: ALL_VISUALS
+          - FilterGroupId: fg-surface-ev
+            CrossDataset: ALL_DATASETS
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-surface-ev
+                  Column: {DataSetIdentifier: chat, ColumnName: surface_type}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      SelectAllOptions: FILTER_ALL_VALUES
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-events
+                    Scope: ALL_VISUALS
+          - FilterGroupId: fg-usertype-ev
+            CrossDataset: ALL_DATASETS
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-usertype-ev
+                  Column: {DataSetIdentifier: chat, ColumnName: user_type}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      SelectAllOptions: FILTER_ALL_VALUES
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-events
+                    Scope: ALL_VISUALS
+        Sheets:
+          # ===================== Overview =====================
+          - SheetId: sh-overview
+            Name: Overview
+            Title: Chat and feedback - overview
+            Description: "Adoption, response outcomes and user sentiment for the selected period. Metadata only - no message content."
+            ParameterControls:
+              - DateTimePicker:
+                  ParameterControlId: pc-ov-start
+                  Title: From
+                  SourceParameterName: pStart
+                  DisplayOptions: {DateTimeFormat: 'YYYY-MM-DD'}
+              - DateTimePicker:
+                  ParameterControlId: pc-ov-end
+                  Title: To (exclusive)
+                  SourceParameterName: pEnd
+                  DisplayOptions: {DateTimeFormat: 'YYYY-MM-DD'}
+            FilterControls:
+              - Dropdown:
+                  FilterControlId: fc-ov-agent
+                  Title: Agent
+                  SourceFilterId: f-agent-ov
+                  Type: MULTI_SELECT
+                  DisplayOptions:
+                    SelectAllOptions: {Visibility: VISIBLE}
+                    TitleOptions: {Visibility: VISIBLE}
+              - Dropdown:
+                  FilterControlId: fc-ov-surface
+                  Title: Surface
+                  SourceFilterId: f-surface-ov
+                  Type: MULTI_SELECT
+                  DisplayOptions:
+                    SelectAllOptions: {Visibility: VISIBLE}
+                    TitleOptions: {Visibility: VISIBLE}
+              - Dropdown:
+                  FilterControlId: fc-ov-usertype
+                  Title: User type
+                  SourceFilterId: f-usertype-ov
+                  Type: MULTI_SELECT
+                  DisplayOptions:
+                    SelectAllOptions: {Visibility: VISIBLE}
+                    TitleOptions: {Visibility: VISIBLE}
+            SheetControlLayouts:
+              - Configuration:
+                  GridLayout:
+                    Elements:
+                      - {ElementId: pc-ov-start, ElementType: PARAMETER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: pc-ov-end, ElementType: PARAMETER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: fc-ov-agent, ElementType: FILTER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: fc-ov-surface, ElementType: FILTER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: fc-ov-usertype, ElementType: FILTER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+            Visuals:
+              - KPIVisual:
+                  VisualId: ov-kpi-messages
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Messages'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      Values:
+                        - NumericalMeasureField: {FieldId: ov-kpi-messages-v, Column: {DataSetIdentifier: chat, ColumnName: message_count}, AggregationFunction: {SimpleNumericalAggregation: SUM}}
+              - KPIVisual:
+                  VisualId: ov-kpi-conversations
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Conversations'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      Values:
+                        - CategoricalMeasureField: {FieldId: ov-kpi-conversations-v, Column: {DataSetIdentifier: chat, ColumnName: conversation_id}, AggregationFunction: DISTINCT_COUNT}
+              - KPIVisual:
+                  VisualId: ov-kpi-users
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Active users'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      Values:
+                        - CategoricalMeasureField: {FieldId: ov-kpi-users-v, Column: {DataSetIdentifier: chat, ColumnName: user_arn}, AggregationFunction: DISTINCT_COUNT}
+              - KPIVisual:
+                  VisualId: ov-kpi-agents
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Agents used'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      Values:
+                        - CategoricalMeasureField: {FieldId: ov-kpi-agents-v, Column: {DataSetIdentifier: chat, ColumnName: agent_label}, AggregationFunction: DISTINCT_COUNT}
+              - KPIVisual:
+                  VisualId: ov-kpi-success
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Answered successfully'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      Values:
+                        - NumericalMeasureField:
+                            FieldId: ov-kpi-success-v
+                            Column: {DataSetIdentifier: chat, ColumnName: success_rate}
+                            FormatConfiguration: {FormatConfiguration: {PercentageDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 1}}}}
+              - KPIVisual:
+                  VisualId: ov-kpi-up
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Thumbs up'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      Values:
+                        - NumericalMeasureField: {FieldId: ov-kpi-up-v, Column: {DataSetIdentifier: feedback, ColumnName: positive_count}, AggregationFunction: {SimpleNumericalAggregation: SUM}}
+              - KPIVisual:
+                  VisualId: ov-kpi-down
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Thumbs down'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      Values:
+                        - NumericalMeasureField: {FieldId: ov-kpi-down-v, Column: {DataSetIdentifier: feedback, ColumnName: negative_count}, AggregationFunction: {SimpleNumericalAggregation: SUM}}
+              - KPIVisual:
+                  VisualId: ov-kpi-satisfaction
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Satisfaction (up / rated)'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      Values:
+                        - NumericalMeasureField:
+                            FieldId: ov-kpi-satisfaction-v
+                            Column: {DataSetIdentifier: feedback, ColumnName: satisfaction}
+                            FormatConfiguration: {FormatConfiguration: {PercentageDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 1}}}}
+              - BarChartVisual:
+                  VisualId: ov-bar-status-trend
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Daily messages by response status'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      BarChartAggregatedFieldWells:
+                        Category:
+                          - DateDimensionField: {FieldId: ov-st-day, Column: {DataSetIdentifier: chat, ColumnName: event_time}, DateGranularity: DAY}
+                        Values:
+                          - NumericalMeasureField: {FieldId: ov-st-n, Column: {DataSetIdentifier: chat, ColumnName: message_count}, AggregationFunction: {SimpleNumericalAggregation: SUM}}
+                        Colors:
+                          - CategoricalDimensionField: {FieldId: ov-st-status, Column: {DataSetIdentifier: chat, ColumnName: status_code}}
+                    Orientation: VERTICAL
+                    BarsArrangement: STACKED
+                    Legend: {Visibility: VISIBLE, Position: BOTTOM}
+              - BarChartVisual:
+                  VisualId: ov-bar-feedback-trend
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Daily feedback by type'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      BarChartAggregatedFieldWells:
+                        Category:
+                          - DateDimensionField: {FieldId: ov-fb-day, Column: {DataSetIdentifier: feedback, ColumnName: event_time}, DateGranularity: DAY}
+                        Values:
+                          - NumericalMeasureField: {FieldId: ov-fb-n, Column: {DataSetIdentifier: feedback, ColumnName: feedback_count}, AggregationFunction: {SimpleNumericalAggregation: SUM}}
+                        Colors:
+                          - CategoricalDimensionField: {FieldId: ov-fb-type, Column: {DataSetIdentifier: feedback, ColumnName: feedback_type}}
+                    Orientation: VERTICAL
+                    BarsArrangement: STACKED
+                    Legend: {Visibility: VISIBLE, Position: BOTTOM}
+              - BarChartVisual:
+                  VisualId: ov-bar-top-agents
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Top 10 agents by messages'}}
+                  Subtitle: {Visibility: VISIBLE, FormatText: {PlainText: 'Friendly names appear once the module exports the agent-name CSV; otherwise the agent ID is shown'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      BarChartAggregatedFieldWells:
+                        Category:
+                          - CategoricalDimensionField: {FieldId: ov-ta-agent, Column: {DataSetIdentifier: chat, ColumnName: agent_label}}
+                        Values:
+                          - NumericalMeasureField: {FieldId: ov-ta-n, Column: {DataSetIdentifier: chat, ColumnName: message_count}, AggregationFunction: {SimpleNumericalAggregation: SUM}}
+                        Colors:
+                          - CategoricalDimensionField: {FieldId: ov-ta-status, Column: {DataSetIdentifier: chat, ColumnName: status_code}}
+                    SortConfiguration:
+                      CategorySort:
+                        - FieldSort: {FieldId: ov-ta-n, Direction: DESC}
+                      CategoryItemsLimit: {ItemsLimit: 10, OtherCategories: EXCLUDE}
+                    Orientation: HORIZONTAL
+                    BarsArrangement: STACKED
+                    Legend: {Visibility: VISIBLE, Position: BOTTOM}
+              - BarChartVisual:
+                  VisualId: ov-bar-surfaces
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Messages by surface and user type'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      BarChartAggregatedFieldWells:
+                        Category:
+                          - CategoricalDimensionField: {FieldId: ov-sf-surface, Column: {DataSetIdentifier: chat, ColumnName: surface_type}}
+                        Values:
+                          - NumericalMeasureField: {FieldId: ov-sf-n, Column: {DataSetIdentifier: chat, ColumnName: message_count}, AggregationFunction: {SimpleNumericalAggregation: SUM}}
+                        Colors:
+                          - CategoricalDimensionField: {FieldId: ov-sf-usertype, Column: {DataSetIdentifier: chat, ColumnName: user_type}}
+                    SortConfiguration:
+                      CategorySort:
+                        - FieldSort: {FieldId: ov-sf-n, Direction: DESC}
+                    Orientation: HORIZONTAL
+                    BarsArrangement: STACKED
+                    Legend: {Visibility: VISIBLE, Position: BOTTOM}
+            TextBoxes:
+              - SheetTextBoxId: ov-txt-howto
+                Content: >-
+                  <text-box><block align="left"><inline font-weight="bold">How to read this dashboard.</inline> Messages are
+                  CHAT_LOGS events (one per user prompt and response); feedback events are Useful / Not Useful ratings with
+                  an optional reason. Only metadata is loaded here - prompts, responses and free-text comments stay in the
+                  KMS-encrypted CloudWatch log group; copy a conversation or message ID from the Events tab to look them up
+                  there. Per-user views are sensitive: involve privacy and legal teams before sharing this dashboard
+                  widely.</block></text-box>
+            Layouts:
+              - Configuration:
+                  GridLayout:
+                    CanvasSizeOptions:
+                      ScreenCanvasSizeOptions: {ResizeOption: FIXED, OptimizedViewPortWidth: '1600px'}
+                    Elements:
+                      - {ElementId: ov-kpi-messages, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 4, RowIndex: 0, RowSpan: 5}
+                      - {ElementId: ov-kpi-conversations, ElementType: VISUAL, ColumnIndex: 4, ColumnSpan: 4, RowIndex: 0, RowSpan: 5}
+                      - {ElementId: ov-kpi-users, ElementType: VISUAL, ColumnIndex: 8, ColumnSpan: 4, RowIndex: 0, RowSpan: 5}
+                      - {ElementId: ov-kpi-agents, ElementType: VISUAL, ColumnIndex: 12, ColumnSpan: 4, RowIndex: 0, RowSpan: 5}
+                      - {ElementId: ov-kpi-success, ElementType: VISUAL, ColumnIndex: 16, ColumnSpan: 5, RowIndex: 0, RowSpan: 5}
+                      - {ElementId: ov-kpi-up, ElementType: VISUAL, ColumnIndex: 21, ColumnSpan: 5, RowIndex: 0, RowSpan: 5}
+                      - {ElementId: ov-kpi-down, ElementType: VISUAL, ColumnIndex: 26, ColumnSpan: 5, RowIndex: 0, RowSpan: 5}
+                      - {ElementId: ov-kpi-satisfaction, ElementType: VISUAL, ColumnIndex: 31, ColumnSpan: 5, RowIndex: 0, RowSpan: 5}
+                      - {ElementId: ov-bar-status-trend, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 18, RowIndex: 5, RowSpan: 11}
+                      - {ElementId: ov-bar-feedback-trend, ElementType: VISUAL, ColumnIndex: 18, ColumnSpan: 18, RowIndex: 5, RowSpan: 11}
+                      - {ElementId: ov-bar-top-agents, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 22, RowIndex: 16, RowSpan: 11}
+                      - {ElementId: ov-bar-surfaces, ElementType: VISUAL, ColumnIndex: 22, ColumnSpan: 14, RowIndex: 16, RowSpan: 11}
+                      - {ElementId: ov-txt-howto, ElementType: TEXT_BOX, ColumnIndex: 0, ColumnSpan: 36, RowIndex: 27, RowSpan: 3}
+          # ===================== Users =====================
+          - SheetId: sh-users
+            Name: Users
+            Title: Users
+            Description: "Who uses chat, how much, with which agents. Per-user views are sensitive: check your employee-monitoring policy before sharing."
+            ParameterControls:
+              - DateTimePicker:
+                  ParameterControlId: pc-us-start
+                  Title: From
+                  SourceParameterName: pStart
+                  DisplayOptions: {DateTimeFormat: 'YYYY-MM-DD'}
+              - DateTimePicker:
+                  ParameterControlId: pc-us-end
+                  Title: To (exclusive)
+                  SourceParameterName: pEnd
+                  DisplayOptions: {DateTimeFormat: 'YYYY-MM-DD'}
+            FilterControls:
+              - Dropdown:
+                  FilterControlId: fc-us-agent
+                  Title: Agent
+                  SourceFilterId: f-agent-us
+                  Type: MULTI_SELECT
+                  DisplayOptions:
+                    SelectAllOptions: {Visibility: VISIBLE}
+                    TitleOptions: {Visibility: VISIBLE}
+              - Dropdown:
+                  FilterControlId: fc-us-surface
+                  Title: Surface
+                  SourceFilterId: f-surface-us
+                  Type: MULTI_SELECT
+                  DisplayOptions:
+                    SelectAllOptions: {Visibility: VISIBLE}
+                    TitleOptions: {Visibility: VISIBLE}
+              - Dropdown:
+                  FilterControlId: fc-us-usertype
+                  Title: User type
+                  SourceFilterId: f-usertype-us
+                  Type: MULTI_SELECT
+                  DisplayOptions:
+                    SelectAllOptions: {Visibility: VISIBLE}
+                    TitleOptions: {Visibility: VISIBLE}
+            SheetControlLayouts:
+              - Configuration:
+                  GridLayout:
+                    Elements:
+                      - {ElementId: pc-us-start, ElementType: PARAMETER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: pc-us-end, ElementType: PARAMETER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: fc-us-agent, ElementType: FILTER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: fc-us-surface, ElementType: FILTER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: fc-us-usertype, ElementType: FILTER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+            Visuals:
+              - TableVisual:
+                  VisualId: us-tbl-users
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Users - activity and outcomes (sorted by messages)'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      TableAggregatedFieldWells:
+                        GroupBy:
+                          - CategoricalDimensionField: {FieldId: us-user, Column: {DataSetIdentifier: chat, ColumnName: user_label}}
+                          - CategoricalDimensionField: {FieldId: us-type, Column: {DataSetIdentifier: chat, ColumnName: user_type}}
+                        Values:
+                          - NumericalMeasureField: {FieldId: us-msgs, Column: {DataSetIdentifier: chat, ColumnName: message_count}, AggregationFunction: {SimpleNumericalAggregation: SUM}}
+                          - CategoricalMeasureField: {FieldId: us-convs, Column: {DataSetIdentifier: chat, ColumnName: conversation_id}, AggregationFunction: DISTINCT_COUNT}
+                          - CategoricalMeasureField: {FieldId: us-agents, Column: {DataSetIdentifier: chat, ColumnName: agent_label}, AggregationFunction: DISTINCT_COUNT}
+                          - NumericalMeasureField:
+                              FieldId: us-success
+                              Column: {DataSetIdentifier: chat, ColumnName: success_rate}
+                              FormatConfiguration: {FormatConfiguration: {PercentageDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}
+                          - NumericalMeasureField: {FieldId: us-flows, Column: {DataSetIdentifier: chat, ColumnName: flow_count}, AggregationFunction: {SimpleNumericalAggregation: SUM}}
+                          - DateMeasureField: {FieldId: us-first, Column: {DataSetIdentifier: chat, ColumnName: event_time}, AggregationFunction: MIN, FormatConfiguration: {DateTimeFormat: 'YYYY-MM-DD HH:mm'}}
+                          - DateMeasureField: {FieldId: us-last, Column: {DataSetIdentifier: chat, ColumnName: event_time}, AggregationFunction: MAX, FormatConfiguration: {DateTimeFormat: 'YYYY-MM-DD HH:mm'}}
+                    SortConfiguration:
+                      RowSort:
+                        - FieldSort: {FieldId: us-msgs, Direction: DESC}
+                    FieldOptions:
+                      SelectedFieldOptions:
+                        - {FieldId: us-user, CustomLabel: User}
+                        - {FieldId: us-type, CustomLabel: Type}
+                        - {FieldId: us-msgs, CustomLabel: Messages}
+                        - {FieldId: us-convs, CustomLabel: Conversations}
+                        - {FieldId: us-agents, CustomLabel: Agents used}
+                        - {FieldId: us-success, CustomLabel: Answered}
+                        - {FieldId: us-flows, CustomLabel: Flow runs}
+                        - {FieldId: us-first, CustomLabel: First activity}
+                        - {FieldId: us-last, CustomLabel: Last activity}
+              - PivotTableVisual:
+                  VisualId: us-pivot-agents
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Messages by user and agent'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      PivotTableAggregatedFieldWells:
+                        Rows:
+                          - CategoricalDimensionField: {FieldId: us-pv-user, Column: {DataSetIdentifier: chat, ColumnName: user_label}}
+                        Columns:
+                          - CategoricalDimensionField: {FieldId: us-pv-agent, Column: {DataSetIdentifier: chat, ColumnName: agent_label}}
+                        Values:
+                          - NumericalMeasureField: {FieldId: us-pv-n, Column: {DataSetIdentifier: chat, ColumnName: message_count}, AggregationFunction: {SimpleNumericalAggregation: SUM}}
+                    TotalOptions:
+                      RowTotalOptions: {TotalsVisibility: VISIBLE}
+                      ColumnTotalOptions: {TotalsVisibility: VISIBLE}
+              - BarChartVisual:
+                  VisualId: us-bar-top
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Top 15 users by messages'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      BarChartAggregatedFieldWells:
+                        Category:
+                          - CategoricalDimensionField: {FieldId: us-tb-user, Column: {DataSetIdentifier: chat, ColumnName: user_label}}
+                        Values:
+                          - NumericalMeasureField: {FieldId: us-tb-n, Column: {DataSetIdentifier: chat, ColumnName: message_count}, AggregationFunction: {SimpleNumericalAggregation: SUM}}
+                        Colors:
+                          - CategoricalDimensionField: {FieldId: us-tb-surface, Column: {DataSetIdentifier: chat, ColumnName: surface_type}}
+                    SortConfiguration:
+                      CategorySort:
+                        - FieldSort: {FieldId: us-tb-n, Direction: DESC}
+                      CategoryItemsLimit: {ItemsLimit: 15, OtherCategories: EXCLUDE}
+                    Orientation: HORIZONTAL
+                    BarsArrangement: STACKED
+                    Legend: {Visibility: VISIBLE, Position: BOTTOM}
+            Layouts:
+              - Configuration:
+                  GridLayout:
+                    CanvasSizeOptions:
+                      ScreenCanvasSizeOptions: {ResizeOption: FIXED, OptimizedViewPortWidth: '1600px'}
+                    Elements:
+                      - {ElementId: us-tbl-users, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 36, RowIndex: 0, RowSpan: 13}
+                      - {ElementId: us-pivot-agents, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 22, RowIndex: 13, RowSpan: 13}
+                      - {ElementId: us-bar-top, ElementType: VISUAL, ColumnIndex: 22, ColumnSpan: 14, RowIndex: 13, RowSpan: 13}
+          # ===================== Agents =====================
+          - SheetId: sh-agents
+            Name: Agents
+            Title: Agents
+            Description: "Custom chat agents and the default agent: usage, outcomes, citations, latency and sentiment."
+            ParameterControls:
+              - DateTimePicker:
+                  ParameterControlId: pc-ag-start
+                  Title: From
+                  SourceParameterName: pStart
+                  DisplayOptions: {DateTimeFormat: 'YYYY-MM-DD'}
+              - DateTimePicker:
+                  ParameterControlId: pc-ag-end
+                  Title: To (exclusive)
+                  SourceParameterName: pEnd
+                  DisplayOptions: {DateTimeFormat: 'YYYY-MM-DD'}
+            FilterControls:
+              - Dropdown:
+                  FilterControlId: fc-ag-agent
+                  Title: Agent
+                  SourceFilterId: f-agent-ag
+                  Type: MULTI_SELECT
+                  DisplayOptions:
+                    SelectAllOptions: {Visibility: VISIBLE}
+                    TitleOptions: {Visibility: VISIBLE}
+              - Dropdown:
+                  FilterControlId: fc-ag-surface
+                  Title: Surface
+                  SourceFilterId: f-surface-ag
+                  Type: MULTI_SELECT
+                  DisplayOptions:
+                    SelectAllOptions: {Visibility: VISIBLE}
+                    TitleOptions: {Visibility: VISIBLE}
+              - Dropdown:
+                  FilterControlId: fc-ag-usertype
+                  Title: User type
+                  SourceFilterId: f-usertype-ag
+                  Type: MULTI_SELECT
+                  DisplayOptions:
+                    SelectAllOptions: {Visibility: VISIBLE}
+                    TitleOptions: {Visibility: VISIBLE}
+            SheetControlLayouts:
+              - Configuration:
+                  GridLayout:
+                    Elements:
+                      - {ElementId: pc-ag-start, ElementType: PARAMETER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: pc-ag-end, ElementType: PARAMETER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: fc-ag-agent, ElementType: FILTER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: fc-ag-surface, ElementType: FILTER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: fc-ag-usertype, ElementType: FILTER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+            Visuals:
+              - TableVisual:
+                  VisualId: ag-tbl-agents
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Agents - usage, outcomes, citations and latency (sorted by messages)'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      TableAggregatedFieldWells:
+                        GroupBy:
+                          - CategoricalDimensionField: {FieldId: ag-agent, Column: {DataSetIdentifier: chat, ColumnName: agent_label}}
+                        Values:
+                          - NumericalMeasureField: {FieldId: ag-msgs, Column: {DataSetIdentifier: chat, ColumnName: message_count}, AggregationFunction: {SimpleNumericalAggregation: SUM}}
+                          - CategoricalMeasureField: {FieldId: ag-convs, Column: {DataSetIdentifier: chat, ColumnName: conversation_id}, AggregationFunction: DISTINCT_COUNT}
+                          - CategoricalMeasureField: {FieldId: ag-users, Column: {DataSetIdentifier: chat, ColumnName: user_arn}, AggregationFunction: DISTINCT_COUNT}
+                          - NumericalMeasureField:
+                              FieldId: ag-success
+                              Column: {DataSetIdentifier: chat, ColumnName: success_rate}
+                              FormatConfiguration: {FormatConfiguration: {PercentageDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}
+                          - NumericalMeasureField: {FieldId: ag-cited, Column: {DataSetIdentifier: chat, ColumnName: cited_count}, AggregationFunction: {SimpleNumericalAggregation: SUM}}
+                          - NumericalMeasureField: {FieldId: ag-flows, Column: {DataSetIdentifier: chat, ColumnName: flow_count}, AggregationFunction: {SimpleNumericalAggregation: SUM}}
+                          - NumericalMeasureField:
+                              FieldId: ag-latency
+                              Column: {DataSetIdentifier: chat, ColumnName: latency}
+                              AggregationFunction: {SimpleNumericalAggregation: AVERAGE}
+                              FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}
+                          - DateMeasureField: {FieldId: ag-last, Column: {DataSetIdentifier: chat, ColumnName: event_time}, AggregationFunction: MAX, FormatConfiguration: {DateTimeFormat: 'YYYY-MM-DD HH:mm'}}
+                    SortConfiguration:
+                      RowSort:
+                        - FieldSort: {FieldId: ag-msgs, Direction: DESC}
+                    FieldOptions:
+                      SelectedFieldOptions:
+                        - {FieldId: ag-agent, CustomLabel: Agent}
+                        - {FieldId: ag-msgs, CustomLabel: Messages}
+                        - {FieldId: ag-convs, CustomLabel: Conversations}
+                        - {FieldId: ag-users, CustomLabel: Users}
+                        - {FieldId: ag-success, CustomLabel: Answered}
+                        - {FieldId: ag-cited, CustomLabel: Answers with citations}
+                        - {FieldId: ag-flows, CustomLabel: Flow runs}
+                        - {FieldId: ag-latency, CustomLabel: Avg latency (raw units)}
+                        - {FieldId: ag-last, CustomLabel: Last used}
+              - TableVisual:
+                  VisualId: ag-tbl-sentiment
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Sentiment by agent'}}
+                  Subtitle: {Visibility: VISIBLE, FormatText: {PlainText: 'Ratings joined to the rated message; ratings that cannot be linked to a message are grouped separately'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      TableAggregatedFieldWells:
+                        GroupBy:
+                          - CategoricalDimensionField: {FieldId: ag-sn-agent, Column: {DataSetIdentifier: feedback, ColumnName: agent_label}}
+                        Values:
+                          - NumericalMeasureField: {FieldId: ag-sn-up, Column: {DataSetIdentifier: feedback, ColumnName: positive_count}, AggregationFunction: {SimpleNumericalAggregation: SUM}}
+                          - NumericalMeasureField: {FieldId: ag-sn-down, Column: {DataSetIdentifier: feedback, ColumnName: negative_count}, AggregationFunction: {SimpleNumericalAggregation: SUM}}
+                          - NumericalMeasureField:
+                              FieldId: ag-sn-sat
+                              Column: {DataSetIdentifier: feedback, ColumnName: satisfaction}
+                              FormatConfiguration: {FormatConfiguration: {PercentageDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}
+                    SortConfiguration:
+                      RowSort:
+                        - FieldSort: {FieldId: ag-sn-down, Direction: DESC}
+                    FieldOptions:
+                      SelectedFieldOptions:
+                        - {FieldId: ag-sn-agent, CustomLabel: Agent}
+                        - {FieldId: ag-sn-up, CustomLabel: Thumbs up}
+                        - {FieldId: ag-sn-down, CustomLabel: Thumbs down}
+                        - {FieldId: ag-sn-sat, CustomLabel: Satisfaction}
+              - BarChartVisual:
+                  VisualId: ag-bar-scope
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Messages by agent and data scope'}}
+                  Subtitle: {Visibility: VISIBLE, FormatText: {PlainText: 'message_scope - which resources the answer could draw on'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      BarChartAggregatedFieldWells:
+                        Category:
+                          - CategoricalDimensionField: {FieldId: ag-sc-agent, Column: {DataSetIdentifier: chat, ColumnName: agent_label}}
+                        Values:
+                          - NumericalMeasureField: {FieldId: ag-sc-n, Column: {DataSetIdentifier: chat, ColumnName: message_count}, AggregationFunction: {SimpleNumericalAggregation: SUM}}
+                        Colors:
+                          - CategoricalDimensionField: {FieldId: ag-sc-scope, Column: {DataSetIdentifier: chat, ColumnName: message_scope}}
+                    SortConfiguration:
+                      CategorySort:
+                        - FieldSort: {FieldId: ag-sc-n, Direction: DESC}
+                    Orientation: HORIZONTAL
+                    BarsArrangement: STACKED
+                    Legend: {Visibility: VISIBLE, Position: BOTTOM}
+            Layouts:
+              - Configuration:
+                  GridLayout:
+                    CanvasSizeOptions:
+                      ScreenCanvasSizeOptions: {ResizeOption: FIXED, OptimizedViewPortWidth: '1600px'}
+                    Elements:
+                      - {ElementId: ag-tbl-agents, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 36, RowIndex: 0, RowSpan: 12}
+                      - {ElementId: ag-tbl-sentiment, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 16, RowIndex: 12, RowSpan: 12}
+                      - {ElementId: ag-bar-scope, ElementType: VISUAL, ColumnIndex: 16, ColumnSpan: 20, RowIndex: 12, RowSpan: 12}
+          # ===================== Quality =====================
+          - SheetId: sh-quality
+            Name: Quality
+            Title: Quality
+            Description: "Response outcomes, latency and feedback. Content stays in CloudWatch Logs; use the correlation IDs to investigate."
+            ParameterControls:
+              - DateTimePicker:
+                  ParameterControlId: pc-qa-start
+                  Title: From
+                  SourceParameterName: pStart
+                  DisplayOptions: {DateTimeFormat: 'YYYY-MM-DD'}
+              - DateTimePicker:
+                  ParameterControlId: pc-qa-end
+                  Title: To (exclusive)
+                  SourceParameterName: pEnd
+                  DisplayOptions: {DateTimeFormat: 'YYYY-MM-DD'}
+            FilterControls:
+              - Dropdown:
+                  FilterControlId: fc-qa-agent
+                  Title: Agent
+                  SourceFilterId: f-agent-qa
+                  Type: MULTI_SELECT
+                  DisplayOptions:
+                    SelectAllOptions: {Visibility: VISIBLE}
+                    TitleOptions: {Visibility: VISIBLE}
+              - Dropdown:
+                  FilterControlId: fc-qa-surface
+                  Title: Surface
+                  SourceFilterId: f-surface-qa
+                  Type: MULTI_SELECT
+                  DisplayOptions:
+                    SelectAllOptions: {Visibility: VISIBLE}
+                    TitleOptions: {Visibility: VISIBLE}
+              - Dropdown:
+                  FilterControlId: fc-qa-usertype
+                  Title: User type
+                  SourceFilterId: f-usertype-qa
+                  Type: MULTI_SELECT
+                  DisplayOptions:
+                    SelectAllOptions: {Visibility: VISIBLE}
+                    TitleOptions: {Visibility: VISIBLE}
+            SheetControlLayouts:
+              - Configuration:
+                  GridLayout:
+                    Elements:
+                      - {ElementId: pc-qa-start, ElementType: PARAMETER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: pc-qa-end, ElementType: PARAMETER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: fc-qa-agent, ElementType: FILTER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: fc-qa-surface, ElementType: FILTER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: fc-qa-usertype, ElementType: FILTER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+            Visuals:
+              - KPIVisual:
+                  VisualId: qa-kpi-success
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Answered successfully'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      Values:
+                        - NumericalMeasureField:
+                            FieldId: qa-kpi-success-v
+                            Column: {DataSetIdentifier: chat, ColumnName: success_rate}
+                            FormatConfiguration: {FormatConfiguration: {PercentageDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 1}}}}
+              - KPIVisual:
+                  VisualId: qa-kpi-notsuccess
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Blocked or unanswered'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      Values:
+                        - NumericalMeasureField: {FieldId: qa-kpi-notsuccess-v, Column: {DataSetIdentifier: chat, ColumnName: not_success_count}, AggregationFunction: {SimpleNumericalAggregation: SUM}}
+              - KPIVisual:
+                  VisualId: qa-kpi-cited
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Answers with citations'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      Values:
+                        - NumericalMeasureField: {FieldId: qa-kpi-cited-v, Column: {DataSetIdentifier: chat, ColumnName: cited_count}, AggregationFunction: {SimpleNumericalAggregation: SUM}}
+              - KPIVisual:
+                  VisualId: qa-kpi-latency
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Avg latency (raw units)'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      Values:
+                        - NumericalMeasureField:
+                            FieldId: qa-kpi-latency-v
+                            Column: {DataSetIdentifier: chat, ColumnName: latency}
+                            AggregationFunction: {SimpleNumericalAggregation: AVERAGE}
+                            FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}
+              - KPIVisual:
+                  VisualId: qa-kpi-ttft
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Avg time to first token (raw units)'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      Values:
+                        - NumericalMeasureField:
+                            FieldId: qa-kpi-ttft-v
+                            Column: {DataSetIdentifier: chat, ColumnName: time_to_first_token}
+                            AggregationFunction: {SimpleNumericalAggregation: AVERAGE}
+                            FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}
+              - KPIVisual:
+                  VisualId: qa-kpi-satisfaction
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Satisfaction (up / rated)'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      Values:
+                        - NumericalMeasureField:
+                            FieldId: qa-kpi-satisfaction-v
+                            Column: {DataSetIdentifier: feedback, ColumnName: satisfaction}
+                            FormatConfiguration: {FormatConfiguration: {PercentageDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 1}}}}
+              - TableVisual:
+                  VisualId: qa-tbl-reasons
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Feedback reasons'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      TableAggregatedFieldWells:
+                        GroupBy:
+                          - CategoricalDimensionField: {FieldId: qa-rs-type, Column: {DataSetIdentifier: feedback, ColumnName: feedback_type}}
+                          - CategoricalDimensionField: {FieldId: qa-rs-reason, Column: {DataSetIdentifier: feedback, ColumnName: feedback_reason}}
+                        Values:
+                          - NumericalMeasureField: {FieldId: qa-rs-n, Column: {DataSetIdentifier: feedback, ColumnName: feedback_count}, AggregationFunction: {SimpleNumericalAggregation: SUM}}
+                          - CategoricalMeasureField: {FieldId: qa-rs-users, Column: {DataSetIdentifier: feedback, ColumnName: user_arn}, AggregationFunction: DISTINCT_COUNT}
+                    SortConfiguration:
+                      RowSort:
+                        - FieldSort: {FieldId: qa-rs-n, Direction: DESC}
+                    FieldOptions:
+                      SelectedFieldOptions:
+                        - {FieldId: qa-rs-type, CustomLabel: Feedback}
+                        - {FieldId: qa-rs-reason, CustomLabel: Reason}
+                        - {FieldId: qa-rs-n, CustomLabel: Ratings}
+                        - {FieldId: qa-rs-users, CustomLabel: Users}
+              - TableVisual:
+                  VisualId: tbl-not-success
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Blocked and unanswered messages'}}
+                  Subtitle: {Visibility: VISIBLE, FormatText: {PlainText: 'Use the conversation and message IDs to read the exchange in CloudWatch Logs'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      TableUnaggregatedFieldWells:
+                        Values:
+                          - {FieldId: qa-ns-time, Column: {DataSetIdentifier: chat, ColumnName: event_time}, FormatConfiguration: {DateTimeFormatConfiguration: {DateTimeFormat: 'YYYY-MM-DD HH:mm:ss'}}}
+                          - {FieldId: qa-ns-user, Column: {DataSetIdentifier: chat, ColumnName: user_label}}
+                          - {FieldId: qa-ns-agent, Column: {DataSetIdentifier: chat, ColumnName: agent_label}}
+                          - {FieldId: qa-ns-status, Column: {DataSetIdentifier: chat, ColumnName: status_code}}
+                          - {FieldId: qa-ns-surface, Column: {DataSetIdentifier: chat, ColumnName: surface_type}}
+                          - {FieldId: qa-ns-scope, Column: {DataSetIdentifier: chat, ColumnName: message_scope}}
+                          - {FieldId: qa-ns-conv, Column: {DataSetIdentifier: chat, ColumnName: conversation_id}}
+                          - {FieldId: qa-ns-umid, Column: {DataSetIdentifier: chat, ColumnName: user_message_id}}
+                          - {FieldId: qa-ns-smid, Column: {DataSetIdentifier: chat, ColumnName: system_message_id}}
+                    SortConfiguration:
+                      RowSort:
+                        - FieldSort: {FieldId: qa-ns-time, Direction: DESC}
+                      PaginationConfiguration: {PageSize: 100, PageNumber: 1}
+                    FieldOptions:
+                      SelectedFieldOptions:
+                        - {FieldId: qa-ns-time, CustomLabel: Time (UTC)}
+                        - {FieldId: qa-ns-user, CustomLabel: User}
+                        - {FieldId: qa-ns-agent, CustomLabel: Agent}
+                        - {FieldId: qa-ns-status, CustomLabel: Status}
+                        - {FieldId: qa-ns-surface, CustomLabel: Surface}
+                        - {FieldId: qa-ns-scope, CustomLabel: Scope}
+                        - {FieldId: qa-ns-conv, CustomLabel: Conversation ID}
+                        - {FieldId: qa-ns-umid, CustomLabel: User message ID}
+                        - {FieldId: qa-ns-smid, CustomLabel: System message ID}
+              - TableVisual:
+                  VisualId: tbl-negative
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Negative feedback'}}
+                  Subtitle: {Visibility: VISIBLE, FormatText: {PlainText: 'Reason and rating only - the free-text comment stays in CloudWatch Logs'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      TableUnaggregatedFieldWells:
+                        Values:
+                          - {FieldId: qa-ng-time, Column: {DataSetIdentifier: feedback, ColumnName: event_time}, FormatConfiguration: {DateTimeFormatConfiguration: {DateTimeFormat: 'YYYY-MM-DD HH:mm:ss'}}}
+                          - {FieldId: qa-ng-user, Column: {DataSetIdentifier: feedback, ColumnName: user_label}}
+                          - {FieldId: qa-ng-agent, Column: {DataSetIdentifier: feedback, ColumnName: agent_label}}
+                          - {FieldId: qa-ng-reason, Column: {DataSetIdentifier: feedback, ColumnName: feedback_reason}}
+                          - {FieldId: qa-ng-rating, Column: {DataSetIdentifier: feedback, ColumnName: rating}}
+                          - {FieldId: qa-ng-conv, Column: {DataSetIdentifier: feedback, ColumnName: conversation_id}}
+                          - {FieldId: qa-ng-smid, Column: {DataSetIdentifier: feedback, ColumnName: system_message_id}}
+                    SortConfiguration:
+                      RowSort:
+                        - FieldSort: {FieldId: qa-ng-time, Direction: DESC}
+                      PaginationConfiguration: {PageSize: 100, PageNumber: 1}
+                    FieldOptions:
+                      SelectedFieldOptions:
+                        - {FieldId: qa-ng-time, CustomLabel: Time (UTC)}
+                        - {FieldId: qa-ng-user, CustomLabel: User}
+                        - {FieldId: qa-ng-agent, CustomLabel: Agent}
+                        - {FieldId: qa-ng-reason, CustomLabel: Reason}
+                        - {FieldId: qa-ng-rating, CustomLabel: Rating}
+                        - {FieldId: qa-ng-conv, CustomLabel: Conversation ID}
+                        - {FieldId: qa-ng-smid, CustomLabel: System message ID}
+            Layouts:
+              - Configuration:
+                  GridLayout:
+                    CanvasSizeOptions:
+                      ScreenCanvasSizeOptions: {ResizeOption: FIXED, OptimizedViewPortWidth: '1600px'}
+                    Elements:
+                      - {ElementId: qa-kpi-success, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 6, RowIndex: 0, RowSpan: 5}
+                      - {ElementId: qa-kpi-notsuccess, ElementType: VISUAL, ColumnIndex: 6, ColumnSpan: 6, RowIndex: 0, RowSpan: 5}
+                      - {ElementId: qa-kpi-cited, ElementType: VISUAL, ColumnIndex: 12, ColumnSpan: 6, RowIndex: 0, RowSpan: 5}
+                      - {ElementId: qa-kpi-latency, ElementType: VISUAL, ColumnIndex: 18, ColumnSpan: 6, RowIndex: 0, RowSpan: 5}
+                      - {ElementId: qa-kpi-ttft, ElementType: VISUAL, ColumnIndex: 24, ColumnSpan: 6, RowIndex: 0, RowSpan: 5}
+                      - {ElementId: qa-kpi-satisfaction, ElementType: VISUAL, ColumnIndex: 30, ColumnSpan: 6, RowIndex: 0, RowSpan: 5}
+                      - {ElementId: qa-tbl-reasons, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 12, RowIndex: 5, RowSpan: 12}
+                      - {ElementId: tbl-not-success, ElementType: VISUAL, ColumnIndex: 12, ColumnSpan: 24, RowIndex: 5, RowSpan: 12}
+                      - {ElementId: tbl-negative, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 36, RowIndex: 17, RowSpan: 12}
+          # ===================== Events =====================
+          - SheetId: sh-events
+            Name: Events
+            Title: Events (audit)
+            Description: "Every message and feedback event in the selected period, newest first, without prompts, responses or comments."
+            ParameterControls:
+              - DateTimePicker:
+                  ParameterControlId: pc-ev-start
+                  Title: From
+                  SourceParameterName: pStart
+                  DisplayOptions: {DateTimeFormat: 'YYYY-MM-DD'}
+              - DateTimePicker:
+                  ParameterControlId: pc-ev-end
+                  Title: To (exclusive)
+                  SourceParameterName: pEnd
+                  DisplayOptions: {DateTimeFormat: 'YYYY-MM-DD'}
+            FilterControls:
+              - Dropdown:
+                  FilterControlId: fc-ev-agent
+                  Title: Agent
+                  SourceFilterId: f-agent-ev
+                  Type: MULTI_SELECT
+                  DisplayOptions:
+                    SelectAllOptions: {Visibility: VISIBLE}
+                    TitleOptions: {Visibility: VISIBLE}
+              - Dropdown:
+                  FilterControlId: fc-ev-surface
+                  Title: Surface
+                  SourceFilterId: f-surface-ev
+                  Type: MULTI_SELECT
+                  DisplayOptions:
+                    SelectAllOptions: {Visibility: VISIBLE}
+                    TitleOptions: {Visibility: VISIBLE}
+              - Dropdown:
+                  FilterControlId: fc-ev-usertype
+                  Title: User type
+                  SourceFilterId: f-usertype-ev
+                  Type: MULTI_SELECT
+                  DisplayOptions:
+                    SelectAllOptions: {Visibility: VISIBLE}
+                    TitleOptions: {Visibility: VISIBLE}
+            SheetControlLayouts:
+              - Configuration:
+                  GridLayout:
+                    Elements:
+                      - {ElementId: pc-ev-start, ElementType: PARAMETER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: pc-ev-end, ElementType: PARAMETER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: fc-ev-agent, ElementType: FILTER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: fc-ev-surface, ElementType: FILTER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: fc-ev-usertype, ElementType: FILTER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+            Visuals:
+              - TableVisual:
+                  VisualId: ev-tbl-messages
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Messages (metadata)'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      TableUnaggregatedFieldWells:
+                        Values:
+                          - {FieldId: ev-m-time, Column: {DataSetIdentifier: chat, ColumnName: event_time}, FormatConfiguration: {DateTimeFormatConfiguration: {DateTimeFormat: 'YYYY-MM-DD HH:mm:ss'}}}
+                          - {FieldId: ev-m-user, Column: {DataSetIdentifier: chat, ColumnName: user_label}}
+                          - {FieldId: ev-m-type, Column: {DataSetIdentifier: chat, ColumnName: user_type}}
+                          - {FieldId: ev-m-agent, Column: {DataSetIdentifier: chat, ColumnName: agent_label}}
+                          - {FieldId: ev-m-surface, Column: {DataSetIdentifier: chat, ColumnName: surface_type}}
+                          - {FieldId: ev-m-scope, Column: {DataSetIdentifier: chat, ColumnName: message_scope}}
+                          - {FieldId: ev-m-status, Column: {DataSetIdentifier: chat, ColumnName: status_code}}
+                          - {FieldId: ev-m-latency, Column: {DataSetIdentifier: chat, ColumnName: latency}}
+                          - {FieldId: ev-m-flow, Column: {DataSetIdentifier: chat, ColumnName: flow_id}}
+                          - {FieldId: ev-m-conv, Column: {DataSetIdentifier: chat, ColumnName: conversation_id}}
+                          - {FieldId: ev-m-umid, Column: {DataSetIdentifier: chat, ColumnName: user_message_id}}
+                          - {FieldId: ev-m-smid, Column: {DataSetIdentifier: chat, ColumnName: system_message_id}}
+                    SortConfiguration:
+                      RowSort:
+                        - FieldSort: {FieldId: ev-m-time, Direction: DESC}
+                      PaginationConfiguration: {PageSize: 100, PageNumber: 1}
+                    FieldOptions:
+                      SelectedFieldOptions:
+                        - {FieldId: ev-m-time, CustomLabel: Time (UTC)}
+                        - {FieldId: ev-m-user, CustomLabel: User}
+                        - {FieldId: ev-m-type, CustomLabel: User type}
+                        - {FieldId: ev-m-agent, CustomLabel: Agent}
+                        - {FieldId: ev-m-surface, CustomLabel: Surface}
+                        - {FieldId: ev-m-scope, CustomLabel: Scope}
+                        - {FieldId: ev-m-status, CustomLabel: Status}
+                        - {FieldId: ev-m-latency, CustomLabel: Latency}
+                        - {FieldId: ev-m-flow, CustomLabel: Flow ID}
+                        - {FieldId: ev-m-conv, CustomLabel: Conversation ID}
+                        - {FieldId: ev-m-umid, CustomLabel: User message ID}
+                        - {FieldId: ev-m-smid, CustomLabel: System message ID}
+              - TableVisual:
+                  VisualId: ev-tbl-feedback
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Feedback events'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      TableUnaggregatedFieldWells:
+                        Values:
+                          - {FieldId: ev-f-time, Column: {DataSetIdentifier: feedback, ColumnName: event_time}, FormatConfiguration: {DateTimeFormatConfiguration: {DateTimeFormat: 'YYYY-MM-DD HH:mm:ss'}}}
+                          - {FieldId: ev-f-user, Column: {DataSetIdentifier: feedback, ColumnName: user_label}}
+                          - {FieldId: ev-f-type, Column: {DataSetIdentifier: feedback, ColumnName: feedback_type}}
+                          - {FieldId: ev-f-reason, Column: {DataSetIdentifier: feedback, ColumnName: feedback_reason}}
+                          - {FieldId: ev-f-rating, Column: {DataSetIdentifier: feedback, ColumnName: rating}}
+                          - {FieldId: ev-f-agent, Column: {DataSetIdentifier: feedback, ColumnName: agent_label}}
+                          - {FieldId: ev-f-conv, Column: {DataSetIdentifier: feedback, ColumnName: conversation_id}}
+                          - {FieldId: ev-f-smid, Column: {DataSetIdentifier: feedback, ColumnName: system_message_id}}
+                          - {FieldId: ev-f-research, Column: {DataSetIdentifier: feedback, ColumnName: research_id}}
+                    SortConfiguration:
+                      RowSort:
+                        - FieldSort: {FieldId: ev-f-time, Direction: DESC}
+                      PaginationConfiguration: {PageSize: 100, PageNumber: 1}
+                    FieldOptions:
+                      SelectedFieldOptions:
+                        - {FieldId: ev-f-time, CustomLabel: Time (UTC)}
+                        - {FieldId: ev-f-user, CustomLabel: User}
+                        - {FieldId: ev-f-type, CustomLabel: Feedback}
+                        - {FieldId: ev-f-reason, CustomLabel: Reason}
+                        - {FieldId: ev-f-rating, CustomLabel: Rating}
+                        - {FieldId: ev-f-agent, CustomLabel: Agent}
+                        - {FieldId: ev-f-conv, CustomLabel: Conversation ID}
+                        - {FieldId: ev-f-smid, CustomLabel: System message ID}
+                        - {FieldId: ev-f-research, CustomLabel: Research ID}
+            Layouts:
+              - Configuration:
+                  GridLayout:
+                    CanvasSizeOptions:
+                      ScreenCanvasSizeOptions: {ResizeOption: FIXED, OptimizedViewPortWidth: '1600px'}
+                    Elements:
+                      - {ElementId: ev-tbl-messages, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 36, RowIndex: 0, RowSpan: 16}
+                      - {ElementId: ev-tbl-feedback, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 36, RowIndex: 16, RowSpan: 12}
+      Tags:
+        - {Key: Purpose, Value: !Ref ResourcePrefix}
+        - {Key: ManagedBy, Value: CloudFormation}
+
+Outputs:
+  ChatDataSetArn:
+    Description: Quick dataset over CHAT_LOGS metadata (Direct Query).
+    Value: !GetAtt ChatDataSet.Arn
+  FeedbackDataSetArn:
+    Description: Quick dataset over FEEDBACK_LOGS metadata joined to messages (Direct Query).
+    Value: !GetAtt FeedbackDataSet.Arn
+  DashboardUrl:
+    Description: Open the dashboard in Amazon Quick (this Region).
+    Value: !Sub 'https://${AWS::Region}.quicksight.aws.amazon.com/sn/dashboards/${ResourcePrefix}-dashboard'

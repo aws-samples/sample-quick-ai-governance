@@ -2,8 +2,9 @@
 
 Fleet-wide visibility into every Amazon Quick dataset — **last sync status with the typed failure
 reason**, **sync duration (last + average, segmented by refresh type)**, and **last observed use
-with an explicit confidence label** — on a CloudWatch dashboard, with SNS alerts for new refresh
-failures and S3 JSONL snapshots for downstream analysis (Athena, Grafana, Quick itself).
+with an explicit confidence label** — on a native Amazon Quick dashboard, with SNS alerts and alarms
+for new refresh failures, over S3 JSONL snapshots that any downstream tool can also read (Athena,
+Grafana, or your own tools).
 
 Amazon Quick's **Manage Assets** page shows *which* datasets exist, but not whether they are
 healthy, slow, or still used. Dataset-level refresh history is only visible inside each dataset —
@@ -62,36 +63,28 @@ governance-dataset-lifecycle-monitor/
                               v
         +---------------------------------------------+
         |  outputs, every run                         |
-        |   1 JSON log event per dataset  ->  CloudWatch Logs data log group
-        |   tombstone events for deleted datasets     |
-        |   fleet KPI metrics (15 names)  ->  QuickGovernance/DatasetLifecycle
-        |   JSONL snapshot + state        ->  S3 bucket (retained on delete)
+        |   JSONL snapshot (1 record per dataset,     |
+        |     tombstones for deleted datasets) ->  shared analytics bucket, dataset-lifecycle/fast|slow/dt=.../
+        |   state (alert dedupe, lineage, usage) ->  shared analytics bucket, dataset-lifecycle/state/
+        |   fleet KPI metrics (15 names)  ->  CloudWatch metrics QuickGovernance/DatasetLifecycle (alarms)
         |   alert on NEW failure          ->  SNS (optional, deduplicated)
         +---------------------------------------------+
-                              |
+                              |  Glue tables dataset_lifecycle_fast / _slow · Athena (Direct Query)
                               v
-                 CloudWatch DASHBOARD
-                  - KPI tiles (total / SPICE / failed / unreferenced /
-                    no-observed-use / SPICE GB)
-                  - Currently FAILED datasets + reason
-                  - Slowest datasets (avg vs last)
-                  - Unreferenced SPICE datasets (cost vs evidence)
-                  - "How to read usage evidence" legend
-                  - Least recently used (WITH evidence, stalest first)
-                  - No usage evidence (telemetry blind spot, verify first)
-                  - Native ingestion latency/error trends
-                  - Largest datasets + estimated cost signal
+                 AMAZON QUICK DASHBOARD (companion stack)
+                  - Overview · Refresh health · Usage · Capacity and cost · History
 ```
 
 Storage is deliberately database-free and cost-optimized:
 
-- **CloudWatch Logs is the system of record** — one JSON event per dataset per run; the dashboard
-  tables are Logs Insights queries (`stats latest(...) by datasetId`).
+- **S3 snapshots are the system of record** — one JSONL record per dataset per run in the shared
+  analytics bucket; the dashboard's datasets keep the latest scan per dataset with a window function
+  (`row_number() over (partition by datasetId order by ts desc)`).
 - **No per-dataset custom metrics** (at 1,000 datasets that would cost hundreds of USD/month and
   cannot carry text like failure reasons). Per-dataset trends come from the **free native**
   `AWS/QuickSight` metrics; only a handful of account-level KPIs are published.
-- **S3** holds tiny state objects (alert dedupe, lineage cache, usage evidence) and per-run JSONL
-  snapshots for anything downstream.
+- **S3 also holds the tiny state objects** (alert dedupe, lineage cache, usage evidence) under
+  `dataset-lifecycle/state/`, a prefix no dashboard reads. The module creates no buckets of its own.
 
 ## What this stack creates
 
@@ -99,10 +92,8 @@ Storage is deliberately database-free and cost-optimized:
 |---|---|
 | `AWS::Serverless::Function` + role | The collector (Python 3.14, arm64), read-only Quick access, `ReservedConcurrentExecutions: 1` to serialize loops under API quotas. |
 | 2 × EventBridge schedule | Fast loop (`{"mode":"fast"}`) and slow loop (`{"mode":"slow"}`). |
-| `AWS::Logs::LogGroup` (data) | One JSON event per dataset per run; queried by the dashboard. |
 | `AWS::Logs::LogGroup` (Lambda) | Collector runtime logs, same retention. |
-| `AWS::S3::Bucket` | State + JSONL snapshots. **Retained on stack delete.** |
-| `AWS::CloudWatch::Dashboard` | The fleet dashboard (see tour below). |
+| KPI metrics (`QuickGovernance/DatasetLifecycle`) | Up to 15 account-level metrics published by the collector; they drive the alarms. |
 | Alarm on `IngestionErrorCount` | Native account-aggregate metric — minutes-level MTTD for any SPICE refresh failure. |
 | Alarm on Lambda `Errors` | Collector health — scan data may be stale/partial when firing. |
 | `AWS::SNS::Topic` + email subscription *(optional)* | New-failure alerts (with reason) and alarm notifications. Created only when `AlertEmail` is set; **confirm the subscription email**. |
@@ -148,7 +139,7 @@ queries (session prewarm) — indistinguishable in the event, hence Medium. Topi
 the **V2 topic APIs** first: topics created in the new Quick experience are invisible to the
 legacy `ListTopics` / `DescribeTopic` ("use new versions of Topic APIs"), and topics referenced
 by spaces are described even when no listing returns them. Agent citations of documents and
-knowledge bases are ignored (no dataset lineage). One verified platform gap: an agent answer
+knowledge bases are ignored (no dataset lineage). One verified telemetry gap: an agent answer
 **grounded through a topic can cite nothing** — empty `cited_resource`,
 `message_scope: no_resources`, no CloudTrail event, no metric — leaving no dataset-level trace in
 any exportable telemetry. The compensating control is `AGENT_CONVERSATION_SCOPE`: every
@@ -178,36 +169,19 @@ managerial allocation. The module publishes `spiceGB × SpiceRatePerGBMonth` lab
 `ESTIMATED_PURCHASED` — never an AWS invoice amount. CUR-based actual/net attribution is a
 non-goal (see below).
 
-**Findings** (rule-based flags on each dataset event, filterable in Logs Insights via the
-`findings` array or the flat `findingsCsv` string):
+**Findings** (rule-based flags on each dataset record, filterable in Athena or the Quick dashboard via
+the `findings` array or the flat `findingsCsv` string):
 `REFRESH_FAILED`, `REFRESH_NEVER_COMPLETED`, `REFRESH_FAILURE_RECURRING` (≥3 failures in the
 lookback window), `SPICE_DATASET_NOT_REFERENCED` (in no dashboard, no topic, *and* no space),
 `NO_OBSERVED_USE`, `SCAN_INCOMPLETE`.
 
 ## Dashboard tour
 
-- **KPI tiles** — total and direct-query datasets, SPICE datasets, datasets with FAILED last
-  refresh, unreferenced SPICE datasets, referenced datasets with no observed use, total consumed
-  SPICE GB.
-- **Currently FAILED datasets** — latest state per dataset with `errorType`/`errorMessage`
-  (typed reasons like `DATA_SOURCE_CONNECTION_FAILED`, `QUERY_TIMEOUT`, `PERMISSION_DENIED`; see
-  the [SPICE ingestion error codes](https://docs.aws.amazon.com/quick/latest/userguide/errors-spice-ingestion.html)).
-- **Slowest SPICE datasets** — average vs last duration, full vs incremental — spot datasets whose
-  sync time is drifting up before they breach refresh windows.
-- **Unreferenced SPICE datasets** — in no dashboard, topic, or space, ranked by capacity: the
-  cost-versus-evidence list a Head of Data reviews first.
-- **How to read usage evidence** — an always-visible legend: the confidence ladder, the evidence
-  windows, and the blind spots. The single most important widget for interpreting the two tables
-  below it.
-- **Least recently used (WITH evidence)** — only datasets with an observed-use timestamp, stalest
-  first, with confidence, source, and dashboard/topic/space/agent reference counts.
-- **No usage evidence** — referenced or not, nothing observed: the telemetry blind spot list,
-  explicitly labeled "verify before acting", with the same reference counts (a dataset with
-  agents ≥1 is reachable by Chat Agents even if nothing was observed yet).
-- **Native trends** — account-wide `IngestionLatency` (avg/max) and ingestions vs failures,
-  emitted by Quick itself; empty when no refresh ran in the selected time range.
-- **Largest SPICE datasets** — GB, estimated monthly cost signal, cross-referenced with usage.
-- **Recent refresh-failure events** — raw feed of failures as they were observed.
+See [Amazon Quick dashboard](#amazon-quick-dashboard) below for the five tabs. Two things hold on every
+tab: the typed failure reasons come straight from the
+[SPICE ingestion error codes](https://docs.aws.amazon.com/quick/latest/userguide/errors-spice-ingestion.html),
+and usage evidence is a **signal with a confidence label, never a verdict** — the how-to note on the
+Overview tab is the single most important element for interpreting the usage tables.
 
 ## Alerts
 
@@ -217,11 +191,73 @@ lookback window), `SPICE_DATASET_NOT_REFERENCED` (in no dashboard, no topic, *an
 - **`IngestionErrorCount ≥ 1` in 5 min** (native alarm): fastest possible detection signal.
 - **Collector errors** (alarm): the scan itself is failing; data may be stale.
 
+Alerting is operational and lives in CloudWatch alarms and SNS; visualization lives in Amazon Quick.
+
+## Where the data lives
+
+Everything the collector writes goes to the shared analytics bucket created by the
+[Analytics Foundation](../governance-analytics-foundation/README.md) — the module creates **no S3
+buckets of its own**:
+
+| Prefix | Content | Read by |
+|---|---|---|
+| `dataset-lifecycle/fast/dt=<date>/run-<time>.jsonl` | One record per dataset per fast run (sync health) | Glue table `dataset_lifecycle_fast`; Athena, Grafana, Datadog |
+| `dataset-lifecycle/slow/dt=<date>/run-<time>.jsonl` | One record per dataset per slow run (usage, lineage, capacity) | Glue table `dataset_lifecycle_slow` |
+| `dataset-lifecycle/latest-fast.jsonl`, `latest-slow.jsonl` | Rolling copies of the last runs | convenience for external tools |
+| `dataset-lifecycle/state/` | alert dedupe, known datasets, lineage caches, agent scope, usage evidence | the collector only |
+
+The state prefix sits outside the Glue table locations, the foundation's lifecycle rules never expire it
+(snapshots expire after the foundation's `AnalyticsExpirationDays`), and the foundation's grant to
+Quick's service role carries an explicit Deny on `*/state/*`, so no Quick data source can read it.
+
+**Self-exclusion.** The Quick datasets created by the governance stacks themselves (IDs `quick-governance-*`)
+are left out of the scan by default (`ExcludeAssetIdPrefixes`); they are Direct Query with no dependents,
+so without the exclusion they would appear as unreferenced.
+
+**Upgrading from a release with the CloudWatch dashboard or a module-owned bucket.** Re-applying removes
+the CloudWatch dashboard and the per-dataset data log group (the log group is retained — delete it with
+`aws logs delete-log-group` when no longer needed); alarms, KPI metrics and SNS stay. A stack still
+writing to its own bucket must be migrated in this order: (1) copy the state —
+`aws s3 cp --recursive s3://<module bucket>/state/ s3://<shared bucket>/dataset-lifecycle/state/` — *before*
+the switch, otherwise the collector loses its alert de-duplication and rebuilds every lineage cache;
+(2) re-apply (the state and access-log buckets leave the stack, retained); (3) run `RunFastLoopNowCommand`
+and `RunSlowLoopNowCommand` and check that `datasets` matches the previous run; (4) copy the history with
+`aws s3 sync s3://<module bucket>/snapshots/ s3://<shared bucket>/dataset-lifecycle/history/` (a sub-prefix
+the live collector never writes to). The two module buckets can then be deleted (they are versioned —
+delete all versions).
+
+## Amazon Quick dashboard
+
+`cloudformation/governance-dataset-lifecycle-quick-dashboard.yaml` builds a native Amazon Quick dashboard over the S3 snapshots: Glue
+table(s) over the partitioned snapshot prefix (`dataset_lifecycle_fast` for refresh health, `dataset_lifecycle_slow` for usage, lineage and capacity), Direct Query datasets whose SQL keeps the
+latest scan per dataset (`row_number() over (partition by … order by ts desc)`) plus a history dataset,
+and a five-tab administrator dashboard. The module's apply script deploys it after the module stack;
+on its own:
+
+```bash
+cd scripts
+./apply-governance-dataset-lifecycle-quick-dashboard.sh --region us-east-1
+./remove-governance-dataset-lifecycle-quick-dashboard.sh --region us-east-1   # snapshots in S3 are untouched
+```
+
+| Tab | What it shows |
+|---|---|
+| Overview | Datasets, SPICE / direct query, FAILED last refresh, unreferenced SPICE datasets, referenced with no observed use, SPICE GB and estimated monthly cost; datasets by refresh status and by usage confidence; currently FAILED datasets with reason; a how-to note on reading usage evidence |
+| Refresh health | FAILED datasets with typed reason, slowest SPICE datasets (average vs last, full vs incremental, rows), average duration by dataset, refresh state of every dataset |
+| Usage | Unreferenced datasets (cost vs evidence), least recently used referenced datasets with confidence and source, datasets with no usage evidence, reference state × confidence |
+| Capacity and cost | Largest SPICE datasets with estimated cost, cost by dataset, SPICE GB by confidence × reference state |
+| History | Datasets in FAILED state per hourly scan, records per day by status, and the failure feed |
+
+Controls (date range on the history tab, import mode, dataset) live in the collapsible control bar. The datasets
+are Direct Query: every load reads the latest snapshots through Athena, so the dashboard is as fresh as
+the last scan with no SPICE and no refresh schedule. Usage evidence is a signal with a confidence label, never a verdict: no dataset should be deleted on this dashboard alone.
+
 ## Parameters
 
 | Parameter | Default | Purpose |
 |---|---|---|
-| `ResourcePrefix` | `quick-governance-dataset-lifecycle` | Names every resource (lowercase; also in the bucket name). |
+| `ResourcePrefix` | `quick-governance-dataset-lifecycle` | Names every resource (lowercase). |
+| `AnalyticsBucketName` | *(required)* | The foundation's shared analytics bucket: snapshots under `dataset-lifecycle/fast/` and `slow/`, state under `dataset-lifecycle/state/`. The apply script resolves it from the foundation stack. |
 | `FastLoopSchedule` | `rate(1 hour)` | Sync-health cadence. |
 | `SlowLoopSchedule` | `cron(15 3 * * ? *)` | Usage/lineage/capacity cadence. |
 | `AlertEmail` | *(empty)* | Set to enable SNS alerts + alarm notifications. |
@@ -232,14 +268,15 @@ lookback window), `SPICE_DATASET_NOT_REFERENCED` (in no dashboard, no topic, *an
 | `UnusedThresholdDays` | `30` | Days without evidence before `NO_OBSERVED_USE`. |
 | `IngestionLookbackRuns` | `50` | Newest ingestions per dataset for averages. |
 | `CloudTrailLookbackDays` | `90` | First-scan Event history lookback (max 90). |
-| `LogRetentionDays` | `90` | Data + Lambda log group retention. |
-| `SnapshotExpirationDays` | `180` | S3 snapshot lifecycle expiry. |
+| `LogRetentionDays` | `90` | Retention of the collector's own Lambda log group. |
 | `FunctionTimeoutSeconds` / `FunctionMemoryMb` | `900` / `512` | Collector sizing. |
+| `ExcludeAssetIdPrefixes` | `quick-governance-` | Comma-separated dataset-ID prefixes left out of the scan (the governance stacks' own Quick datasets). Empty scans everything. |
 
 ## Deploy
 
-Prerequisites: AWS SAM CLI, AWS CLI v2 authenticated against the account/Region that holds the
-Quick subscription. The apply script runs `sam build` first (resolves `lambda/requirements.txt`,
+Prerequisites: the [Analytics Foundation](../governance-analytics-foundation/README.md) stack in the
+same account and Region (the script resolves its bucket; `--foundation-stack` if renamed), AWS SAM CLI,
+AWS CLI v2 authenticated against the account/Region that holds the Quick subscription. The apply script runs `sam build` first (resolves `lambda/requirements.txt`,
 which pins a boto3 recent enough for the Space/Agent/Topic-V2 lineage APIs) — that step needs a
 local Python matching the function runtime (3.14) or Docker (`sam build --use-container`). The
 deploying principal needs CloudFormation/IAM/Lambda/S3/SNS/CloudWatch permissions; the collector
@@ -248,8 +285,11 @@ itself is read-only towards Quick.
 ```bash
 cd governance-dataset-lifecycle-monitor/scripts
 
-# minimal
+# minimal: module stack + Quick dashboard
 ./apply-governance-dataset-lifecycle-monitor.sh --region us-east-1
+
+# module only (snapshots for your own tools)
+./apply-governance-dataset-lifecycle-monitor.sh --region us-east-1 --skip-dashboard
 
 # with alerts and a 60-day unused threshold
 ./apply-governance-dataset-lifecycle-monitor.sh \
@@ -266,8 +306,8 @@ aws lambda invoke --function-name quick-governance-dataset-lifecycle-fn \
   --payload '{"mode": "slow"}' --cli-binary-format raw-in-base64-out /dev/stdout
 ```
 
-Open the dashboard via the `DashboardUrl` stack output. If you set `AlertEmail`, confirm the SNS
-subscription from your inbox.
+Open the dashboard via the `DashboardUrl` output of the dashboard stack (printed last). If you set
+`AlertEmail`, confirm the SNS subscription from your inbox.
 
 ## IAM and security
 
@@ -277,13 +317,13 @@ subscription from your inbox.
   `DescribeAgent`) plus
   `cloudwatch:GetMetricData`, `cloudtrail:LookupEvents`, Logs Insights read on the `CHAT_LOGS`
   log group when `ChatLogGroupName` is set (`logs:StartQuery` scoped to that group), scoped
-  writes to its own log group/bucket/metrics namespace, and optional `sns:Publish`. **No Quick
+  writes to its own Lambda log group, the `dataset-lifecycle/` prefix of the shared bucket and its
+  metrics namespace, and optional `sns:Publish`. **No Quick
   resource permissions (ownership/sharing) are used or granted** — this is the least-privilege
   alternative to adding yourself as co-owner of every dataset.
 - Failure messages can reveal infrastructure details (hosts, schemas); they are truncated to 400
-  chars and stay inside your account (log group, bucket, SNS topic). Grant dashboard/log access
-  accordingly, and keep dataset names/IDs out of anything public.
-- The S3 bucket blocks public access, is SSE-encrypted, and is retained on stack delete.
+  chars and stay inside your account (shared bucket, SNS topic). Grant dashboard access accordingly,
+  and keep dataset names/IDs out of anything public.
 
 ## Cost
 
@@ -291,9 +331,10 @@ Roughly **US$2–3/month** at ~1,000 SPICE datasets / 500 dashboards on default 
 
 | Item | ~Cost/month |
 |---|---|
-| Log ingestion (1k events/hour ≈ 24 MB/day) | ~$0.40 |
+| S3 snapshots (1k records/hour ≈ 24 MB/day) + Athena per dashboard load | ~$0.10 |
 | Custom KPI metrics (≤15 total) | ~$1.80–4.50 |
-| 3 alarms | $0.30 |
+| 2 alarms | $0.20 |
+| Alert-topic KMS key (created only when `AlertEmail` is set) | $1.00 |
 | Lambda (≤5 min/hour, arm64 512 MB) | ~$0.15 |
 | `GetMetricData`, CHAT_LOGS Insights scan, S3, SNS | pennies |
 
@@ -338,11 +379,10 @@ further (`--fast-schedule 'rate(6 hours)'`).
 
 ```bash
 cd governance-dataset-lifecycle-monitor/scripts
-./remove-governance-dataset-lifecycle-monitor.sh --region us-east-1
+./remove-governance-dataset-lifecycle-monitor.sh --region us-east-1                   # dashboard stack, then module stack
+./remove-governance-dataset-lifecycle-monitor.sh --region us-east-1 --keep-dashboard  # module stack only
 ```
 
-The S3 bucket is retained (scan history). Remove it manually when no longer needed:
-
-```bash
-aws s3 rb "s3://quick-governance-dataset-lifecycle-<account-id>" --force --region us-east-1
-```
+Nothing in S3 is deleted: snapshots and state stay under `dataset-lifecycle/` in the foundation's
+analytics bucket. Remove that data, or the foundation itself, through
+`governance-analytics-foundation/scripts`.

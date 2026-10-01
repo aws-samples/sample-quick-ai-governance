@@ -1,10 +1,10 @@
 # Amazon Quick — Orphaned Assets Monitor
 
 Fleet-wide ownership assurance for every Amazon Quick asset — **who owns it, whether those
-owners still exist, and which assets are one departure away from being orphaned** — on a
-CloudWatch dashboard, with SNS alerts for new HIGH findings and S3 JSONL snapshots for
-downstream analysis. Strictly **audit-only**: the monitor never transfers ownership and never
-deletes anything.
+owners still exist, and which assets are one departure away from being orphaned** — on a native
+Amazon Quick dashboard, with SNS alerts and alarms for new HIGH findings, over S3 JSONL snapshots that
+any downstream tool can also read. Strictly **audit-only**: the monitor never transfers ownership and
+never deletes anything.
 
 Amazon Quick does not automatically transfer a user's assets when that user leaves:
 
@@ -48,25 +48,22 @@ governance-orphaned-assets-monitor/
   |-- classify every owner grant against the identity inventory
   |-- evaluate finding rules; track finding lifecycle in S3 state
         |
-        +--> 1 JSON ownership event per asset  ->  CloudWatch Logs data log group
-        +--> JSONL snapshot per scan           ->  S3 (dt=... partitions + latest)
-        +--> 11 fleet KPIs                     ->  QuickGovernance/OrphanedAssets
-        +--> alert on NEW HIGH finding         ->  SNS (optional)
+        +--> JSONL snapshot per scan   ->  shared analytics bucket, orphaned-assets/ownership/dt=.../
+        +--> finding + identity state  ->  shared analytics bucket, orphaned-assets/state/
+        +--> 11 fleet KPIs             ->  CloudWatch metrics QuickGovernance/OrphanedAssets (alarms)
+        +--> alert on NEW HIGH finding ->  SNS (optional)
         |
-        v
- CloudWatch DASHBOARD
-  - KPI tiles (open findings / HIGH / single-owner / assets+users / partial / recovered)
-  - "How to read ownership findings" legend
-  - HIGH: orphaned or missing-owner assets
-  - MEDIUM: at-risk assets (bus factor 1)
-  - Ownership coverage by asset type · LOW table · recovered feed
+        v  Glue table orphaned_assets_snapshots · Athena (Direct Query)
+ AMAZON QUICK DASHBOARD (companion stack)
+  - Overview: open findings / HIGH / single-owner / healthy, coverage by type, HIGH action list
+  - Findings · Ownership · History
 ```
 
 Asset types scanned (all verified live, configurable via `AssetTypes`): **datasets, dashboards,
 analyses, data sources, shared folders, spaces, agents, topics**. Soft-deleted analyses
-(`Status: DELETED`, 30-day restore window) and the platform-managed SYSTEM default agent are
-excluded by design. Storage reuses the repository chassis — CloudWatch Logs as the queryable
-system of record, S3 for state and snapshots, no database.
+(`Status: DELETED`, 30-day restore window) and the service-managed SYSTEM default agent are
+excluded by design. Storage is S3 only — the shared analytics bucket holds the snapshots the
+dashboard queries and the collector's working state; no database, no module-owned buckets.
 
 ## Ownership semantics the module guarantees
 
@@ -107,52 +104,109 @@ against a real orphaned asset.
 
 ## Dashboard tour
 
-- **KPI tiles** — open findings, HIGH severity, single-owner assets, assets|users scanned,
-  partial scans, recovered findings. Tiles read the current day's bucket (`liveData`), so the
-  morning scan is visible immediately; values are the day's maximum (worst state today).
-- **How to read ownership findings** — always-visible legend: the owner rule, the finding
-  ladder, confidence semantics, and the reminder that remediation is manual.
-- **HIGH — orphaned or missing-owner assets** — the action list, oldest finding first, with
-  owner counts and principals.
-- **MEDIUM — at-risk assets** — single-owner and inactive-only-owner assets per type.
-- **Ownership coverage by asset type** — assets vs healthy vs high-risk vs single-owner.
-- **Recovered findings (feed)** and **LOW — mixed or unknown owner status**.
+See [Amazon Quick dashboard](#amazon-quick-dashboard) below for the four tabs. The constant across
+them: the **finding ladder** (HIGH orphaned or missing-owner → MEDIUM at-risk → LOW mixed or unknown),
+the confidence label on every finding, and the reminder that remediation is a manual, human decision.
 
 ## Alerts
 
 - **New HIGH finding** (SNS email, optional): fires once per asset when a finding first becomes
   HIGH, with the finding type, asset, confidence, owner grants, and a link to the transfer
   procedure. Re-fires only if the finding type changes.
-- **`HighSeverityFindings ≥ 1`** (alarm): open HIGH findings exist (daily granularity).
+- **`HighSeverityFindings ≥ 1`** (CloudWatch alarm on the collector's KPI metric): open HIGH findings
+  exist (daily granularity).
 - **Collector errors** (alarm): the scan itself failed; findings may be stale.
+
+Alerting is operational and lives in CloudWatch alarms and SNS; visualization lives in Amazon Quick.
+
+## Where the data lives
+
+Everything the collector writes goes to the shared analytics bucket created by the
+[Analytics Foundation](../governance-analytics-foundation/README.md) — the module creates **no S3
+buckets of its own**:
+
+| Prefix | Content | Read by |
+|---|---|---|
+| `orphaned-assets/ownership/dt=<date>/run-<time>.jsonl` | One JSONL snapshot per scan, one record per asset | the Quick dashboard's Glue table; Athena, Grafana, Datadog |
+| `orphaned-assets/latest-ownership.jsonl` | Rolling copy of the last scan | convenience for external tools |
+| `orphaned-assets/state/` | `findings.json` (finding lifecycle), `identity.json` (identity cache) | the collector only |
+
+The state prefix sits outside the Glue table location, the foundation's lifecycle rules never expire it
+(snapshots expire after the foundation's `AnalyticsExpirationDays`), and the foundation's grant to
+Quick's service role carries an explicit Deny on `*/state/*`, so no Quick data source can read it.
+
+**Self-exclusion.** The Quick assets created by the governance stacks themselves (IDs `quick-governance-*`)
+are left out of the scan by default (`ExcludeAssetIdPrefixes`), so the monitor does not report on its own
+dashboards and datasets. Exclusion hides the finding; to fix the underlying bus factor, own the governance assets with a Quick **group** rather than a single user (`QuickPrincipalArn` on the foundation stack).
+
+**Upgrading from a release with the CloudWatch dashboard or a module-owned bucket.** Re-applying removes
+the CloudWatch dashboard and the per-asset data log group (the log group is retained — delete it with
+`aws logs delete-log-group` when no longer needed); alarms, KPI metrics and SNS stay. A stack still
+writing to its own bucket must be migrated in this order: (1) copy the state —
+`aws s3 cp --recursive s3://<module bucket>/state/ s3://<shared bucket>/orphaned-assets/state/` — *before*
+the switch, otherwise the first scan starts with no memory and re-fires every open finding as NEW;
+(2) re-apply (the state and access-log buckets leave the stack, retained); (3) run `RunScanNowCommand`
+and check `"recovered": 0` / `"newHigh": 0`; (4) copy the history with
+`aws s3 sync s3://<module bucket>/snapshots/ownership/ s3://<shared bucket>/orphaned-assets/ownership/history/`
+(a sub-prefix the live collector never writes to). The two module buckets can then be deleted (they are
+versioned — delete all versions).
+
+## Amazon Quick dashboard
+
+`cloudformation/governance-orphaned-assets-quick-dashboard.yaml` builds a native Amazon Quick dashboard over the S3 snapshots: Glue
+table(s) over the partitioned snapshot prefix (`orphaned_assets_snapshots`, without the `ownerPrincipals` column), Direct Query datasets whose SQL keeps the
+latest scan per asset (`row_number() over (partition by … order by ts desc)`) plus a history dataset,
+and a four-tab administrator dashboard. The module's apply script deploys it after the module stack;
+on its own:
+
+```bash
+cd scripts
+./apply-governance-orphaned-assets-quick-dashboard.sh --region us-east-1
+./remove-governance-orphaned-assets-quick-dashboard.sh --region us-east-1   # snapshots in S3 are untouched
+```
+
+| Tab | What it shows |
+|---|---|
+| Overview | Assets scanned, orphaned (HIGH), HIGH / MEDIUM counts, single-owner (bus factor 1), healthy, asset types covered; coverage by asset type; findings by type; the HIGH action list oldest-first; a how-to note on the finding ladder |
+| Findings | The full HIGH, MEDIUM and LOW lists from the latest scan with days open, owner / viewer counts and first-observed dates |
+| Ownership | Coverage by asset type, assets by type × finding, and the single-owner list to co-own before the owner leaves |
+| History | Findings per scan by severity, assets scanned per day by type, recovered findings, scans (status, counts) |
+
+Controls (date range on the history tab, asset type, severity, finding) live in the collapsible control bar. The datasets
+are Direct Query: every load reads the latest snapshots through Athena, so the dashboard is as fresh as
+the last scan with no SPICE and no refresh schedule. Owner principal names are deliberately not declared in the Glue table — asset names and counts are enough to act on, and remediation stays manual in the Quick asset management console.
 
 ## Parameters
 
 | Parameter | Default | Purpose |
 |---|---|---|
-| `ResourcePrefix` | `quick-governance-orphaned-assets` | Names every resource (lowercase; also in the bucket name). |
-| `DataLogGroupName` | `/quick-governance/orphaned-assets` | Data log group queried by the dashboard. |
+| `ResourcePrefix` | `quick-governance-orphaned-assets` | Names every resource (lowercase). |
+| `AnalyticsBucketName` | *(required)* | The foundation's shared analytics bucket: snapshots under `orphaned-assets/ownership/`, state under `orphaned-assets/state/`. The apply script resolves it from the foundation stack. |
 | `ScheduleExpression` | `cron(45 3 * * ? *)` | Daily reconciliation cadence. |
 | `AlertEmail` | *(empty)* | Set to enable SNS alerts + alarm notifications. |
 | `IdentityRegion` | *(empty = auto-discover)* | Region hosting the Quick user/group APIs when it differs from the asset Region. |
 | `Namespaces` | `default` | Comma-separated namespaces to inventory. |
 | `AssetTypes` | all eight | Comma-separated asset types to scan. |
-| `LogRetentionDays` | `90` | Data + Lambda log group retention. |
-| `SnapshotExpirationDays` | `365` | S3 snapshot lifecycle expiry (finding history). |
+| `LogRetentionDays` | `90` | Retention of the collector's own Lambda log group. |
 | `FunctionTimeoutSeconds` / `FunctionMemoryMb` | `900` / `512` | Collector sizing. |
+| `ExcludeAssetIdPrefixes` | `quick-governance-` | Comma-separated asset-ID prefixes left out of the scan (the governance stacks' own Quick assets). Empty scans everything. |
 
 ## Deploy
 
-Prerequisites: AWS SAM CLI (the build step needs a local Python 3.14 or Docker for
-`sam build --use-container`), AWS CLI v2 authenticated against the account/Region that holds
-the Quick assets. `sam build` resolves `lambda/requirements.txt`, which pins a boto3 recent
+Prerequisites: the [Analytics Foundation](../governance-analytics-foundation/README.md) stack in
+the same account and Region (the script resolves its bucket; `--foundation-stack` if renamed), AWS SAM
+CLI (the build step needs a local Python 3.14 or Docker for `sam build --use-container`), AWS CLI v2
+authenticated against the account/Region that holds the Quick assets. `sam build` resolves `lambda/requirements.txt`, which pins a boto3 recent
 enough for the Space/Agent/Topic-V2 permission APIs.
 
 ```bash
 cd governance-orphaned-assets-monitor/scripts
 
-# minimal
+# minimal: module stack + Quick dashboard
 ./apply-governance-orphaned-assets-monitor.sh --region us-east-1
+
+# module only (snapshots for your own tools)
+./apply-governance-orphaned-assets-monitor.sh --region us-east-1 --skip-dashboard
 
 # with alerts
 ./apply-governance-orphaned-assets-monitor.sh \
@@ -167,8 +221,8 @@ aws lambda invoke --function-name quick-governance-orphaned-assets-fn \
   --payload '{}' --cli-binary-format raw-in-base64-out --region us-east-1 /dev/stdout
 ```
 
-Open the dashboard via the `DashboardUrl` stack output. If you set `AlertEmail`, confirm the
-SNS subscription from your inbox.
+Open the dashboard via the `DashboardUrl` output of the dashboard stack (printed last). If you set
+`AlertEmail`, confirm the SNS subscription from your inbox.
 
 **Acting on findings** stays manual by design, in the
 [Quick asset management console](https://docs.aws.amazon.com/quick/latest/userguide/manage-qs-assets.html)
@@ -192,18 +246,20 @@ single-owner findings close once a second active owner exists).
 - Collector permissions are read-only towards Quick: the `List*` inventory operations, the
   `Describe*Permissions` operation per asset type (resource-scoped to this Region's assets),
   and `ListUsers` / `ListGroups` / `ListGroupMemberships` (region-wildcarded, because the
-  identity region can differ from the asset region), plus scoped writes to its own log group,
-  bucket, and metrics namespace, and optional `sns:Publish`. **No mutating Quick action is
+  identity region can differ from the asset region), plus scoped writes to its own Lambda log
+  group, the `orphaned-assets/` prefix of the shared bucket, and its metrics namespace, and optional
+  `sns:Publish`. **No mutating Quick action is
   granted** — ownership transfer requires a human in the asset management console.
 - Ownership findings identify people (owner principal names) — that is their purpose. They stay
-  inside your account (log group, bucket, SNS topic); grant dashboard/log access accordingly.
-  No personal data is placed in metric dimensions or alarm names.
-- The S3 bucket blocks public access, is SSE-encrypted, and is retained on stack delete.
+  inside your account (shared bucket, SNS topic); the Glue table the dashboard reads omits the
+  owner principal names, and the state prefix is denied to Quick's service role. No personal data is
+  placed in metric dimensions or alarm names.
 
 ## Cost
 
-Roughly **US$3–4/month** on default settings, dominated by the 11 KPI metrics (~$3.30); the
-rest — one short Lambda run per day, one log event per asset per scan, two alarms, S3 state —
+Roughly **US$3–4/month** on default settings, dominated by the 11 KPI metrics (~$3.30), plus
+**US$1/month for the alert-topic KMS key when `AlertEmail` is set** (SNS encryption at rest); the
+rest — one short Lambda run per day, two alarms, S3 snapshots and state, Athena per dashboard load —
 is pennies. Quick and identity API calls made by the collector are free.
 
 ## Limitations
@@ -219,9 +275,9 @@ is pennies. Quick and identity API calls made by the collector are free.
 - **Transition-window semantics**: right after a user deletion an asset may briefly report
   `OWNER_PRINCIPAL_MISSING` before Quick purges the grant and it becomes `NO_OWNER_GRANTS`;
   both are HIGH, so alerting is unaffected.
-- **KPI tiles show the day's worst value** (stat Maximum over the daily bucket): after
-  remediating mid-day, tiles and the HIGH alarm reflect the fix on the next day's bucket even
-  though the tables update on the next scan.
+- **The HIGH alarm evaluates the day's worst value** (stat Maximum over the daily bucket): after
+  remediating mid-day, the alarm reflects the fix on the next day's bucket; the dashboard reflects
+  it on the next scan.
 
 ## Non-goals
 
@@ -239,11 +295,10 @@ is pennies. Quick and identity API calls made by the collector are free.
 
 ```bash
 cd governance-orphaned-assets-monitor/scripts
-./remove-governance-orphaned-assets-monitor.sh --region us-east-1
+./remove-governance-orphaned-assets-monitor.sh --region us-east-1                   # dashboard stack, then module stack
+./remove-governance-orphaned-assets-monitor.sh --region us-east-1 --keep-dashboard  # module stack only
 ```
 
-The S3 bucket is retained (finding history). Remove it manually when no longer needed:
-
-```bash
-aws s3 rb "s3://quick-governance-orphaned-assets-<account-id>" --force --region us-east-1
-```
+Nothing in S3 is deleted: snapshots and state stay under `orphaned-assets/` in the foundation's
+analytics bucket. Remove that data, or the foundation itself, through
+`governance-analytics-foundation/scripts`.

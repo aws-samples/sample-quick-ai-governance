@@ -1,0 +1,515 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Amazon Quick governance - analytics foundation. Shared, once-per-Region
+  prerequisites for the Quick (native dashboard) visualization target of the
+  governance modules: an AWS Glue database, an Amazon Athena workgroup with its
+  own query-results bucket, a shared analytics bucket that modules deliver
+  into under per-module prefixes, and one Amazon Quick data source (Athena).
+  Deploy before the monitoring modules and their Quick dashboards; remove after
+  them (stack exports enforce the order).
+
+# Prerequisites (NOT created by this stack):
+#   * An Amazon Quick subscription in this account and Region.
+#   * A Quick user or group ARN to own the data source (QuickPrincipalArn). The
+#     ARN lives in the account's Quick identity Region, which may differ from
+#     this Region - for example arn:aws:quicksight:sa-east-1:<acct>:user/default/<name>.
+#
+# Quick access to the data (no console step in the default configuration):
+#   The stack attaches a scoped policy to Quick's service role
+#   (QuickServiceRoleName, default aws-quicksight-service-role-v0) granting
+#   read access to the analytics bucket, use of the Athena workgroup and
+#   read access to the Glue database. Set QuickServiceRoleName to '' to skip
+#   it and authorize buckets in the console instead (Manage Quick -> Security
+#   & permissions -> AWS resources), for example when the account governs data
+#   through Lake Formation or uses a custom Quick role.
+#
+# Deploy:
+#   aws cloudformation deploy \
+#       --stack-name quick-governance-analytics-foundation \
+#       --template-file governance-analytics-foundation.yaml --region <REGION> \
+#       --parameter-overrides QuickPrincipalArn=<arn>
+
+Parameters:
+  ResourcePrefix:
+    Type: String
+    Default: 'quick-governance-analytics'
+    Description: Prefix for resource names; lowercase and DNS-safe (used in bucket names).
+    AllowedPattern: '^[a-z0-9-]{1,32}$'
+    ConstraintDescription: 1-32 chars, lowercase letters, digits, hyphens.
+
+  GlueDatabaseName:
+    Type: String
+    Default: 'quick_governance'
+    Description: Glue database that holds the governance tables (one per module).
+    AllowedPattern: '^[a-z0-9_]{1,64}$'
+
+  AthenaWorkGroupName:
+    Type: String
+    Default: 'quick-governance'
+    Description: Athena workgroup used by the Quick data source.
+    AllowedPattern: '^[a-zA-Z0-9._-]{1,128}$'
+
+  QuickPrincipalArn:
+    Type: String
+    Description: >
+      Amazon Quick user or group ARN granted owner permissions on the data
+      source (from the Quick identity Region).
+    AllowedPattern: '^arn:aws[a-z-]*:quicksight:[a-z0-9-]+:[0-9]{12}:(user|group)/.+$'
+    ConstraintDescription: A Quick user or group ARN.
+
+  QueryResultsExpirationDays:
+    Type: Number
+    Default: 7
+    MinValue: 1
+    MaxValue: 365
+    Description: Days before Athena query results expire.
+
+  AnalyticsExpirationDays:
+    Type: Number
+    Default: 365
+    MinValue: 1
+    MaxValue: 3650
+    Description: Days before objects in the shared analytics bucket expire.
+
+  QuickServiceRoleName:
+    Type: String
+    Default: 'aws-quicksight-service-role-v0'
+    AllowedPattern: '^$|^[\w+=,.@-]{1,64}$'
+    Description: >
+      Name of the IAM service role Amazon Quick uses to reach AWS data sources
+      (the role the console's "AWS resources" page manages). The stack attaches
+      a scoped policy to it so Quick can read the analytics bucket and query the
+      Athena workgroup without the console step. Set to an empty string to skip
+      the grant (accounts governed by Lake Formation, or a custom Quick role).
+
+Conditions:
+  GrantQuickServiceRole: !Not [!Equals [!Ref QuickServiceRoleName, '']]
+
+Resources:
+
+  # ----- Access-log bucket (terminal; logs to itself) -------------------------
+
+  AccessLogBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub '${ResourcePrefix}-access-logs-${AWS::AccountId}-${AWS::Region}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      LoggingConfiguration:
+        DestinationBucketName: !Sub '${ResourcePrefix}-access-logs-${AWS::AccountId}-${AWS::Region}'
+        LogFilePrefix: self/
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-access-logs
+            Status: Enabled
+            ExpirationInDays: 90
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+      Tags:
+        - Key: Purpose
+          Value: !Ref ResourcePrefix
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  AccessLogBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AccessLogBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: S3ServerAccessLogsDelivery
+            Effect: Allow
+            Principal:
+              Service: logging.s3.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${AccessLogBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref 'AWS::AccountId'
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt AccessLogBucket.Arn
+              - !Sub '${AccessLogBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+
+  # ----- Shared analytics bucket: <module>/ prefixes ---------------------------
+
+  AnalyticsBucket:
+    Type: AWS::S3::Bucket
+    DependsOn: AccessLogBucketPolicy
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub '${ResourcePrefix}-${AWS::AccountId}-${AWS::Region}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      LoggingConfiguration:
+        DestinationBucketName: !Ref AccessLogBucket
+        LogFilePrefix: analytics/
+      LifecycleConfiguration:
+        # Age-based expiry applies to the delivered data prefixes only. Anything
+        # outside them - <module>/state/ (collector working state) and
+        # chat-feedback/agent-names/ (lookup table) - is kept until rewritten;
+        # noncurrent versions expire bucket-wide.
+        Rules:
+          - Id: expire-agent-hours
+            Status: Enabled
+            Prefix: agent-hours/
+            ExpirationInDays: !Ref AnalyticsExpirationDays
+          - Id: expire-chat-logs
+            Status: Enabled
+            Prefix: chat-feedback/chat/
+            ExpirationInDays: !Ref AnalyticsExpirationDays
+          - Id: expire-feedback-logs
+            Status: Enabled
+            Prefix: chat-feedback/feedback/
+            ExpirationInDays: !Ref AnalyticsExpirationDays
+          - Id: expire-dataset-lifecycle-fast
+            Status: Enabled
+            Prefix: dataset-lifecycle/fast/
+            ExpirationInDays: !Ref AnalyticsExpirationDays
+          - Id: expire-dataset-lifecycle-slow
+            Status: Enabled
+            Prefix: dataset-lifecycle/slow/
+            ExpirationInDays: !Ref AnalyticsExpirationDays
+          - Id: expire-orphaned-assets-ownership
+            Status: Enabled
+            Prefix: orphaned-assets/ownership/
+            ExpirationInDays: !Ref AnalyticsExpirationDays
+          - Id: expire-noncurrent-versions
+            Status: Enabled
+            Prefix: ''
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+      Tags:
+        - Key: Purpose
+          Value: !Ref ResourcePrefix
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  AnalyticsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AnalyticsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # Vended-log deliveries (Agent Hours, Chat and Feedback) write under
+          # their module prefix. Individual delivery-source ARNs are not known
+          # here, so the grant is scoped to this account and to the prefixes.
+          - Sid: VendedLogDeliveryWrite
+            Effect: Allow
+            Principal:
+              Service: delivery.logs.amazonaws.com
+            Action: s3:PutObject
+            Resource:
+              - !Sub '${AnalyticsBucket.Arn}/agent-hours/*'
+              - !Sub '${AnalyticsBucket.Arn}/chat-feedback/*'
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: bucket-owner-full-control
+                aws:SourceAccount: !Ref 'AWS::AccountId'
+          - Sid: VendedLogDeliveryAclCheck
+            Effect: Allow
+            Principal:
+              Service: delivery.logs.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt AnalyticsBucket.Arn
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref 'AWS::AccountId'
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt AnalyticsBucket.Arn
+              - !Sub '${AnalyticsBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+
+  # ----- Athena query results bucket ------------------------------------------
+  # Named aws-athena-query-results-* on purpose: the AWSQuicksightAthenaAccess
+  # managed policy grants Quick's service role read/write on that name pattern,
+  # so query results need no extra console authorization.
+
+  QueryResultsBucket:
+    Type: AWS::S3::Bucket
+    DependsOn: AccessLogBucketPolicy
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub 'aws-athena-query-results-quick-gov-${AWS::AccountId}-${AWS::Region}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      LoggingConfiguration:
+        DestinationBucketName: !Ref AccessLogBucket
+        LogFilePrefix: query-results/
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-query-results
+            Status: Enabled
+            ExpirationInDays: !Ref QueryResultsExpirationDays
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 1
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+      Tags:
+        - Key: Purpose
+          Value: !Ref ResourcePrefix
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  QueryResultsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref QueryResultsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt QueryResultsBucket.Arn
+              - !Sub '${QueryResultsBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+
+  # ----- Glue database and Athena workgroup ------------------------------------
+
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref 'AWS::AccountId'
+      DatabaseInput:
+        Name: !Ref GlueDatabaseName
+        Description: Amazon Quick governance modules - analytics tables over S3 data.
+
+  AthenaWorkGroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Ref AthenaWorkGroupName
+      Description: Amazon Quick governance - queries issued by the Quick data source.
+      State: ENABLED
+      WorkGroupConfiguration:
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetricsEnabled: true
+        EngineVersion:
+          SelectedEngineVersion: 'Athena engine version 3'
+        ResultConfiguration:
+          OutputLocation: !Sub 's3://${QueryResultsBucket}/'
+          EncryptionConfiguration:
+            EncryptionOption: SSE_S3
+      Tags:
+        - Key: Purpose
+          Value: !Ref ResourcePrefix
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ----- Quick data source (Athena) --------------------------------------------
+
+  QuickDataSource:
+    Type: AWS::QuickSight::DataSource
+    Properties:
+      AwsAccountId: !Ref 'AWS::AccountId'
+      DataSourceId: !Sub '${ResourcePrefix}-athena'
+      Name: Quick governance (Athena)
+      Type: ATHENA
+      DataSourceParameters:
+        AthenaParameters:
+          WorkGroup: !Ref AthenaWorkGroup
+      SslProperties:
+        DisableSsl: false
+      Permissions:
+        - Principal: !Ref QuickPrincipalArn
+          Actions:
+            - quicksight:DescribeDataSource
+            - quicksight:DescribeDataSourcePermissions
+            - quicksight:PassDataSource
+            - quicksight:UpdateDataSource
+            - quicksight:DeleteDataSource
+            - quicksight:UpdateDataSourcePermissions
+      Tags:
+        - Key: Purpose
+          Value: !Ref ResourcePrefix
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ----- Quick service role access (replaces the console step) -----------------
+  # The console's "AWS resources" page only attaches an S3 policy
+  # (s3:ListBucket + s3:GetObject/GetObjectVersion on the ticked buckets) and
+  # AWSQuicksightAthenaAccess to this role. This inline policy grants the same
+  # capability scoped to the resources created here. The console page does not
+  # display grants it did not create, so the bucket will not appear ticked -
+  # access works regardless. Lake Formation-governed data needs LF grants.
+
+  QuickServiceRoleAccess:
+    Type: AWS::IAM::Policy
+    Condition: GrantQuickServiceRole
+    Properties:
+      PolicyName: !Sub '${ResourcePrefix}-quick-service-role-access'
+      Roles: [!Ref QuickServiceRoleName]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: ReadAnalyticsBucket
+            Effect: Allow
+            Action:
+              - s3:ListBucket
+              - s3:GetBucketLocation
+            Resource: !GetAtt AnalyticsBucket.Arn
+          - Sid: ReadAnalyticsObjects
+            Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:GetObjectVersion
+            Resource: !Sub '${AnalyticsBucket.Arn}/*'
+          # Collector working state (<module>/state/*.json: finding lifecycle,
+          # identity and lineage caches, usage evidence) is not analytics data.
+          # An explicit Deny keeps it unreadable through any Quick data source,
+          # whatever the Allow above or a later grant says.
+          - Sid: DenyCollectorState
+            Effect: Deny
+            Action:
+              - s3:GetObject
+              - s3:GetObjectVersion
+            Resource: !Sub '${AnalyticsBucket.Arn}/*/state/*'
+          - Sid: AthenaResultsBucket
+            Effect: Allow
+            Action:
+              - s3:ListBucket
+              - s3:GetBucketLocation
+              - s3:ListBucketMultipartUploads
+            Resource: !GetAtt QueryResultsBucket.Arn
+          - Sid: AthenaResultsObjects
+            Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+              - s3:AbortMultipartUpload
+              - s3:ListMultipartUploadParts
+            Resource: !Sub '${QueryResultsBucket.Arn}/*'
+          - Sid: AthenaWorkGroup
+            Effect: Allow
+            Action:
+              - athena:StartQueryExecution
+              - athena:StopQueryExecution
+              - athena:GetQueryExecution
+              - athena:BatchGetQueryExecution
+              - athena:GetQueryResults
+              - athena:GetQueryResultsStream
+              - athena:ListQueryExecutions
+              - athena:GetWorkGroup
+            Resource: !Sub 'arn:${AWS::Partition}:athena:${AWS::Region}:${AWS::AccountId}:workgroup/${AthenaWorkGroup}'
+          - Sid: AthenaCatalog
+            Effect: Allow
+            Action:
+              - athena:GetDataCatalog
+              - athena:GetDatabase
+              - athena:GetTableMetadata
+              - athena:ListDatabases
+              - athena:ListTableMetadata
+            Resource: !Sub 'arn:${AWS::Partition}:athena:${AWS::Region}:${AWS::AccountId}:datacatalog/AwsDataCatalog'
+          - Sid: AthenaList
+            Effect: Allow
+            Action:
+              - athena:ListWorkGroups
+              - athena:ListDataCatalogs
+              - athena:ListEngineVersions
+            Resource: '*'
+          - Sid: GlueReadGovernanceDatabase
+            Effect: Allow
+            Action:
+              - glue:GetDatabase
+              - glue:GetDatabases
+              - glue:GetTable
+              - glue:GetTables
+              - glue:GetPartition
+              - glue:GetPartitions
+              - glue:BatchGetPartition
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:catalog'
+              - !Sub 'arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:database/${GlueDatabase}'
+              - !Sub 'arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:table/${GlueDatabase}/*'
+
+Outputs:
+  GlueDatabaseName:
+    Description: Glue database for the governance tables.
+    Value: !Ref GlueDatabase
+    Export:
+      Name: !Sub '${AWS::StackName}-GlueDatabase'
+
+  AthenaWorkGroupName:
+    Description: Athena workgroup used by the Quick data source.
+    Value: !Ref AthenaWorkGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-AthenaWorkGroup'
+
+  QuickDataSourceArn:
+    Description: ARN of the Quick Athena data source (referenced by module datasets).
+    Value: !GetAtt QuickDataSource.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-QuickDataSourceArn'
+
+  AnalyticsBucketName:
+    Description: Shared analytics bucket; pass to modules as AnalyticsBucketName.
+    Value: !Ref AnalyticsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-AnalyticsBucket'
+
+  QueryResultsBucketName:
+    Description: Athena query-results bucket (covered by AWSQuicksightAthenaAccess).
+    Value: !Ref QueryResultsBucket
+
+  ManualStep:
+    Description: Console fallback, only when QuickServiceRoleName is empty or the role name differs.
+    Value: !If
+      - GrantQuickServiceRole
+      - !Sub >-
+        None required: policy ${ResourcePrefix}-quick-service-role-access on role
+        ${QuickServiceRoleName} grants Quick access to ${AnalyticsBucket} and
+        workgroup ${AthenaWorkGroup}. (The Quick console will not show the
+        bucket as ticked; access works regardless.)
+      - !Sub >-
+        Manage Quick -> Security & permissions -> AWS resources -> Manage: enable
+        Amazon Athena and select bucket ${AnalyticsBucket} plus every module-owned
+        data bucket Quick should read.
