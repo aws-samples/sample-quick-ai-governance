@@ -1,5 +1,8 @@
 # Amazon Quick — Dataset Lifecycle Monitor
 
+> [!IMPORTANT]
+> **Sample code — review and adapt before production use.** Not an AWS service and not supported by AWS; see the [repository disclaimer](../README.md#disclaimer).
+
 Fleet-wide visibility into every Amazon Quick dataset — **last sync status with the typed failure
 reason**, **sync duration (last + average, segmented by refresh type)**, and **last observed use
 with an explicit confidence label** — on a native Amazon Quick dashboard, with SNS alerts and alarms
@@ -113,7 +116,7 @@ Storage is deliberately database-free and cost-optimized:
 | Last queried / viewed (higher confidence) | CloudTrail `LookupEvents`: `QueryDatabase`, `GetDashboard`, `GetDashboardEmbedUrl` | Slow loop, incremental | Always-on 90-day Event history; no trail required; ≤2 TPS paced. `QueryDatabase` counts as usage for direct-query datasets only — for SPICE it fires during refresh |
 | SPICE capacity | `DescribeDataSet` (`ConsumedSpiceCapacityInBytes`) | Slow loop | Best-effort; file-upload datasets are not API-describable |
 
-## Semantics the module guarantees
+## Semantics the module implements
 
 **Refresh semantics.** A `FAILED` refresh never overwrites `LastSuccessfulRefreshAt` — Quick keeps
 serving the previous successful SPICE snapshot, so both timestamps are reported. Direct-query

@@ -1,5 +1,8 @@
 # Amazon Quick — Block Sharing
 
+> [!IMPORTANT]
+> **Sample code — review and adapt before production use.** Not an AWS service and not supported by AWS; see the [repository disclaimer](../README.md#disclaimer).
+
 Prevent users in an **Amazon Quick (QuickSight)** Enterprise account from sharing selected assets while still allowing them to create and use those assets. The module creates a Quick **custom permissions profile** with sharing capabilities set to `DENY`, then assigns that profile at account, role, or user scope.
 
 ## Business capability

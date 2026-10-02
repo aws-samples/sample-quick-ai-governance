@@ -1,5 +1,8 @@
 # Amazon Quick — Chat and Feedback Monitor
 
+> [!IMPORTANT]
+> **Sample code — review and adapt before production use.** Not an AWS service and not supported by AWS; see the [repository disclaimer](../README.md#disclaimer).
+
 Monitor **messages sent to Amazon Quick**, the users sending them, the agents and flows being used,
 response outcomes, and **Useful / Not Useful** feedback on a native **Amazon Quick dashboard** fed by
 a field-minimized S3 copy that never contains conversation content — while the full conversation

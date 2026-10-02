@@ -1,5 +1,8 @@
 # Amazon Quick — Governance Analytics Foundation
 
+> [!IMPORTANT]
+> **Sample code — review and adapt before production use.** Not an AWS service and not supported by AWS; see the [repository disclaimer](../README.md#disclaimer).
+
 Shared, once-per-Region prerequisites of the four monitoring modules (Agent Hours, Chat and
 Feedback, Dataset Lifecycle, Orphaned Assets) and their **native Amazon Quick dashboards**: an AWS
 Glue database, an Amazon Athena workgroup with its own query-results bucket, a shared analytics

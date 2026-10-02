@@ -1,5 +1,8 @@
 # Amazon Quick — Orphaned Assets Monitor
 
+> [!IMPORTANT]
+> **Sample code — review and adapt before production use.** Not an AWS service and not supported by AWS; see the [repository disclaimer](../README.md#disclaimer).
+
 Fleet-wide ownership assurance for every Amazon Quick asset — **who owns it, whether those
 owners still exist, and which assets are one departure away from being orphaned** — on a native
 Amazon Quick dashboard, with SNS alerts and alarms for new HIGH findings, over S3 JSONL snapshots that
@@ -65,7 +68,7 @@ analyses, data sources, shared folders, spaces, agents, topics**. Soft-deleted a
 excluded by design. Storage is S3 only — the shared analytics bucket holds the snapshots the
 dashboard queries and the collector's working state; no database, no module-owned buckets.
 
-## Ownership semantics the module guarantees
+## Ownership semantics the module applies
 
 **Owner rule (verified against live permission documents of all eight types).** A grant is an
 *owner* grant if and only if its actions include `quicksight:Update<Type>Permissions` — owner

@@ -1,5 +1,8 @@
 # Amazon Quick — Agent Hours Usage Monitor
 
+> [!IMPORTANT]
+> **Sample code — review and adapt before production use.** Not an AWS service and not supported by AWS; see the [repository disclaimer](../README.md#disclaimer).
+
 Track **Amazon Quick agent-hours usage** — total, per user, per feature, and license-covered vs.
 chargeable — on a native **Amazon Quick dashboard**. The module delivers the `AGENT_HOURS_LOGS`
 vended-log feed into the shared analytics bucket of the

@@ -4,11 +4,19 @@ Deployable, self-contained reference modules for governing [Amazon Quick](https:
 
 Each module is independent: its own [AWS CloudFormation](https://aws.amazon.com/cloudformation/) or [AWS SAM](https://aws.amazon.com/serverless/sam/) template, `apply` / `remove` helper scripts, and a README covering prerequisites, parameters, cost, and teardown. Adopt only what you need, in any order.
 
+> [!WARNING]
+> **Sample code — review and adapt before production use.** The modules in this repository are a
+> reference implementation published to show how an organization can govern Amazon Quick from its own
+> AWS account. They are not an AWS service and are not supported by AWS. Before deploying them where
+> production decisions depend on them, review every IAM policy, encryption setting and template default
+> against your own security, privacy and compliance requirements, and test them in a non-production
+> account first. See [Disclaimer](#disclaimer).
+
 ## Why govern Amazon Quick
 
 Amazon Quick lets teams build custom Chat Agents without code, ask natural-language questions over governed datasets, run deep research, and automate workflows. When that adoption moves from a pilot to hundreds or thousands of users, the question for technology leadership changes from "does it work?" to "how do we scale with cost predictability, data security, and auditability?".
 
-That is the AI governance agenda — and it is not a brake on adoption; it is what makes adoption sustainable. Organizations that can see who consumes what, audit interactions, control how access expands, and guarantee that every answer respects existing data permissions can open the technology to more teams, faster, with less friction with security, privacy, and finance.
+That is the AI governance agenda — and it is not a brake on adoption; it is what makes adoption sustainable. Organizations that can see who consumes what, audit interactions, control how access expands, and keep every answer within the data permissions users already have can open the technology to more teams, faster, with less friction with security, privacy, and finance.
 
 This repository organizes that agenda into five pillars. Pillars 1–4 combine native Amazon Quick controls with the reference modules published here. Pillar 5 is a property of the Amazon Quick architecture itself — no module is required, but it is the most important point to bring to a security review.
 
@@ -175,7 +183,7 @@ What the monitoring modules share, and what they keep:
 
 The five pillars form a simple operating model: the platform team or data center of excellence deploys the monitoring and control modules in the account and Regions where Amazon Quick runs, while data teams keep RLS / CLS and the semantic layer as part of each dataset's design.
 
-1. **Pillars 1 and 5 first** — consumption under control, and data permissions guaranteed from the first agent in production.
+1. **Pillars 1 and 5 first** — consumption under control, and RLS / CLS defined on the datasets before the first agent reaches production, so answers are limited to what each user is already permitted to see.
 2. **Pillar 2 early** — log delivery is not retroactive, so start it before you need the history.
 3. **Pillars 3 and 4** as the number of creators and datasets grows.
 
@@ -196,6 +204,19 @@ Operating cost is on the order of a few US dollars per month for the whole estat
 ├── governance-orphaned-assets-monitor/     Pillar 4 · AWS SAM (Python Lambda)
 └── governance-analytics-foundation/        shared · CloudFormation (prerequisite of the four monitoring modules)
 ```
+
+## Disclaimer
+
+**This repository is sample code, published for reference and evaluation. It is not an AWS service and it is not supported by AWS. You use it at your own risk, and you remain responsible for the governance decisions you make with the data it produces.**
+
+Before relying on any module where production decisions depend on it:
+
+- **You own the security review.** The templates configure IAM roles and policies, KMS encryption, S3 bucket policies and lifecycle rules, Lambda functions and log deliveries. Each module README describes those controls so you can check them against your own requirements; that description is not a compliance claim, and none of it has been assessed against any framework. Review every policy and default — in particular the grant to the Amazon Quick service role, the KMS key policy of the Chat and Feedback log group, and the retention periods — and adapt them to your account.
+- **Test in a non-production account first.** The modules read Amazon Quick vended logs and APIs and, in two cases, make scoped write calls (assigning a custom-permissions profile, renaming spreadsheet datasets). Deploy with the defaults in a sandbox account, confirm the dashboards, alerts and automations behave as you expect, then promote the templates through your own change process.
+- **Governance signals, not verdicts.** The monitors report evidence with its source and confidence (for example "last observed use" or "probable deletion of an owner"). Ownership transfers, access revocations and asset deletions remain human decisions; the modules never perform them.
+- **You own the cost.** Vended-log delivery, S3, Athena, CloudWatch Logs, alarms and Lambda are billed to your account; Amazon Quick is priced per user independently of this repository. The [Cost](#cost) section and each module README give the drivers and defaults.
+- **Privacy and legal.** Conversation content stays in a KMS-encrypted log group and is excluded from the dashboards by default. Involve your privacy and legal teams before widening who can read that content, and before using any of these signals in decisions about individual users.
+- **No warranty of any kind.** See [LICENSE](LICENSE).
 
 ## Security
 

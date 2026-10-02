@@ -1,5 +1,8 @@
 # Amazon Quick — Spreadsheet File Rename
 
+> [!IMPORTANT]
+> **Sample code — review and adapt before production use.** Not an AWS service and not supported by AWS; see the [repository disclaimer](../README.md#disclaimer).
+
 Automatically prefix the name of any **Amazon Quick (QuickSight) dataset created from an uploaded
 spreadsheet** (Microsoft Excel `.xlsx` by default) so it becomes **`xls-<original name>`**. Zero
 change to the upload experience — users upload as usual, and the dataset is renamed within seconds.
