@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1400" height="816" viewBox="0 0 1400 816" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">
   <title>Amazon Quick AI governance: five pillars, reference modules and native controls</title>
-  <desc>Four pillars (Consumption, Interactions, Sharing, Data asset lifecycle) each combine a reference module from this repository with native Amazon Quick controls. A fifth pillar, data security in agent access, is a native capability of the service and needs no module. Everything rests on the Amazon Quick service layer.</desc>
+  <desc>Three pillars (Consumption, Interactions, Data asset lifecycle) each combine a reference module from this repository with native Amazon Quick controls. Two pillars, Sharing and data security in agent access, are native capabilities of the service and need no module. Everything rests on the Amazon Quick service layer.</desc>
   <defs>
     <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
       <stop offset="0" stop-color="#FAFBFC"/>
@@ -19,7 +19,7 @@
 
   <!-- Title -->
   <text x="60" y="52" font-size="26" font-weight="700" fill="#232F3E">Amazon Quick — AI governance in five pillars</text>
-  <text x="60" y="78" font-size="15" fill="#545B64">Pillars 1–4 combine a reference module from this repository with the controls Amazon Quick provides natively. Pillar 5 is a property of the service itself.</text>
+  <text x="60" y="78" font-size="15" fill="#545B64">Pillars 1, 2 and 4 combine a reference module from this repository with the controls Amazon Quick provides natively. Pillars 3 and 5 are native to the service — no module.</text>
 
   <!-- Row labels -->
   <g font-size="12" font-weight="600" fill="#545B64" text-anchor="end">
@@ -83,19 +83,19 @@
     <text x="923" y="133" font-size="15" font-weight="700" fill="#232F3E" text-anchor="middle">3 · Sharing</text>
     <text x="923" y="170" font-size="12" fill="#545B64" text-anchor="middle">Who may expand access to an asset, and how?</text>
 
-    <rect x="788" y="186" width="270" height="176" rx="8" fill="#FFFFFF" stroke="#FF9900" stroke-width="2" filter="url(#shadow)"/>
-    <text x="804" y="214" font-size="15" font-weight="700" fill="#232F3E">Block Sharing</text>
-    <text x="804" y="238" font-size="12" fill="#545B64">Custom permissions profile that</text>
-    <text x="804" y="256" font-size="12" fill="#545B64">denies sharing of Chat Agents, Spaces</text>
-    <text x="804" y="274" font-size="12" fill="#545B64">and Datasets (optionally dashboards,</text>
-    <text x="804" y="292" font-size="12" fill="#545B64">analyses, data sources), assigned at</text>
-    <text x="804" y="310" font-size="12" fill="#545B64">account, role or user scope.</text>
-    <rect x="804" y="330" width="190" height="22" rx="11" fill="#FFF4E5"/>
-    <text x="899" y="345" font-size="11" font-weight="600" fill="#8D6605" text-anchor="middle">CloudFormation + Quick APIs</text>
+    <rect x="788" y="186" width="270" height="176" rx="8" fill="#E9F5EC" stroke="#1D8102" stroke-width="2" filter="url(#shadow)"/>
+    <text x="804" y="214" font-size="15" font-weight="700" fill="#232F3E">No module needed</text>
+    <text x="804" y="238" font-size="12" fill="#3A4750">A custom permissions profile denies</text>
+    <text x="804" y="256" font-size="12" fill="#3A4750">sharing of Chat Agents, Spaces and</text>
+    <text x="804" y="274" font-size="12" fill="#3A4750">Datasets by account, role or user;</text>
+    <text x="804" y="292" font-size="12" fill="#3A4750">approval policies send share requests</text>
+    <text x="804" y="310" font-size="12" fill="#3A4750">to approver groups for review.</text>
+    <rect x="804" y="330" width="196" height="22" rx="11" fill="#D6EFDA"/>
+    <text x="902" y="345" font-size="11" font-weight="600" fill="#1D8102" text-anchor="middle">Native capability · no module</text>
 
     <rect x="788" y="400" width="270" height="120" rx="8" fill="#F7F8FA" stroke="#AAB7B8" stroke-width="1.5" stroke-dasharray="6 4"/>
-    <text x="804" y="428" font-size="14" font-weight="700" fill="#232F3E">Custom permissions and</text>
-    <text x="804" y="446" font-size="14" font-weight="700" fill="#232F3E">approval workflows</text>
+    <text x="804" y="428" font-size="14" font-weight="700" fill="#232F3E">Custom permissions, deny by</text>
+    <text x="804" y="446" font-size="14" font-weight="700" fill="#232F3E">default, approval workflows</text>
     <text x="804" y="470" font-size="12" fill="#545B64">Allow, require approval, or deny —</text>
     <text x="804" y="488" font-size="12" fill="#545B64">per asset type and population.</text>
   </g>
@@ -128,7 +128,7 @@
     <rect x="216" y="548" width="1128" height="112" rx="8" fill="#E9F5EC" stroke="#1D8102" stroke-width="2" filter="url(#shadow)"/>
     <text x="232" y="578" font-size="15" font-weight="700" fill="#232F3E">5 · Data security in agent access — permissions inherited end to end</text>
     <text x="232" y="604" font-size="12" fill="#3A4750">Every answer is generated in the asking user's context and inherits the dataset permissions: RLS / CLS evaluated per user through the semantic layer.</text>
-    <text x="232" y="624" font-size="12" fill="#3A4750">DLP with Microsoft Purview governs unstructured content. The security rule is defined once, at the data layer, and holds for dashboards, questions and agents.</text>
+    <text x="232" y="624" font-size="12" fill="#3A4750">DLP with Microsoft Purview governs unstructured content. The security rule is defined once, at the data layer, and holds for dashboards, questions, agents and apps.</text>
     <rect x="1132" y="568" width="196" height="22" rx="11" fill="#D6EFDA"/>
     <text x="1230" y="583" font-size="11" font-weight="600" fill="#1D8102" text-anchor="middle">Native capability · no module</text>
   </g>

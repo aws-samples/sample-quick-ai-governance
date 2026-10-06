@@ -7,7 +7,7 @@ Shared, once-per-Region prerequisites of the four monitoring modules (Agent Hour
 Feedback, Dataset Lifecycle, Orphaned Assets) and their **native Amazon Quick dashboards**: an AWS
 Glue database, an Amazon Athena workgroup with its own query-results bucket, a shared analytics
 bucket that modules deliver into under per-module prefixes, and one Amazon Quick data source
-(Athena). Deploy it first; Block Sharing and Spreadsheet File Rename do not need it.
+(Athena). Deploy it first; Spreadsheet File Rename does not need it.
 
 ## Module layout
 

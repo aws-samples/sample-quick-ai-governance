@@ -9,13 +9,15 @@
 #   * Amazon Quick data source (Athena) owned by --quick-principal-arn
 #
 # Deploy once per Region BEFORE the monitoring modules (Agent Hours, Chat and
-# Feedback, Dataset Lifecycle, Orphaned Assets); Block Sharing and Spreadsheet
-# File Rename do not need this stack.
+# Feedback, Dataset Lifecycle, Orphaned Assets); Spreadsheet File Rename does
+# not need this stack.
 #
-# After deployment, one manual console step is required (no API exists):
-#   Manage Quick -> Security & permissions -> AWS resources -> Manage:
-#   enable Amazon Athena and select the analytics bucket plus every
-#   module-owned data bucket Quick should read.
+# No console step is needed by default: the stack attaches a scoped policy to
+# Quick's service role (--quick-service-role) so Quick can read the analytics
+# bucket, use the workgroup and read the Glue database. Only when that grant is
+# skipped (--quick-service-role "" -- Lake Formation accounts or a custom Quick
+# role) tick the analytics bucket on Manage Quick -> Security & permissions ->
+# AWS resources, as described in the module README.
 #
 # Usage examples:
 #

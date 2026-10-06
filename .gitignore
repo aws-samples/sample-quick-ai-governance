@@ -3,8 +3,7 @@
 #
 # Ignore rules covering every module in this repository:
 #   * Bash helper scripts + CloudFormation templates
-#       governance-agent-hours-monitor, governance-chat-feedback-monitor,
-#       governance-block-sharing
+#       governance-agent-hours-monitor, governance-chat-feedback-monitor
 #   * AWS SAM templates + Python Lambda sources
 #       governance-spreadsheet-file-rename, governance-dataset-lifecycle-monitor
 #
