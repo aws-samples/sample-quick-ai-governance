@@ -58,11 +58,12 @@
 #                             '/aws/vendedlogs/quick/chat-feedback', the Chat
 #                             and Feedback Monitor default; '' disables)
 #   --spice-rate              USD per SPICE GB-month for the estimate (default 0.38)
-#   --unused-threshold-days   no-observed-use threshold (default 30)
+#   --unused-threshold-days   no-observed-use threshold (default 60)
 #   --log-retention-days      CloudWatch Logs retention of the collector's own log group (default 90)
 #   --foundation-stack        Analytics Foundation stack name (default quick-governance-analytics-foundation);
 #                             its bucket receives snapshots and state under dataset-lifecycle/
 #   --skip-dashboard          deploy the module stack only, not its AWS Quick dashboard
+#   --no-execute              create the change set and stop before executing it
 
 set -euo pipefail
 
@@ -77,10 +78,11 @@ SLOW_SCHEDULE="cron(15 3 * * ? *)"
 ENABLE_CLOUDTRAIL="true"
 CHAT_LOG_GROUP="/aws/vendedlogs/quick/chat-feedback"
 SPICE_RATE="0.38"
-UNUSED_THRESHOLD_DAYS="30"
+UNUSED_THRESHOLD_DAYS="60"
 LOG_RETENTION_DAYS="90"
 FOUNDATION_STACK="quick-governance-analytics-foundation"
 SKIP_DASHBOARD="false"
+NO_EXECUTE="false"
 
 # Resolve script dir so we can locate ../cloudformation regardless of cwd
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
@@ -115,6 +117,7 @@ while [[ $# -gt 0 ]]; do
     --log-retention-days)       LOG_RETENTION_DAYS="$2";       shift 2 ;;
     --foundation-stack)         FOUNDATION_STACK="$2";         shift 2 ;;
     --skip-dashboard)           SKIP_DASHBOARD="true";         shift ;;
+    --no-execute)               NO_EXECUTE="true";             shift ;;
     -h|--help)                  usage ;;
     *) err "Unknown argument: $1" ;;
   esac
@@ -153,6 +156,12 @@ sam build \
   --template-file "$TEMPLATE" \
   --build-dir "$BUILD_DIR" > /dev/null
 
+EXECUTE_ARGS=()
+if [[ "$NO_EXECUTE" == "true" ]]; then
+  EXECUTE_ARGS=(--no-execute-changeset)
+  log "Change set only (--no-execute): review it, then execute the change set."
+fi
+
 sam deploy \
   --template-file "$BUILD_DIR/template.yaml" \
   --stack-name "$STACK_NAME" \
@@ -161,6 +170,7 @@ sam deploy \
   --resolve-s3 \
   --no-confirm-changeset \
   --no-fail-on-empty-changeset \
+  ${EXECUTE_ARGS[@]+"${EXECUTE_ARGS[@]}"} \
   --tags "Purpose=$RESOURCE_PREFIX" "ManagedBy=SAM" \
   --parameter-overrides \
       "ResourcePrefix=\"$RESOURCE_PREFIX\"" \
@@ -173,6 +183,11 @@ sam deploy \
       "UnusedThresholdDays=\"$UNUSED_THRESHOLD_DAYS\"" \
       "LogRetentionDays=\"$LOG_RETENTION_DAYS\"" \
       "AnalyticsBucketName=\"$ANALYTICS_BUCKET\""
+
+if [[ "$NO_EXECUTE" == "true" ]]; then
+  log "Change set created, nothing executed."
+  exit 0
+fi
 
 # ---------- report outputs ----------
 log "Stack outputs:"

@@ -94,12 +94,13 @@ Parameters:
 
   UnusedThresholdDays:
     Type: Number
-    Default: 30
+    Default: 60
     MinValue: 1
     MaxValue: 455
     Description: >
-      Days without observed use before a referenced dataset is counted in the
-      NO_OBSERVED_USE finding and the NoObservedUseDatasets KPI.
+      Days without observed use before a dataset or dashboard is IDLE, when the
+      evidence covers the whole window and the asset is older than it. The
+      dashboard can also show 30, 90 or 180 from its own control.
 
   IngestionLookbackRuns:
     Type: Number
@@ -243,6 +244,7 @@ Resources:
                 Action:
                   - quicksight:DescribeDataSet
                   - quicksight:ListIngestions
+                  - quicksight:ListRefreshSchedules
                 Resource: !Sub 'arn:${AWS::Partition}:quicksight:${AWS::Region}:${AWS::AccountId}:dataset/*'
               - Sid: QuickSightDashboardRead
                 Effect: Allow
@@ -287,7 +289,9 @@ Resources:
                 Effect: Allow
                 Action:
                   - s3:GetObject
-                Resource: !Sub 'arn:${AWS::Partition}:s3:::${AnalyticsBucketName}/dataset-lifecycle/state/*'
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:s3:::${AnalyticsBucketName}/dataset-lifecycle/state/*'
+                  - !Sub 'arn:${AWS::Partition}:s3:::${AnalyticsBucketName}/orphaned-assets/latest-ownership.jsonl'
               # ListBucket is what turns a missing state file into NoSuchKey
               # (first run) instead of AccessDenied; key names only.
               - Sid: SharedBucketList
