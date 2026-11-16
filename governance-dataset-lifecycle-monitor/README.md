@@ -72,10 +72,11 @@ governance-dataset-lifecycle-monitor/
         |   fleet KPI metrics (15 names)  ->  CloudWatch metrics QuickGovernance/DatasetLifecycle (alarms)
         |   alert on NEW failure          ->  SNS (optional, deduplicated)
         +---------------------------------------------+
-                              |  Glue tables dataset_lifecycle_fast / _slow · Athena (Direct Query)
+                              |  Glue tables fast, slow, dashboards, schedules · Athena (Direct Query)
                               v
                  AWS QUICK DASHBOARD (companion stack)
-                  - Overview · Refresh health · Usage · Capacity and cost · History
+                  - Overview · Refresh health · Refresh plan · Usage
+                    · Dashboards · Capacity and cost · History
 ```
 
 Storage is deliberately database-free and cost-optimized:
@@ -112,8 +113,10 @@ Storage is deliberately database-free and cost-optimized:
 | Topic→dataset lineage | `ListTopicsV2` (fallback `ListTopics`) + `DescribeTopicV2` (fallback `DescribeTopic`), plus topics referenced by spaces | Slow loop | New-experience topics are invisible to the legacy APIs; failures downgrade to warnings |
 | Space→dataset and Space→Chat Agent lineage | `ListSpaces` + `ListSpaceResources` (`DATA_SET` / `TOPIC` members) + `ListAgents` + `DescribeAgent` (`Spaces`) | Slow loop | Agents reach datasets only through spaces; feature-detected — requires a botocore with the Space/Agent APIs, otherwise last known state is reused with a warning |
 | Agent citations, chat selections, and conversations | Logs Insights on the `CHAT_LOGS` log group (Pillar 2 module) | Slow loop, incremental | `cited_resource` + `user_selected_resources` + last conversation per agent (joined with lineage into `AGENT_CONVERSATION_SCOPE`); ≤10,000 messages per scan; skipped if the log group is absent |
-| Last dashboard view | `GetMetricData` on `DashboardViewCount` per `DashboardId` | Slow loop | 90-day pass, then 15-month pass for silent dashboards |
-| Last queried / viewed (higher confidence) | CloudTrail `LookupEvents`: `QueryDatabase`, `GetDashboard`, `GetDashboardEmbedUrl` | Slow loop, incremental | Always-on 90-day Event history; no trail required; ≤2 TPS paced. `QueryDatabase` counts as usage for direct-query datasets only — for SPICE it fires during refresh |
+| Last dashboard view | `GetMetricData` on `DashboardViewCount` per `DashboardId` | Slow loop | One 455-day pass: last view, views in 30, 60 and 90 days, and the same 90 days a year earlier |
+| Refresh schedules | `ListRefreshSchedules` per SPICE dataset | Slow loop | Paced like `ListIngestions`. One row per schedule and one row per planned run in the next 7 days |
+| Refresh count, 30 days | `GetMetricData` on `IngestionInvocationCount` per `DatasetId` | Slow loop | Scheduled and manual together. The metric has no source dimension |
+| Last queried / viewed (higher confidence) | CloudTrail `LookupEvents`: `QueryDatabase`, `GetDashboard`, `GetDashboardEmbedUrl` | Slow loop, incremental | Always-on 90-day Event history; no trail required; ≤2 TPS paced. A SPICE `QueryDatabase` event inside that dataset's refresh window does not count as use |
 | SPICE capacity | `DescribeDataSet` (`ConsumedSpiceCapacityInBytes`) | Slow loop | Best-effort; file-upload datasets are not API-describable |
 
 ## Semantics the module implements
@@ -129,7 +132,7 @@ datasets never get SPICE refresh semantics (`lastStatus: NOT_APPLICABLE`).
 |---|---|---|
 | A Chat Agent answer cited the dataset (`CHAT_LOGS`) | High | `AGENT_CITED_DATASET` |
 | CloudTrail `QueryDatabase` naming a **direct-query** dataset | High | `CLOUDTRAIL_QUERY` |
-| CloudTrail `QueryDatabase` naming a **SPICE** dataset (interactive query, session prewarm, or refresh — indistinguishable in the event) | Medium | `CLOUDTRAIL_QUERY` |
+| CloudTrail `QueryDatabase` naming a **SPICE** dataset outside that dataset's own refresh | Medium | `CLOUDTRAIL_QUERY` |
 | An agent cited a topic containing the dataset, used a space containing it, or a user selected the dataset in chat | Medium | `AGENT_CITED_TOPIC` / `AGENT_USED_SPACE` / `AGENT_SELECTED_RESOURCE` |
 | A conversation ran on an agent that can reach the dataset — CHAT_LOGS × agent→space→dataset lineage; scope-level, not query proof | Medium (agent scope ≤ `AgentScopeMediumMax` datasets) · Low (broader scope) | `AGENT_CONVERSATION_SCOPE` |
 | A dashboard that uses the dataset was viewed (metric, CloudTrail, or agent citation) | Medium | `DASHBOARD_VIEW_METRIC` / `DASHBOARD_VIEW_CLOUDTRAIL` / `AGENT_CITED_DASHBOARD` |
@@ -137,8 +140,12 @@ datasets never get SPICE refresh semantics (`lastStatus: NOT_APPLICABLE`).
 | No references, no events | No evidence | — (`usageConfidence: NO_EVIDENCE`) |
 
 Nuances verified empirically: CloudTrail `QueryDatabase` fires for direct-query datasets when
-they are queried (High), and for SPICE datasets on refreshes *and* service-initiated interactive
-queries (session prewarm) — indistinguishable in the event, hence Medium. Topics are listed with
+they are queried (High). For SPICE it also fires during a refresh. An event whose time falls
+inside that dataset's ingestion, from 120 seconds before `CreatedTime` until the duration plus
+120 seconds (or until the scan, when the duration is missing), does not count as use. Outside
+that window the event stays Medium, because a person and a refresh can still look alike.
+The event's `resourceId` names the dashboard or analysis behind the query when it carries one.
+Topics are listed with
 the **V2 topic APIs** first: topics created in the new Quick experience are invisible to the
 legacy `ListTopics` / `DescribeTopic` ("use new versions of Topic APIs"), and topics referenced
 by spaces are described even when no listing returns them. Agent citations of documents and
@@ -178,9 +185,48 @@ the `findings` array or the flat `findingsCsv` string):
 lookback window), `SPICE_DATASET_NOT_REFERENCED` (in no dashboard, no topic, *and* no space),
 `NO_OBSERVED_USE`, `SCAN_INCOMPLETE`.
 
+## States, schedules and dashboard records
+
+**State.** A dataset or a dashboard is ACTIVE when its last evidence is inside the window
+(`UnusedThresholdDays`, 60 by default). An event exactly that many days ago is still inside.
+It is IDLE when there is no such evidence, the evidence covers the whole window, and the asset
+is older than the window. An asset created exactly that many days ago is not old enough.
+Otherwise it is UNKNOWN, and the record says whether the coverage is short or the asset is new,
+plus the date to re-check. The dashboard control (30, 60, 90, 180) recalculates the current
+tabs from the timestamps. The history line keeps the state stored at scan time.
+`NO_OBSERVED_USE` means the same thing as IDLE at the module window.
+
+**Schedules.** The slow loop reads `ListRefreshSchedules` for every SPICE dataset. The plain-words
+definition, the next run and the runs in the next 7 days come from the interval, the time of day,
+the time zone and the day. Assumptions:
+
+- 15-minute, 30-minute and hourly schedules have no minute in the API. The minute comes from the
+  newest SCHEDULED ingestion. With none, the label says "within" that interval and no concrete
+  runs are written. The 24-hour and 7-day counts still use the runs per day, so the count does
+  not drop to zero.
+- Times are computed in the schedule's zone and stored in UTC. A local time that falls in a
+  daylight-saving gap moves to the next real minute. An ambiguous time uses the first one.
+- An unknown time zone does not fail the scan. That schedule has no next run and no planned rows,
+  and the row stays, with a label that says the zone is unknown.
+- A failed schedule read or a failed 30-day refresh-count read is left empty, not stored as zero.
+  That dataset is left out of "with a schedule" and "without a schedule". The manual-refresh
+  total for that scan is blank, not zero.
+- No run is planned before `StartAfterDateTime`. `LAST_DAY_OF_MONTH` is the last day of that
+  month in that zone. Manual and API refreshes are never planned.
+- The refresh window kept in `dataset-lifecycle/state/ingestion-windows.json` is what the next
+  run uses, so a run does not page a dataset's full ingestion history. The first pass pages back
+  through the CloudTrail lookback (capped at 120 pages, enough for 90 days of a 15-minute schedule).
+- "Manual refreshes in the last 30 days" is the ingestion-count metric for SPICE datasets that
+  have no schedule. With a schedule, the metric cannot split manual from scheduled.
+
+**Dashboards.** One record per dashboard per scan, including the governance dashboards. Views come
+from `DashboardViewCount`. CloudTrail `GetDashboard` is the other last-view source. A dashboard
+with no view in the metric history is labelled with the history start. Tombstones
+(`assetState: DELETED`) are re-emitted for the retention window, the same way deleted datasets are.
+
 ## Dashboard tour
 
-See [AWS Quick dashboard](#aws-quick-dashboard) below for the five tabs. Two things hold on every
+See [AWS Quick dashboard](#aws-quick-dashboard) below for the seven tabs. Two things hold on every
 tab: the typed failure reasons come straight from the
 [SPICE ingestion error codes](https://docs.aws.amazon.com/quick/latest/userguide/errors-spice-ingestion.html),
 and usage evidence is a **signal with a confidence label, never a verdict** — the how-to note on the
@@ -205,9 +251,11 @@ buckets of its own**:
 | Prefix | Content | Read by |
 |---|---|---|
 | `dataset-lifecycle/fast/dt=<date>/run-<time>.jsonl` | One record per dataset per fast run (sync health) | Glue table `dataset_lifecycle_fast`; Athena, Grafana, Datadog |
-| `dataset-lifecycle/slow/dt=<date>/run-<time>.jsonl` | One record per dataset per slow run (usage, lineage, capacity) | Glue table `dataset_lifecycle_slow` |
-| `dataset-lifecycle/latest-fast.jsonl`, `latest-slow.jsonl` | Rolling copies of the last runs | convenience for external tools |
-| `dataset-lifecycle/state/` | alert dedupe, known datasets, lineage caches, agent scope, usage evidence | the collector only |
+| `dataset-lifecycle/slow/dt=<date>/run-<time>.jsonl` | One record per dataset per slow run (usage, lineage, capacity, state) | Glue table `dataset_lifecycle_slow` |
+| `dataset-lifecycle/dashboards/dt=<date>/run-<time>.jsonl` | One record per dashboard per slow run, plus tombstones for deleted dashboards | Glue table `dataset_lifecycle_dashboards` |
+| `dataset-lifecycle/schedules/dt=<date>/run-<time>.jsonl` | One row per refresh schedule and one row per planned run in the next 7 days | Glue table `dataset_lifecycle_schedules` |
+| `dataset-lifecycle/latest-fast.jsonl`, `latest-slow.jsonl`, `latest-dashboards.jsonl`, `latest-schedules.jsonl` | Rolling copies of the last runs | convenience for external tools |
+| `dataset-lifecycle/state/` | alert dedupe, known datasets and dashboards, lineage caches, ingestion windows, agent scope, usage evidence | the collector only |
 
 The state prefix sits outside the Glue table locations, the foundation's lifecycle rules never expire it
 (snapshots expire after the foundation's `AnalyticsExpirationDays`), and the foundation's grant to
@@ -232,9 +280,11 @@ delete all versions).
 ## AWS Quick dashboard
 
 `cloudformation/governance-dataset-lifecycle-quick-dashboard.yaml` builds a native AWS Quick dashboard over the S3 snapshots: Glue
-table(s) over the partitioned snapshot prefix (`dataset_lifecycle_fast` for refresh health, `dataset_lifecycle_slow` for usage, lineage and capacity), Direct Query datasets whose SQL keeps the
-latest scan per dataset (`row_number() over (partition by … order by ts desc)`) plus a history dataset,
-and a five-tab administrator dashboard. The module's apply script deploys it after the module stack;
+table(s) over the partitioned snapshot prefixes (`dataset_lifecycle_fast`, `dataset_lifecycle_slow`,
+`dataset_lifecycle_dashboards`, `dataset_lifecycle_schedules`), Direct Query datasets whose SQL keeps the
+latest scan per dataset (`row_number() over (partition by … order by ts desc)`) plus a refresh history
+dataset and an idle-history dataset,
+and a seven-tab administrator dashboard. The module's apply script deploys it after the module stack;
 on its own:
 
 ```bash
@@ -245,15 +295,26 @@ cd scripts
 
 | Tab | What it shows |
 |---|---|
-| Overview | Datasets, SPICE / direct query, FAILED last refresh, unreferenced SPICE datasets, referenced with no observed use, SPICE GB and estimated monthly cost; datasets by refresh status and by usage confidence; currently FAILED datasets with reason; a how-to note on reading usage evidence |
+| Overview | Datasets, SPICE and direct query, FAILED last refresh, SPICE consumed and estimated cost, idle and unknown datasets, idle dashboards, refreshes in the next 24 hours, SPICE datasets without a schedule, and the last scan. The how-to note states the three states, the window and the retire order: dashboards first, then the datasets they leave unused |
 | Refresh health | FAILED datasets with typed reason, slowest SPICE datasets (average vs last, full vs incremental, rows), average duration by dataset, refresh state of every dataset |
-| Usage | Unreferenced datasets (cost vs evidence), least recently used referenced datasets with confidence and source, datasets with no usage evidence, reference state × confidence |
-| Capacity and cost | Largest SPICE datasets with estimated cost, cost by dataset, SPICE GB by confidence × reference state |
-| History | Datasets in FAILED state per hourly scan, records per day by status, and the failure feed |
+| Refresh plan | Which SPICE datasets have a schedule, the next run in plain words, planned refreshes by hour and by day, and the SPICE datasets refreshed only by hand or by API |
+| Usage | Active, idle and unknown counts, every dataset stalest first with the evidence behind the state, idle datasets nothing depends on, and datasets that are not old enough or not covered for long enough yet |
+| Dashboards | Every dashboard, least recently viewed first, and the idle dashboards whose same 90 days a year earlier also had no views |
+| Capacity and cost | Largest SPICE datasets with their state, estimated cost by dataset, SPICE GB by confidence and reference state |
+| History | Datasets in FAILED state per hourly scan, records per day by status, the failure feed, and idle datasets and idle dashboards per daily scan |
 
-Controls (date range on the history tab, import mode, dataset) live in the collapsible control bar. The datasets
+Controls (Idle after, date range on the history tab, import mode, dataset, and on Refresh plan the refresh type and data source) live in the collapsible control bar. The datasets
 are Direct Query: every load reads the latest snapshots through Athena, so the dashboard is as fresh as
-the last scan with no SPICE and no refresh schedule. Usage evidence is a signal with a confidence label, never a verdict: no dataset should be deleted on this dashboard alone.
+the last scan with no SPICE and no refresh schedule. Usage evidence is a signal with a confidence label, never a verdict: no dataset should be retired on this dashboard alone.
+
+**Upgrading from the previous Dataset Lifecycle dashboard.** Re-apply the Analytics Foundation first,
+so the new `dataset-lifecycle/dashboards/` and `dataset-lifecycle/schedules/` prefixes expire with the
+other data prefixes. Then re-apply this module. `UnusedThresholdDays` now defaults to 60 (it was 30);
+the apply script sends 60 unless you pass `--unused-threshold-days`. The Usage tab no longer has
+"Unreferenced datasets", "Least recently used", "No usage evidence" or "Datasets by reference state
+and confidence". Those rows are in "All datasets", "Retire candidates" and "Not enough history yet".
+Overview no longer has the "Referenced, no observed use" KPI; it has "Idle datasets". Run the slow
+loop once after the deploy so the new tables have rows.
 
 ## Parameters
 
@@ -268,7 +329,7 @@ the last scan with no SPICE and no refresh schedule. Usage evidence is a signal 
 | `ChatLogGroupName` | `/aws/vendedlogs/quick/chat-feedback` | `CHAT_LOGS` log group (Pillar 2 module) scanned for agent-citation evidence. Skipped with a warning if absent; empty disables. |
 | `AgentScopeMediumMax` | `10` | `AGENT_CONVERSATION_SCOPE` is Medium when the conversing agent can reach at most this many datasets, Low above it. |
 | `SpiceRatePerGBMonth` | `0.38` | USD rate for the estimated cost signal (example us-east-1 rate — adjust per Region/agreement). |
-| `UnusedThresholdDays` | `30` | Days without evidence before `NO_OBSERVED_USE`. |
+| `UnusedThresholdDays` | `60` | Days without evidence before a dataset or dashboard is IDLE, when coverage is complete and the asset is older than the window. The dashboard control can also show 30, 90 or 180. |
 | `IngestionLookbackRuns` | `50` | Newest ingestions per dataset for averages. |
 | `CloudTrailLookbackDays` | `90` | First-scan Event history lookback (max 90). |
 | `LogRetentionDays` | `90` | Retention of the collector's own Lambda log group. |
@@ -316,7 +377,7 @@ Open the dashboard via the `DashboardUrl` output of the dashboard stack (printed
 
 - Collector permissions are read-only towards Quick (`ListDataSets`, `ListDashboards`,
   `ListTopics`, `ListTopicsV2`, `ListSpaces`, `ListSpaceResources`, `ListAgents`,
-  `ListIngestions`, `DescribeDataSet`, `DescribeDashboard`, `DescribeTopic`, `DescribeTopicV2`,
+  `ListIngestions`, `ListRefreshSchedules`, `DescribeDataSet`, `DescribeDashboard`, `DescribeTopic`, `DescribeTopicV2`,
   `DescribeAgent`) plus
   `cloudwatch:GetMetricData`, `cloudtrail:LookupEvents`, Logs Insights read on the `CHAT_LOGS`
   log group when `ChatLogGroupName` is set (`logs:StartQuery` scoped to that group), scoped
