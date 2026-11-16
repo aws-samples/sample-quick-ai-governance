@@ -2,7 +2,7 @@
 #
 # remove-governance-spreadsheet-file-rename.sh
 #
-# Thin wrapper around "sam delete" — tears down the Amazon Quick spreadsheet-file
+# Thin wrapper around "sam delete" — tears down the AWS Quick spreadsheet-file
 # auto-rename stack created by apply-governance-spreadsheet-file-rename.sh.
 #
 # Deletes the CloudFormation stack (Lambda, IAM role/policy, EventBridge rule,

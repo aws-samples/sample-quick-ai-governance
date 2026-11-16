@@ -1,6 +1,6 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
-  Amazon Quick dataset lifecycle monitor - native Amazon Quick dashboard for
+  AWS Quick dataset lifecycle monitor - native AWS Quick dashboard for
   administrators. Glue tables over the fast (refresh health) and slow (usage,
   lineage, capacity) snapshots the module writes to S3, current-state datasets
   (latest run per dataset) plus a refresh history dataset, and a five-tab
@@ -383,7 +383,7 @@ Resources:
     Properties:
       AwsAccountId: !Ref 'AWS::AccountId'
       DashboardId: !Sub '${ResourcePrefix}-dashboard'
-      Name: Amazon Quick - dataset lifecycle
+      Name: AWS Quick - dataset lifecycle
       VersionDescription: Administrator dashboard - Overview, Refresh health, Usage, Capacity and cost, History.
       DashboardPublishOptions:
         AdHocFilteringOption: {AvailabilityStatus: ENABLED}
@@ -1455,5 +1455,5 @@ Resources:
 
 Outputs:
   DashboardUrl:
-    Description: Open the dashboard in Amazon Quick (this Region).
+    Description: Open the dashboard in AWS Quick (this Region).
     Value: !Sub 'https://${AWS::Region}.quicksight.aws.amazon.com/sn/dashboards/${ResourcePrefix}-dashboard'

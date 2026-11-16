@@ -1,19 +1,19 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
 Description: >
-  Amazon Quick dataset lifecycle monitor. A scheduled collector Lambda scans
+  AWS Quick dataset lifecycle monitor. A scheduled collector Lambda scans
   every dataset (no co-ownership required - IAM-authorized read-only APIs) and
   publishes per-dataset sync health (last refresh status + typed failure
   reason), sync duration (last + average, segmented by refresh type), and
   last-observed-use evidence with confidence labels as JSONL snapshots in the
   shared analytics bucket of the Analytics Foundation stack, where the module's
-  Amazon Quick dashboard reads them; low-cardinality fleet KPIs drive the
+  AWS Quick dashboard reads them; low-cardinality fleet KPIs drive the
   alarms. Optional SNS alerts fire once per new refresh failure. Deploy via
   scripts/apply-governance-dataset-lifecycle-monitor.sh (sam build + deploy,
   then the Quick dashboard).
 
 # Prerequisites (NOT created by this stack):
-#   * Amazon Quick subscription in this same account/Region.
+#   * AWS Quick subscription in this same account/Region.
 #   * Nothing else: CloudTrail evidence uses the always-on 90-day Event
 #     history (no trail required); dashboard-view evidence uses the native
 #     AWS/QuickSight vended metrics.
@@ -354,7 +354,7 @@ Resources:
     Properties:
       FunctionName: !Sub '${ResourcePrefix}-fn'
       Description: >
-        Scans Amazon Quick datasets: sync health, durations, usage evidence.
+        Scans AWS Quick datasets: sync health, durations, usage evidence.
       Runtime: python3.14
       Architectures:
         - arm64
@@ -410,7 +410,7 @@ Resources:
     Properties:
       AlarmName: !Sub '${ResourcePrefix}-ingestion-failures'
       AlarmDescription: >
-        At least one Amazon Quick SPICE ingestion failed in the last 5 minutes
+        At least one AWS Quick SPICE ingestion failed in the last 5 minutes
         (native account-aggregate metric; minutes-level MTTD between collector
         runs). The dashboard and SNS alert carry the per-dataset reason.
       Namespace: AWS/QuickSight

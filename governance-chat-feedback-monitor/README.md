@@ -1,14 +1,14 @@
-# Amazon Quick — Chat and Feedback Monitor
+# AWS Quick — Chat and Feedback Monitor
 
 > [!IMPORTANT]
 > **Sample code — review and adapt before production use.** Not an AWS service and not supported by AWS; see the [repository disclaimer](../README.md#disclaimer).
 
-Monitor **messages sent to Amazon Quick**, the users sending them, the agents and flows being used,
-response outcomes, and **Useful / Not Useful** feedback on a native **Amazon Quick dashboard** fed by
+Monitor **messages sent to AWS Quick**, the users sending them, the agents and flows being used,
+response outcomes, and **Useful / Not Useful** feedback on a native **AWS Quick dashboard** fed by
 a field-minimized S3 copy that never contains conversation content — while the full conversation
 record stays in an encrypted CloudWatch Logs log group as the audit trail.
 
-The source is Amazon Quick's regional `CHAT_LOGS` and `FEEDBACK_LOGS` vended-log feeds. CloudTrail is
+The source is AWS Quick's regional `CHAT_LOGS` and `FEEDBACK_LOGS` vended-log feeds. CloudTrail is
 not the source for conversation content or feedback. The module delivers both feeds twice: complete,
 to one KMS-encrypted log group; and without prompts, responses or comments, to the shared analytics
 bucket of the [Analytics Foundation](../governance-analytics-foundation/README.md), where the Quick
@@ -28,7 +28,7 @@ governance-chat-feedback-monitor/
 ├── README.md
 ├── cloudformation/
 │   ├── governance-chat-feedback-monitor.yaml             # the module stack (source of truth)
-│   └── governance-chat-feedback-quick-dashboard.yaml     # the Amazon Quick dashboard stack
+│   └── governance-chat-feedback-quick-dashboard.yaml     # the AWS Quick dashboard stack
 └── scripts/
     ├── apply-governance-chat-feedback-monitor.sh          # module stack + Quick dashboard
     ├── remove-governance-chat-feedback-monitor.sh         # tears both down
@@ -39,7 +39,7 @@ governance-chat-feedback-monitor/
 ## Architecture
 
 ```text
-Amazon Quick (one account and Region)
+AWS Quick (one account and Region)
   ├─ CHAT_LOGS delivery source ─────┬──────────────────────────────┐
   └─ FEEDBACK_LOGS delivery source ─┤                              │ RecordFields: no user_message,
                                     v                              │ system_text_message, feedback_details
@@ -52,13 +52,13 @@ Amazon Quick (one account and Region)
   AGENT_METADATA_LOGS delivery source                              |                 | Glue tables (no content columns)
       └─ <log group>-agent-metadata ── subscription filter ──> resolver Lambda       | Athena (Direct Query)
          (create / rename / delete)        daily EventBridge rule ─┘                 v
-                                           ListAgents -> CSV export         AMAZON QUICK DASHBOARD
+                                           ListAgents -> CSV export         AWS QUICK DASHBOARD
                                                                             Overview · Users · Agents ·
                                                                             Quality · Events
 ```
 
 Vended-log delivery is **regional and non-retroactive**. Deploy this module separately in every
-Region where Amazon Quick activity occurs, and deploy it soon after enabling Quick AI features.
+Region where AWS Quick activity occurs, and deploy it soon after enabling Quick AI features.
 
 ## What the stack creates
 
@@ -88,8 +88,8 @@ table to the CloudWatch audit trail. The module creates no buckets of its own.
 
 - The [Analytics Foundation](../governance-analytics-foundation/README.md) stack deployed in the same
   account and Region (the apply script resolves its bucket; `--foundation-stack` if you renamed it).
-- Active Amazon Quick Enterprise or Professional subscription with AI features enabled.
-- Deploy in the same AWS account and Region as Amazon Quick.
+- Active AWS Quick Enterprise or Professional subscription with AI features enabled.
+- Deploy in the same AWS account and Region as AWS Quick.
 - AWS CLI v2 configured with deployment credentials.
 - The deploying principal must have CloudFormation permissions for the resources in the template and
   `quicksight:AllowVendedLogDeliveryForResource` on:
@@ -207,7 +207,7 @@ visible during its deletion window. The field-minimized copies under `chat-feedb
 analytics bucket are not deleted; remove them, or the foundation itself, through
 `governance-analytics-foundation/scripts`.
 
-## Amazon Quick dashboard
+## AWS Quick dashboard
 
 `cloudformation/governance-chat-feedback-quick-dashboard.yaml` builds the dashboard over the
 field-minimized S3 copy: Glue tables `chat_logs`, `feedback_logs` and `chat_agent_names` (none declares
@@ -263,7 +263,7 @@ each viewer sees where needed.
   trigger is enabled. The 900-second timeout provides headroom for accounts with 100+ agents. Unknown
   IDs remain visible as IDs. `flow_id=-` denotes a regular chat rather than a Flow invocation.
 - **Agent metadata log group:** holds one small record per agent operation (event name, agent ID,
-  name, status, version, acting user); the fields Amazon Quick documents as sensitive —
+  name, status, version, acting user); the fields AWS Quick documents as sensitive —
   `instructions`, `custom_prompt_input`, `welcome_message`, `starter_prompts`, `magic_builder_query` —
   are excluded at the delivery. 30-day retention, encrypted with the module key when enabled.
 - **Agent-name CSV:** contains only agent IDs and friendly names — no prompts, instructions, or chat
@@ -280,5 +280,5 @@ each viewer sees where needed.
 
 ## AWS documentation
 
-- [Monitoring Amazon Quick using CloudWatch Logs](https://docs.aws.amazon.com/quick/latest/userguide/monitoring-cloudwatch-logs.html) — delivery setup, regional/non-retroactive behavior, security guidance, and chat/feedback schemas.
-- [Incident response, logging, and monitoring in Amazon Quick](https://docs.aws.amazon.com/quick/latest/userguide/incident-response-logging-and-monitoring.html) — when to use vended logs versus CloudTrail and the monitoring checklist.
+- [Monitoring AWS Quick using CloudWatch Logs](https://docs.aws.amazon.com/quick/latest/userguide/monitoring-cloudwatch-logs.html) — delivery setup, regional/non-retroactive behavior, security guidance, and chat/feedback schemas.
+- [Incident response, logging, and monitoring in AWS Quick](https://docs.aws.amazon.com/quick/latest/userguide/incident-response-logging-and-monitoring.html) — when to use vended logs versus CloudTrail and the monitoring checklist.

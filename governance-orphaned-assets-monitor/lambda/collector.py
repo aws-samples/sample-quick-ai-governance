@@ -1,5 +1,5 @@
 """
-Amazon Quick — Orphaned Assets Monitor collector.
+AWS Quick — Orphaned Assets Monitor collector.
 
 One scheduled loop (daily by default): reconcile every asset's owner grants
 against the current Quick user/group inventory and flag ownership risk.
@@ -616,7 +616,7 @@ def send_finding_alert(record: dict) -> None:
         for p in record.get("ownerPrincipals", [])
     ) or "    (no owner grants at all)"
     body = "\n".join([
-        "Amazon Quick — Orphaned Assets Monitor",
+        "AWS Quick — Orphaned Assets Monitor",
         "",
         f"Finding:       {record['findingType']} ({record['severity']})",
         f"Asset:         {record.get('assetType')} / {name}",

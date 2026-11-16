@@ -2,7 +2,7 @@
 #
 # apply-governance-spreadsheet-file-rename.sh
 #
-# Thin wrapper around "sam deploy" for the Amazon Quick spreadsheet-file
+# Thin wrapper around "sam deploy" for the AWS Quick spreadsheet-file
 # auto-rename stack (../cloudformation/governance-spreadsheet-file-rename.yaml).
 #
 # The SAM template is the single source of truth. This script just packages
@@ -11,7 +11,7 @@
 #
 # The stack deploys into the account resolved from your credentials/profile and
 # targets it via the AWS::AccountId pseudo-parameter -- there is no account ID
-# to pass. The Amazon Quick subscription must be in that same account/Region.
+# to pass. The AWS Quick subscription must be in that same account/Region.
 #
 # What the stack creates (all named ${ResourcePrefix}-*):
 #   * Lambda function (Python 3.14) that renames matching dataset uploads

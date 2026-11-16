@@ -2,11 +2,11 @@
 #
 # apply-governance-analytics-foundation.sh
 #
-# Deploys the Amazon Quick governance analytics foundation via CloudFormation:
+# Deploys the AWS Quick governance analytics foundation via CloudFormation:
 #   * Shared analytics S3 bucket (per-module prefixes) + delivery bucket policy
 #   * Athena workgroup + query-results bucket
 #   * Glue database for the module tables
-#   * Amazon Quick data source (Athena) owned by --quick-principal-arn
+#   * AWS Quick data source (Athena) owned by --quick-principal-arn
 #
 # Deploy once per Region BEFORE the monitoring modules (Agent Hours, Chat and
 # Feedback, Dataset Lifecycle, Orphaned Assets); Spreadsheet File Rename does

@@ -1,13 +1,13 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
 Description: >
-  Amazon Quick orphaned assets monitor (Phase 1, AUDIT_ONLY). A scheduled
+  AWS Quick orphaned assets monitor (Phase 1, AUDIT_ONLY). A scheduled
   collector reconciles every asset's owner grants (datasets, dashboards,
   analyses, data sources, folders, spaces, agents, topics) against the
   current Quick user/group inventory and flags ownership risk - orphaned
   assets, missing owner principals, single-owner assets - with evidence and
   confidence. Findings land as JSONL snapshots in the shared analytics bucket
-  of the Analytics Foundation stack, where the module's Amazon Quick dashboard
+  of the Analytics Foundation stack, where the module's AWS Quick dashboard
   reads them; KPI metrics drive the alarms and SNS alerts. Strictly read-only:
   it never transfers ownership, never deletes anything. Deploy via
   scripts/apply-governance-orphaned-assets-monitor.sh (sam build + deploy,
@@ -263,7 +263,7 @@ Resources:
     Properties:
       FunctionName: !Sub '${ResourcePrefix}-fn'
       Description: >
-        Reconciles Amazon Quick asset ownership against the user inventory
+        Reconciles AWS Quick asset ownership against the user inventory
         (audit-only).
       Runtime: python3.14
       Architectures:

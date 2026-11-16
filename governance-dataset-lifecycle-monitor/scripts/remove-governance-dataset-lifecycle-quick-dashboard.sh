@@ -2,7 +2,7 @@
 #
 # remove-governance-dataset-lifecycle-quick-dashboard.sh
 #
-# Deletes the native Amazon Quick dashboard stack of the Dataset Lifecycle Monitor
+# Deletes the native AWS Quick dashboard stack of the Dataset Lifecycle Monitor
 # (dashboard, dataset(s) and Glue table(s)). The data in S3 is not touched.
 #
 # Usage:

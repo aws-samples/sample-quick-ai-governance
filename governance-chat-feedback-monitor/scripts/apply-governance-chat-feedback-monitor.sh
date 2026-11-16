@@ -2,20 +2,20 @@
 #
 # apply-governance-chat-feedback-monitor.sh
 #
-# Deploys the Amazon Quick chat and feedback monitor:
+# Deploys the AWS Quick chat and feedback monitor:
 #   1. the module stack - regional CHAT_LOGS and FEEDBACK_LOGS vended-log delivery
 #      to an encrypted CloudWatch Logs log group (the content audit trail) and,
 #      field-minimized (no prompts, responses or comments), to the shared
 #      analytics bucket of the Analytics Foundation stack; plus the Lambda that
 #      exports the agent ID-to-name CSV the Quick dashboard joins on;
-#   2. the module's Amazon Quick dashboard stack, via
+#   2. the module's AWS Quick dashboard stack, via
 #      apply-governance-chat-feedback-quick-dashboard.sh - skip with --skip-dashboard.
 # Delivery is not retroactive. Deploy once in each Region where Quick is used.
 #
 # Prerequisites:
 #   * The Analytics Foundation stack in this Region
 #     (../../governance-analytics-foundation/scripts/apply-governance-analytics-foundation.sh).
-#   * Amazon Quick AI features enabled (Enterprise or Professional).
+#   * AWS Quick AI features enabled (Enterprise or Professional).
 #   * The caller can deploy the template and has
 #     quicksight:AllowVendedLogDeliveryForResource on the Quick account.
 #
@@ -173,5 +173,5 @@ if [[ "$SKIP_DASHBOARD" == "true" ]]; then
   exit 0
 fi
 [[ -x "$DASHBOARD_SCRIPT" ]] || err "Dashboard script not found or not executable: $DASHBOARD_SCRIPT"
-log "Deploying the Amazon Quick dashboard."
+log "Deploying the AWS Quick dashboard."
 "$DASHBOARD_SCRIPT" --region "$REGION" ${PROFILE:+--profile "$PROFILE"} --foundation-stack "$FOUNDATION_STACK"

@@ -2,7 +2,7 @@
 #
 # remove-governance-agent-hours-monitor.sh
 #
-# Tears down the Amazon Quick agent-hours monitor deployed by
+# Tears down the AWS Quick agent-hours monitor deployed by
 # apply-governance-agent-hours-monitor.sh: the Quick dashboard stack first
 # (skip with --keep-dashboard), then the module stack (the vended-log delivery).
 #

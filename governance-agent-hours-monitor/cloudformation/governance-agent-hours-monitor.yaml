@@ -1,8 +1,8 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
-  Amazon Quick agent-hours usage monitor. Delivers the Quick AGENT_HOURS_LOGS
+  AWS Quick agent-hours usage monitor. Delivers the Quick AGENT_HOURS_LOGS
   vended-log feed to the shared analytics bucket created by the Analytics
-  Foundation stack, under the agent-hours/ prefix, where the module's Amazon
+  Foundation stack, under the agent-hours/ prefix, where the module's AWS
   Quick dashboard (governance-agent-hours-quick-dashboard.yaml) reads it through
   Athena. Assumes the Quick subscription is in the same AWS account as this stack.
 

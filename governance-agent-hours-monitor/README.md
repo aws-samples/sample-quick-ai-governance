@@ -1,10 +1,10 @@
-# Amazon Quick — Agent Hours Usage Monitor
+# AWS Quick — Agent Hours Usage Monitor
 
 > [!IMPORTANT]
 > **Sample code — review and adapt before production use.** Not an AWS service and not supported by AWS; see the [repository disclaimer](../README.md#disclaimer).
 
-Track **Amazon Quick agent-hours usage** — total, per user, per feature, and license-covered vs.
-chargeable — on a native **Amazon Quick dashboard**. The module delivers the `AGENT_HOURS_LOGS`
+Track **AWS Quick agent-hours usage** — total, per user, per feature, and license-covered vs.
+chargeable — on a native **AWS Quick dashboard**. The module delivers the `AGENT_HOURS_LOGS`
 vended-log feed into the shared analytics bucket of the
 [Analytics Foundation](../governance-analytics-foundation/README.md) and ships the dashboard that
 reads it through Athena; the same S3 data serves any downstream tool (Athena, Grafana, Datadog,
@@ -23,7 +23,7 @@ governance-agent-hours-monitor/
 ├── README.md
 ├── cloudformation/
 │   ├── governance-agent-hours-monitor.yaml             # the module stack (source of truth)
-│   └── governance-agent-hours-quick-dashboard.yaml     # the Amazon Quick dashboard stack
+│   └── governance-agent-hours-quick-dashboard.yaml     # the AWS Quick dashboard stack
 └── scripts/
     ├── apply-governance-agent-hours-monitor.sh          # module stack + Quick dashboard
     ├── remove-governance-agent-hours-monitor.sh         # tears both down (data in S3 preserved)
@@ -35,7 +35,7 @@ governance-agent-hours-monitor/
 
 ```
             +------------------------------------------+
-            |               Amazon Quick               |
+            |                AWS Quick                 |
             |        Research / Flows / Automate        |
             |           emits AGENT_HOURS_LOGS          |
             +-------------------+----------------------+
@@ -57,7 +57,7 @@ governance-agent-hours-monitor/
                                 | Athena (Direct Query)
                                 v
             +------------------------------------------+
-            | AMAZON QUICK DASHBOARD (companion stack)  |
+            | AWS QUICK DASHBOARD (companion stack)     |
             |   Overview · Users · Features and         |
             |   automations · Events                    |
             +------------------------------------------+
@@ -80,7 +80,7 @@ Direct Query dataset and the dashboard.
 
 - The [Analytics Foundation](../governance-analytics-foundation/README.md) stack deployed in the same
   account and Region (the apply script resolves its bucket; `--foundation-stack` if you renamed it).
-- Amazon Quick AI features enabled (Enterprise or Professional subscription).
+- AWS Quick AI features enabled (Enterprise or Professional subscription).
 - The deploying principal must hold `quicksight:AllowVendedLogDeliveryForResource` on the Quick account.
 - Same-account: the Quick subscription must be in the same AWS account where you deploy. The template
   targets it automatically via the `AWS::AccountId` pseudo-parameter (resolved from your deploy
@@ -131,7 +131,7 @@ place. The old log group (`/aws/vendedlogs/quick/agent-hours`) is left behind, r
 bucket must first migrate to the shared bucket (sync the history into `agent-hours/history/`, a
 sub-prefix the live delivery never writes to).
 
-## Amazon Quick dashboard
+## AWS Quick dashboard
 
 `cloudformation/governance-agent-hours-quick-dashboard.yaml` builds the dashboard: a Glue table
 (`agent_hours_logs`) over the delivered objects, a Direct Query dataset on the foundation's Athena data
@@ -224,7 +224,7 @@ with the other `governance-*` modules in this repo — including deploying the Q
 
 ## Sources
 
-- Amazon Quick — Monitoring usage with CloudWatch Logs (`AGENT_HOURS_LOGS` schema and delivery setup)
+- AWS Quick — Monitoring usage with CloudWatch Logs (`AGENT_HOURS_LOGS` schema and delivery setup)
 - Amazon CloudWatch pricing — vended logs delivery
 - CloudFormation — `AWS::Logs::DeliverySource` / `DeliveryDestination` / `Delivery`
-- Amazon Athena — partition projection; Amazon Quick — CloudFormation `AWS::QuickSight::*` resources
+- Amazon Athena — partition projection; AWS Quick — CloudFormation `AWS::QuickSight::*` resources

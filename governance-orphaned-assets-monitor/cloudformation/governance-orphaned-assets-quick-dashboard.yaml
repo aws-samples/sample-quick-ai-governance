@@ -1,6 +1,6 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
-  Amazon Quick orphaned assets monitor - native Amazon Quick dashboard for
+  AWS Quick orphaned assets monitor - native AWS Quick dashboard for
   administrators. Glue table over the daily ownership snapshots the module
   writes to S3 (owner principal names are not declared), a current-state
   dataset (latest scan per asset) and a history dataset, and a four-tab
@@ -252,7 +252,7 @@ Resources:
     Properties:
       AwsAccountId: !Ref 'AWS::AccountId'
       DashboardId: !Sub '${ResourcePrefix}-dashboard'
-      Name: Amazon Quick - asset ownership
+      Name: AWS Quick - asset ownership
       VersionDescription: Administrator dashboard - Overview, Findings, Ownership, History.
       DashboardPublishOptions:
         AdHocFilteringOption: {AvailabilityStatus: ENABLED}
@@ -1211,5 +1211,5 @@ Resources:
 
 Outputs:
   DashboardUrl:
-    Description: Open the dashboard in Amazon Quick (this Region).
+    Description: Open the dashboard in AWS Quick (this Region).
     Value: !Sub 'https://${AWS::Region}.quicksight.aws.amazon.com/sn/dashboards/${ResourcePrefix}-dashboard'

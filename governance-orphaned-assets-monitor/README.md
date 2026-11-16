@@ -1,15 +1,15 @@
-# Amazon Quick — Orphaned Assets Monitor
+# AWS Quick — Orphaned Assets Monitor
 
 > [!IMPORTANT]
 > **Sample code — review and adapt before production use.** Not an AWS service and not supported by AWS; see the [repository disclaimer](../README.md#disclaimer).
 
-Fleet-wide ownership assurance for every Amazon Quick asset — **who owns it, whether those
+Fleet-wide ownership assurance for every AWS Quick asset — **who owns it, whether those
 owners still exist, and which assets are one departure away from being orphaned** — on a native
-Amazon Quick dashboard, with SNS alerts and alarms for new HIGH findings, over S3 JSONL snapshots that
+AWS Quick dashboard, with SNS alerts and alarms for new HIGH findings, over S3 JSONL snapshots that
 any downstream tool can also read. Strictly **audit-only**: the monitor never transfers ownership and
 never deletes anything.
 
-Amazon Quick does not automatically transfer a user's assets when that user leaves:
+AWS Quick does not automatically transfer a user's assets when that user leaves:
 
 | Removal path | What happens to the user's assets |
 |---|---|
@@ -17,7 +17,7 @@ Amazon Quick does not automatically transfer a user's assets when that user leav
 | `DeleteUser` API | **No cleanup runs.** Assets stay in the account without an owner until an administrator transfers them. |
 | Removal from IAM Identity Center / Active Directory | No automatic cleanup. The user parks in the **Inactive users** list pending review; assets stay untouched. |
 
-(See [User lifecycle and data handling in Amazon Quick](https://docs.aws.amazon.com/quick/latest/userguide/user-lifecycle-data-handling.html).)
+(See [User lifecycle and data handling in AWS Quick](https://docs.aws.amazon.com/quick/latest/userguide/user-lifecycle-data-handling.html).)
 The asset management console supports manual discovery and transfer; this module adds the
 continuous, account-wide detection layer in front of it.
 
@@ -57,7 +57,7 @@ governance-orphaned-assets-monitor/
         +--> alert on NEW HIGH finding ->  SNS (optional)
         |
         v  Glue table orphaned_assets_snapshots · Athena (Direct Query)
- AMAZON QUICK DASHBOARD (companion stack)
+ AWS QUICK DASHBOARD (companion stack)
   - Overview: open findings / HIGH / single-owner / healthy, coverage by type, HIGH action list
   - Findings · Ownership · History
 ```
@@ -107,7 +107,7 @@ against a real orphaned asset.
 
 ## Dashboard tour
 
-See [Amazon Quick dashboard](#amazon-quick-dashboard) below for the four tabs. The constant across
+See [AWS Quick dashboard](#aws-quick-dashboard) below for the four tabs. The constant across
 them: the **finding ladder** (HIGH orphaned or missing-owner → MEDIUM at-risk → LOW mixed or unknown),
 the confidence label on every finding, and the reminder that remediation is a manual, human decision.
 
@@ -120,7 +120,7 @@ the confidence label on every finding, and the reminder that remediation is a ma
   exist (daily granularity).
 - **Collector errors** (alarm): the scan itself failed; findings may be stale.
 
-Alerting is operational and lives in CloudWatch alarms and SNS; visualization lives in Amazon Quick.
+Alerting is operational and lives in CloudWatch alarms and SNS; visualization lives in AWS Quick.
 
 ## Where the data lives
 
@@ -154,9 +154,9 @@ and check `"recovered": 0` / `"newHigh": 0`; (4) copy the history with
 (a sub-prefix the live collector never writes to). The two module buckets can then be deleted (they are
 versioned — delete all versions).
 
-## Amazon Quick dashboard
+## AWS Quick dashboard
 
-`cloudformation/governance-orphaned-assets-quick-dashboard.yaml` builds a native Amazon Quick dashboard over the S3 snapshots: Glue
+`cloudformation/governance-orphaned-assets-quick-dashboard.yaml` builds a native AWS Quick dashboard over the S3 snapshots: Glue
 table(s) over the partitioned snapshot prefix (`orphaned_assets_snapshots`, without the `ownerPrincipals` column), Direct Query datasets whose SQL keeps the
 latest scan per asset (`row_number() over (partition by … order by ts desc)`) plus a history dataset,
 and a four-tab administrator dashboard. The module's apply script deploys it after the module stack;
@@ -236,7 +236,7 @@ Open the dashboard via the `DashboardUrl` output of the dashboard stack (printed
 - **MEDIUM (`SINGLE_ACTIVE_OWNER`)** — remediate *proactively*: select the assets and use
   **Actions → Share** to add an administrator or a recovery group as **co-owner**
   ([walkthrough](https://aws.amazon.com/blogs/big-data/govern-and-manage-permissions-of-amazon-quicksight-assets-with-the-new-centralized-asset-management-console/)).
-  This is the cheapest insurance in the module: Amazon Quick
+  This is the cheapest insurance in the module: AWS Quick
   [never deletes an asset that has more than one owner](https://docs.aws.amazon.com/quick/latest/userguide/user-lifecycle-data-handling.html)
   when a user is removed — the departed user is simply dropped from the permissions and the
   asset stays available to its co-owners, whatever the removal path.

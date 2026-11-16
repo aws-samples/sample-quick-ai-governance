@@ -1,9 +1,9 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
-  Amazon Quick chat and feedback monitor. Delivers the regional CHAT_LOGS and
+  AWS Quick chat and feedback monitor. Delivers the regional CHAT_LOGS and
   FEEDBACK_LOGS vended-log feeds to an encrypted CloudWatch Logs log group (the
   content audit trail) and, field-minimized, to the shared analytics bucket of
-  the Analytics Foundation stack, where the module's Amazon Quick dashboard
+  the Analytics Foundation stack, where the module's AWS Quick dashboard
   reads them through Athena. A small Lambda exports the agent ID-to-name CSV the
   dashboard joins on, refreshed daily and on every agent create/rename/delete.
   Log delivery is not retroactive. Assumes Quick is in the same AWS account.
@@ -12,7 +12,7 @@ Description: >
 #   * The Analytics Foundation stack in this account and Region (its
 #     AnalyticsBucketName output is this template's AnalyticsBucketName parameter;
 #     the apply script resolves it).
-#   * Amazon Quick AI features enabled (Enterprise or Professional subscription).
+#   * AWS Quick AI features enabled (Enterprise or Professional subscription).
 #   * The deploying principal must hold the IAM permission
 #     quicksight:AllowVendedLogDeliveryForResource on the Quick account.
 #
@@ -140,7 +140,7 @@ Resources:
               - kms:Decrypt
             Resource: '*'
             Condition:
-              # StringLike, as the Amazon Quick documentation prescribes: the
+              # StringLike, as the AWS Quick documentation prescribes: the
               # value carries a wildcard, which StringEquals would take literally
               # (security review M1).
               StringLike:

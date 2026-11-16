@@ -1,6 +1,6 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
-  Amazon Quick agent-hours usage monitor - native Amazon Quick dashboard for
+  AWS Quick agent-hours usage monitor - native AWS Quick dashboard for
   administrators. Creates a Glue table over the AGENT_HOURS_LOGS objects
   delivered to S3, a Direct Query dataset (Athena, custom SQL) and a four-tab
   dashboard: Overview (KPIs, trends, top consumers), Users, Features and
@@ -80,7 +80,7 @@ Resources:
         Fn::ImportValue: !Sub '${FoundationStackName}-GlueDatabase'
       TableInput:
         Name: !Ref GlueTableName
-        Description: Amazon Quick AGENT_HOURS_LOGS vended-log events (see monitoring-cloudwatch-logs.html).
+        Description: AWS Quick AGENT_HOURS_LOGS vended-log events (see monitoring-cloudwatch-logs.html).
         TableType: EXTERNAL_TABLE
         Parameters:
           classification: json
@@ -242,7 +242,7 @@ Resources:
     Properties:
       AwsAccountId: !Ref 'AWS::AccountId'
       DashboardId: !Sub '${ResourcePrefix}-dashboard'
-      Name: Amazon Quick - agent hours usage
+      Name: AWS Quick - agent hours usage
       VersionDescription: Administrator dashboard - Overview, Users, Features and automations, Events.
       DashboardPublishOptions:
         AdHocFilteringOption: {AvailabilityStatus: ENABLED}
@@ -687,7 +687,7 @@ Resources:
               - SheetTextBoxId: txt-howto
                 Content: >-
                   <text-box><block align="left"><inline font-weight="bold">How to read this dashboard.</inline> An agent hour is the
-                  metered unit of AI usage in Amazon Quick (Research, Flows, Automate, apps, chat over data, artifact
+                  metered unit of AI usage in AWS Quick (Research, Flows, Automate, apps, chat over data, artifact
                   generation), metered per second while Quick is actively working. Included hours fall within the
                   subscription entitlement; Extra hours are billed as overage. Events without a user are scheduled or
                   deployed automations and are attributed to the resource that ran them. The Features and automations tab
@@ -1219,5 +1219,5 @@ Outputs:
     Value: !GetAtt DataSet.Arn
 
   DashboardUrl:
-    Description: Open the dashboard in Amazon Quick (this Region).
+    Description: Open the dashboard in AWS Quick (this Region).
     Value: !Sub 'https://${AWS::Region}.quicksight.aws.amazon.com/sn/dashboards/${ResourcePrefix}-dashboard'

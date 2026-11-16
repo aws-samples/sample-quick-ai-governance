@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1400" height="816" viewBox="0 0 1400 816" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">
-  <title>Amazon Quick AI governance: five pillars, reference modules and native controls</title>
-  <desc>Three pillars (Consumption, Interactions, Data asset lifecycle) each combine a reference module from this repository with native Amazon Quick controls. Two pillars, Sharing and data security in agent access, are native capabilities of the service and need no module. Everything rests on the Amazon Quick service layer.</desc>
+  <title>AWS Quick AI governance: five pillars, reference modules and native controls</title>
+  <desc>Three pillars (Consumption, Interactions, Data asset lifecycle) each combine a reference module from this repository with native AWS Quick controls. Two pillars, Sharing and data security in agent access, are native capabilities of the service and need no module. Everything rests on the AWS Quick service layer.</desc>
   <defs>
     <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
       <stop offset="0" stop-color="#FAFBFC"/>
@@ -18,15 +18,15 @@
   <rect width="1400" height="816" fill="url(#bg)"/>
 
   <!-- Title -->
-  <text x="60" y="52" font-size="26" font-weight="700" fill="#232F3E">Amazon Quick — AI governance in five pillars</text>
-  <text x="60" y="78" font-size="15" fill="#545B64">Pillars 1, 2 and 4 combine a reference module from this repository with the controls Amazon Quick provides natively. Pillars 3 and 5 are native to the service — no module.</text>
+  <text x="60" y="52" font-size="26" font-weight="700" fill="#232F3E">AWS Quick — AI governance in five pillars</text>
+  <text x="60" y="78" font-size="15" fill="#545B64">Pillars 1, 2 and 4 combine a reference module from this repository with the controls AWS Quick provides natively. Pillars 3 and 5 are native to the service — no module.</text>
 
   <!-- Row labels -->
   <g font-size="12" font-weight="600" fill="#545B64" text-anchor="end">
     <text x="188" y="212" >REFERENCE MODULES</text>
     <text x="188" y="228" font-weight="400">this repository</text>
     <text x="188" y="428">NATIVE CONTROLS</text>
-    <text x="188" y="444" font-weight="400">Amazon Quick</text>
+    <text x="188" y="444" font-weight="400">AWS Quick</text>
   </g>
   <line x1="200" y1="150" x2="200" y2="516" stroke="#D5DBDB" stroke-width="1"/>
 
@@ -40,7 +40,7 @@
     <rect x="216" y="186" width="270" height="176" rx="8" fill="#FFFFFF" stroke="#FF9900" stroke-width="2" filter="url(#shadow)"/>
     <text x="232" y="214" font-size="15" font-weight="700" fill="#232F3E">Agent Hours Usage Monitor</text>
     <text x="232" y="238" font-size="12" fill="#545B64">AGENT_HOURS_LOGS feed to the shared S3</text>
-    <text x="232" y="256" font-size="12" fill="#545B64">bucket; Amazon Quick dashboard:</text>
+    <text x="232" y="256" font-size="12" fill="#545B64">bucket; AWS Quick dashboard:</text>
     <text x="232" y="274" font-size="12" fill="#545B64">totals, top consumers, spend by</text>
     <text x="232" y="292" font-size="12" fill="#545B64">feature, included vs chargeable,</text>
     <text x="232" y="310" font-size="12" fill="#545B64">overage by user and automation.</text>
@@ -133,10 +133,10 @@
     <text x="1230" y="583" font-size="11" font-weight="600" fill="#1D8102" text-anchor="middle">Native capability · no module</text>
   </g>
 
-  <!-- Amazon Quick service layer -->
+  <!-- AWS Quick service layer -->
   <g>
     <rect x="216" y="688" width="1128" height="72" rx="8" fill="url(#quick)"/>
-    <text x="232" y="718" font-size="15" font-weight="700" fill="#FFFFFF">Amazon Quick</text>
+    <text x="232" y="718" font-size="15" font-weight="700" fill="#FFFFFF">AWS Quick</text>
     <text x="232" y="742" font-size="12" fill="#D5DBDB">Datasets · semantic layer (topics) · Spaces · Chat Agents · Flows · Automate · Research</text>
   </g>
 
@@ -145,7 +145,7 @@
     <rect x="60" y="776" width="14" height="14" rx="3" fill="#FFFFFF" stroke="#FF9900" stroke-width="2"/>
     <text x="80" y="787">Reference module (deploy only what you need, in any order)</text>
     <rect x="420" y="776" width="14" height="14" rx="3" fill="#F7F8FA" stroke="#AAB7B8" stroke-width="1.5" stroke-dasharray="4 3"/>
-    <text x="440" y="787">Native Amazon Quick control</text>
+    <text x="440" y="787">Native AWS Quick control</text>
     <rect x="640" y="776" width="14" height="14" rx="3" fill="#E9F5EC" stroke="#1D8102" stroke-width="2"/>
     <text x="660" y="787">Native capability of the service</text>
   </g>

@@ -2,7 +2,7 @@
 #
 # apply-governance-orphaned-assets-monitor.sh
 #
-# Thin wrapper around "sam build" + "sam deploy" for the Amazon Quick
+# Thin wrapper around "sam build" + "sam deploy" for the AWS Quick
 # orphaned assets monitor stack
 # (../cloudformation/governance-orphaned-assets-monitor.yaml).
 #
@@ -36,7 +36,7 @@
 #   --log-retention-days      CloudWatch Logs retention of the collector's own log group (default 90)
 #   --foundation-stack        Analytics Foundation stack name (default quick-governance-analytics-foundation);
 #                             its bucket receives snapshots and state under orphaned-assets/
-#   --skip-dashboard          deploy the module stack only, not its Amazon Quick dashboard
+#   --skip-dashboard          deploy the module stack only, not its AWS Quick dashboard
 
 set -euo pipefail
 
@@ -145,5 +145,5 @@ if [[ "$SKIP_DASHBOARD" == "true" ]]; then
   exit 0
 fi
 [[ -x "$DASHBOARD_SCRIPT" ]] || err "Dashboard script not found or not executable: $DASHBOARD_SCRIPT"
-log "Deploying the Amazon Quick dashboard."
+log "Deploying the AWS Quick dashboard."
 "$DASHBOARD_SCRIPT" --region "$REGION" ${PROFILE:+--profile "$PROFILE"} --foundation-stack "$FOUNDATION_STACK"

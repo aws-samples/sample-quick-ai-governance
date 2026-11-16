@@ -2,7 +2,7 @@
 #
 # remove-governance-dataset-lifecycle-monitor.sh
 #
-# Tears down the Amazon Quick dataset lifecycle monitor deployed by
+# Tears down the AWS Quick dataset lifecycle monitor deployed by
 # apply-governance-dataset-lifecycle-monitor.sh: the Quick dashboard stack first
 # (skip with --keep-dashboard), then the module stack (collector, alarms, SNS).
 #

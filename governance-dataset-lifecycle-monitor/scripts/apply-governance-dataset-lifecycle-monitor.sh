@@ -2,7 +2,7 @@
 #
 # apply-governance-dataset-lifecycle-monitor.sh
 #
-# Thin wrapper around "sam build" + "sam deploy" for the Amazon Quick dataset lifecycle
+# Thin wrapper around "sam build" + "sam deploy" for the AWS Quick dataset lifecycle
 # monitor stack (../cloudformation/governance-dataset-lifecycle-monitor.yaml).
 #
 # The SAM template is the single source of truth. This script packages
@@ -12,13 +12,13 @@
 #
 # The stack deploys into the account resolved from your credentials/profile
 # and targets it via AWS::AccountId -- there is no account ID to pass. The
-# Amazon Quick subscription must be in that same account/Region.
+# AWS Quick subscription must be in that same account/Region.
 #
 # What the stack creates (all named ${ResourcePrefix}-*):
 #   * Collector Lambda (Python 3.14, arm64) on two EventBridge schedules
 #     (fast: sync health / slow: usage + lineage + capacity)
 #   * CloudWatch Logs data log group (one JSON event per dataset per run)
-#   * the Amazon Quick dashboard stack (fleet health, durations, last-used, cost signal)
+#   * the AWS Quick dashboard stack (fleet health, durations, last-used, cost signal)
 #   * Low-cardinality KPI metrics (QuickGovernance/DatasetLifecycle)
 #   * S3 state/snapshot bucket (retained on stack delete)
 #   * Native ingestion-failure alarm + collector error alarm
@@ -62,7 +62,7 @@
 #   --log-retention-days      CloudWatch Logs retention of the collector's own log group (default 90)
 #   --foundation-stack        Analytics Foundation stack name (default quick-governance-analytics-foundation);
 #                             its bucket receives snapshots and state under dataset-lifecycle/
-#   --skip-dashboard          deploy the module stack only, not its Amazon Quick dashboard
+#   --skip-dashboard          deploy the module stack only, not its AWS Quick dashboard
 
 set -euo pipefail
 
@@ -190,5 +190,5 @@ if [[ "$SKIP_DASHBOARD" == "true" ]]; then
   exit 0
 fi
 [[ -x "$DASHBOARD_SCRIPT" ]] || err "Dashboard script not found or not executable: $DASHBOARD_SCRIPT"
-log "Deploying the Amazon Quick dashboard."
+log "Deploying the AWS Quick dashboard."
 "$DASHBOARD_SCRIPT" --region "$REGION" ${PROFILE:+--profile "$PROFILE"} --foundation-stack "$FOUNDATION_STACK"

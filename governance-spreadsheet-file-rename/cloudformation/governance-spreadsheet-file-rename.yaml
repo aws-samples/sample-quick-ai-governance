@@ -1,13 +1,13 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
 Description: >
-  Amazon Quick spreadsheet-file auto-rename automation. Deploys a Lambda that
+  AWS Quick spreadsheet-file auto-rename automation. Deploys a Lambda that
   renames datasets created from uploaded Microsoft Excel (.xlsx) files by
   prefixing the dataset name (default "xls-"), triggered by EventBridge events
-  from Amazon Quick. All resources are named "<ResourcePrefix>-*" (default
+  from AWS Quick. All resources are named "<ResourcePrefix>-*" (default
   quick-governance-spreadsheet-file-rename-*). The stack targets the account it
   is deployed into via AWS::AccountId (resolved from your credentials/profile),
-  so there is no account ID to pass; the Amazon Quick subscription must live in
+  so there is no account ID to pass; the AWS Quick subscription must live in
   that same account. Deploy via scripts/apply-governance-spreadsheet-file-rename.sh
   or "sam deploy" (see the module README for full usage).
 
@@ -36,7 +36,7 @@ Parameters:
     Type: String
     Default: 'XLSX'
     AllowedValues: [CSV, TSV, CLF, ELF, XLSX, JSON]
-    Description: Upload format to act on (per Amazon Quick UploadSettings).
+    Description: Upload format to act on (per AWS Quick UploadSettings).
 
   AlsoOnUpdate:
     Type: String
@@ -66,7 +66,7 @@ Parameters:
     MaxValue: 1000
     Description: >
       Reserved concurrent executions for the renamer Lambda. Set low to
-      protect Amazon Quick API throttling limits. Set to 0 to disable the
+      protect AWS Quick API throttling limits. Set to 0 to disable the
       function without deleting it.
 
   LogRetentionDays:
@@ -126,7 +126,7 @@ Resources:
     DependsOn: RenamerLogGroup
     Properties:
       FunctionName: !Sub '${ResourcePrefix}-fn'
-      Description: Auto-renames Amazon Quick datasets created from XLSX uploads.
+      Description: Auto-renames AWS Quick datasets created from XLSX uploads.
       Runtime: python3.14
       Architectures:
         - arm64

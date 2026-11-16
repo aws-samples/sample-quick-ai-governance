@@ -2,11 +2,11 @@
 #
 # apply-governance-agent-hours-monitor.sh
 #
-# Deploys the Amazon Quick agent-hours usage monitor:
+# Deploys the AWS Quick agent-hours usage monitor:
 #   1. the module stack - one vended-log delivery of AGENT_HOURS_LOGS into the
 #      shared analytics bucket (agent-hours/ prefix) created by the Analytics
 #      Foundation stack;
-#   2. the module's Amazon Quick dashboard stack (Glue table, datasets, dashboard),
+#   2. the module's AWS Quick dashboard stack (Glue table, datasets, dashboard),
 #      via apply-governance-agent-hours-quick-dashboard.sh - skip with --skip-dashboard.
 #
 # This is a thin wrapper around "aws cloudformation deploy". CloudFormation is
@@ -151,5 +151,5 @@ if [[ "$SKIP_DASHBOARD" == "true" ]]; then
   exit 0
 fi
 [[ -x "$DASHBOARD_SCRIPT" ]] || err "Dashboard script not found or not executable: $DASHBOARD_SCRIPT"
-log "Deploying the Amazon Quick dashboard."
+log "Deploying the AWS Quick dashboard."
 "$DASHBOARD_SCRIPT" --region "$REGION" ${PROFILE:+--profile "$PROFILE"} --foundation-stack "$FOUNDATION_STACK"

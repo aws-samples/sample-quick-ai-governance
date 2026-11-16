@@ -2,7 +2,7 @@
 #
 # apply-governance-agent-hours-quick-dashboard.sh
 #
-# Deploys the native Amazon Quick dashboard for the Agent Hours Usage Monitor:
+# Deploys the native AWS Quick dashboard for the Agent Hours Usage Monitor:
 #   * Glue table(s) over the module's data in S3 (metadata columns only)
 #   * Direct Query dataset(s) on the foundation's Athena data source
 #   * the dashboard (control bar, tabs, exportable tables)
@@ -136,4 +136,4 @@ aws cloudformation describe-stacks \
   --query 'Stacks[0].Outputs[].[OutputKey,OutputValue]' \
   --output text 2>/dev/null | sed 's/^/  /' || true
 
-log "Done. Open the DashboardUrl above in Amazon Quick."
+log "Done. Open the DashboardUrl above in AWS Quick."

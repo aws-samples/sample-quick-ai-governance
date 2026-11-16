@@ -1,5 +1,5 @@
 # =============================================================================
-# Amazon Quick - AI Governance
+# AWS Quick - AI Governance
 #
 # Ignore rules covering every module in this repository:
 #   * Bash helper scripts + CloudFormation templates

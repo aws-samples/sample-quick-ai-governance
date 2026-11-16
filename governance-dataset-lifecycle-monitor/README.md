@@ -1,15 +1,15 @@
-# Amazon Quick — Dataset Lifecycle Monitor
+# AWS Quick — Dataset Lifecycle Monitor
 
 > [!IMPORTANT]
 > **Sample code — review and adapt before production use.** Not an AWS service and not supported by AWS; see the [repository disclaimer](../README.md#disclaimer).
 
-Fleet-wide visibility into every Amazon Quick dataset — **last sync status with the typed failure
+Fleet-wide visibility into every AWS Quick dataset — **last sync status with the typed failure
 reason**, **sync duration (last + average, segmented by refresh type)**, and **last observed use
-with an explicit confidence label** — on a native Amazon Quick dashboard, with SNS alerts and alarms
+with an explicit confidence label** — on a native AWS Quick dashboard, with SNS alerts and alarms
 for new refresh failures, over S3 JSONL snapshots that any downstream tool can also read (Athena,
 Grafana, or your own tools).
 
-Amazon Quick's **Manage Assets** page shows *which* datasets exist, but not whether they are
+AWS Quick's **Manage Assets** page shows *which* datasets exist, but not whether they are
 healthy, slow, or still used. Dataset-level refresh history is only visible inside each dataset —
 which requires resource-level access an enterprise admin usually does not have. This module closes
 that gap **without co-owning a single dataset**: everything is collected through IAM-authorized
@@ -74,7 +74,7 @@ governance-dataset-lifecycle-monitor/
         +---------------------------------------------+
                               |  Glue tables dataset_lifecycle_fast / _slow · Athena (Direct Query)
                               v
-                 AMAZON QUICK DASHBOARD (companion stack)
+                 AWS QUICK DASHBOARD (companion stack)
                   - Overview · Refresh health · Usage · Capacity and cost · History
 ```
 
@@ -180,7 +180,7 @@ lookback window), `SPICE_DATASET_NOT_REFERENCED` (in no dashboard, no topic, *an
 
 ## Dashboard tour
 
-See [Amazon Quick dashboard](#amazon-quick-dashboard) below for the five tabs. Two things hold on every
+See [AWS Quick dashboard](#aws-quick-dashboard) below for the five tabs. Two things hold on every
 tab: the typed failure reasons come straight from the
 [SPICE ingestion error codes](https://docs.aws.amazon.com/quick/latest/userguide/errors-spice-ingestion.html),
 and usage evidence is a **signal with a confidence label, never a verdict** — the how-to note on the
@@ -194,7 +194,7 @@ Overview tab is the single most important element for interpreting the usage tab
 - **`IngestionErrorCount ≥ 1` in 5 min** (native alarm): fastest possible detection signal.
 - **Collector errors** (alarm): the scan itself is failing; data may be stale.
 
-Alerting is operational and lives in CloudWatch alarms and SNS; visualization lives in Amazon Quick.
+Alerting is operational and lives in CloudWatch alarms and SNS; visualization lives in AWS Quick.
 
 ## Where the data lives
 
@@ -229,9 +229,9 @@ and `RunSlowLoopNowCommand` and check that `datasets` matches the previous run; 
 the live collector never writes to). The two module buckets can then be deleted (they are versioned —
 delete all versions).
 
-## Amazon Quick dashboard
+## AWS Quick dashboard
 
-`cloudformation/governance-dataset-lifecycle-quick-dashboard.yaml` builds a native Amazon Quick dashboard over the S3 snapshots: Glue
+`cloudformation/governance-dataset-lifecycle-quick-dashboard.yaml` builds a native AWS Quick dashboard over the S3 snapshots: Glue
 table(s) over the partitioned snapshot prefix (`dataset_lifecycle_fast` for refresh health, `dataset_lifecycle_slow` for usage, lineage and capacity), Direct Query datasets whose SQL keeps the
 latest scan per dataset (`row_number() over (partition by … order by ts desc)`) plus a history dataset,
 and a five-tab administrator dashboard. The module's apply script deploys it after the module stack;

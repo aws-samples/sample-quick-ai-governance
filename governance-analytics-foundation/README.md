@@ -1,12 +1,12 @@
-# Amazon Quick — Governance Analytics Foundation
+# AWS Quick — Governance Analytics Foundation
 
 > [!IMPORTANT]
 > **Sample code — review and adapt before production use.** Not an AWS service and not supported by AWS; see the [repository disclaimer](../README.md#disclaimer).
 
 Shared, once-per-Region prerequisites of the four monitoring modules (Agent Hours, Chat and
-Feedback, Dataset Lifecycle, Orphaned Assets) and their **native Amazon Quick dashboards**: an AWS
+Feedback, Dataset Lifecycle, Orphaned Assets) and their **native AWS Quick dashboards**: an AWS
 Glue database, an Amazon Athena workgroup with its own query-results bucket, a shared analytics
-bucket that modules deliver into under per-module prefixes, and one Amazon Quick data source
+bucket that modules deliver into under per-module prefixes, and one AWS Quick data source
 (Athena). Deploy it first; Spreadsheet File Rename does not need it.
 
 ## Module layout
@@ -40,7 +40,7 @@ order (modules first, foundation last).
 
 ## Prerequisites
 
-- An Amazon Quick subscription in this account and Region.
+- An AWS Quick subscription in this account and Region.
 - A Quick **user or group ARN** to own the data source. It lives in the account's Quick *identity*
   Region, which can differ from the Region you deploy into — list it with
   `aws quicksight list-users --aws-account-id <account> --namespace default --region <identity-region>`

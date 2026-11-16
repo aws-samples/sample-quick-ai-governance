@@ -1,13 +1,13 @@
-# Amazon Quick — Spreadsheet File Rename
+# AWS Quick — Spreadsheet File Rename
 
 > [!IMPORTANT]
 > **Sample code — review and adapt before production use.** Not an AWS service and not supported by AWS; see the [repository disclaimer](../README.md#disclaimer).
 
-Automatically prefix the name of any **Amazon Quick (QuickSight) dataset created from an uploaded
+Automatically prefix the name of any **AWS Quick (QuickSight) dataset created from an uploaded
 spreadsheet** (Microsoft Excel `.xlsx` by default) so it becomes **`xls-<original name>`**. Zero
 change to the upload experience — users upload as usual, and the dataset is renamed within seconds.
 
-Mechanism: an **EventBridge → Lambda** automation. Amazon Quick emits a
+Mechanism: an **EventBridge → Lambda** automation. AWS Quick emits a
 `QuickSight DataSet Created` event in near real time; a Lambda reads the new dataset, detects the
 upload format, and renames it. Because the AWS SDKs don't yet model the file-upload physical table,
 the Lambda calls `DescribeDataSet`/`UpdateDataSet` as **raw, SigV4-signed REST requests** — see
@@ -33,7 +33,7 @@ The SAM template defines the whole stack; the scripts just drive `sam deploy` / 
 ## How it works
 
 ```
-  User uploads file.xlsx in Amazon Quick  ──creates dataset──▶  EventBridge (default bus)
+  User uploads file.xlsx in AWS Quick     ──creates dataset──▶  EventBridge (default bus)
                                                                  source      : aws.quicksight
                                                                  detail-type : QuickSight DataSet
                                                                                Created
@@ -56,7 +56,7 @@ Why it is safe:
 
 ## Why it uses the raw QuickSight API (boto3 limitation)
 
-Datasets created by the Amazon Quick "upload a file" experience store their physical table as a
+Datasets created by the AWS Quick "upload a file" experience store their physical table as a
 **`FileSource`**. As of **botocore 1.42.x / aws-cli 2.33.x**, the AWS SDKs do **not** model
 `FileSource` in the `PhysicalTable` type — they know only `RelationalTable`, `CustomSql`, `S3Source`,
 and `SaaSTable`. As a result, boto3 silently **drops** the file source when reading
@@ -107,7 +107,7 @@ responses are retried with exponential backoff and jitter.
 
 ## Prerequisites
 
-- An Amazon Quick (QuickSight) subscription in the AWS account and Region you deploy into.
+- An AWS Quick (QuickSight) subscription in the AWS account and Region you deploy into.
   EventBridge events are emitted in the Region where the *dataset resource* lives — deploy there.
   (Note: your Quick *identity* Region can differ from the Region where datasets are created; deploy
   where the datasets — and thus the events — are.)
@@ -173,7 +173,7 @@ The account is not a parameter — it is resolved from your deploy credentials/p
 
 ## Verify
 
-1. In Amazon Quick, create a dataset by uploading a small `.xlsx` (e.g. `sales.xlsx`).
+1. In AWS Quick, create a dataset by uploading a small `.xlsx` (e.g. `sales.xlsx`).
 2. The dataset first appears as `sales`, then within seconds becomes `xls-sales`.
 3. Tail the logs to see the decision:
 
@@ -208,8 +208,8 @@ invocations per upload, plus CloudWatch Logs storage. No always-on resources.
 
 ## References
 
-- [Amazon Quick events integration (EventBridge)](https://docs.aws.amazon.com/quick/latest/userguide/events-integration.html)
-- [EventBridge events reference — Amazon Quick / QuickSight](https://docs.aws.amazon.com/eventbridge/latest/ref/events-ref-quicksight.html)
+- [AWS Quick events integration (EventBridge)](https://docs.aws.amazon.com/quick/latest/userguide/events-integration.html)
+- [EventBridge events reference — AWS Quick / QuickSight](https://docs.aws.amazon.com/eventbridge/latest/ref/events-ref-quicksight.html)
 - [Creating a dataset using a Microsoft Excel file](https://docs.aws.amazon.com/quick/latest/userguide/create-a-data-set-excel.html)
 - [API_UpdateDataSet](https://docs.aws.amazon.com/quicksight/latest/APIReference/API_UpdateDataSet.html) · [API_DescribeDataSet](https://docs.aws.amazon.com/quicksight/latest/APIReference/API_DescribeDataSet.html)
 - [AWS Lambda Python runtimes](https://docs.aws.amazon.com/lambda/latest/dg/lambda-python.html) · [Install the AWS SAM CLI](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/install-sam-cli.html)

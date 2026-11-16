@@ -1,6 +1,6 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
-  Amazon Quick chat and feedback monitor - native Amazon Quick dashboard for
+  AWS Quick chat and feedback monitor - native AWS Quick dashboard for
   administrators. Creates Glue tables over the CHAT_LOGS and FEEDBACK_LOGS
   objects delivered to S3 (message text and comment fields are deliberately
   not declared), two Direct Query datasets (Athena, custom SQL) and a five-tab
@@ -87,7 +87,7 @@ Resources:
         Fn::ImportValue: !Sub '${FoundationStackName}-GlueDatabase'
       TableInput:
         Name: chat_logs
-        Description: Amazon Quick CHAT_LOGS events - metadata only (user_message and system_text_message not declared).
+        Description: AWS Quick CHAT_LOGS events - metadata only (user_message and system_text_message not declared).
         TableType: EXTERNAL_TABLE
         Parameters: {classification: json, EXTERNAL: 'TRUE'}
         StorageDescriptor:
@@ -137,7 +137,7 @@ Resources:
         Fn::ImportValue: !Sub '${FoundationStackName}-GlueDatabase'
       TableInput:
         Name: feedback_logs
-        Description: Amazon Quick FEEDBACK_LOGS events - metadata only (feedback_details not declared).
+        Description: AWS Quick FEEDBACK_LOGS events - metadata only (feedback_details not declared).
         TableType: EXTERNAL_TABLE
         Parameters: {classification: json, EXTERNAL: 'TRUE'}
         StorageDescriptor:
@@ -377,7 +377,7 @@ Resources:
     Properties:
       AwsAccountId: !Ref 'AWS::AccountId'
       DashboardId: !Sub '${ResourcePrefix}-dashboard'
-      Name: Amazon Quick - chat and feedback
+      Name: AWS Quick - chat and feedback
       VersionDescription: Administrator dashboard - Overview, Users, Agents, Quality, Events (metadata only).
       DashboardPublishOptions:
         AdHocFilteringOption: {AvailabilityStatus: ENABLED}
@@ -1531,5 +1531,5 @@ Outputs:
     Description: Quick dataset over FEEDBACK_LOGS metadata joined to messages (Direct Query).
     Value: !GetAtt FeedbackDataSet.Arn
   DashboardUrl:
-    Description: Open the dashboard in Amazon Quick (this Region).
+    Description: Open the dashboard in AWS Quick (this Region).
     Value: !Sub 'https://${AWS::Region}.quicksight.aws.amazon.com/sn/dashboards/${ResourcePrefix}-dashboard'

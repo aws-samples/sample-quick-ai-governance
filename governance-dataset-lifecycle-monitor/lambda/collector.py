@@ -1,5 +1,5 @@
 """
-Amazon Quick — Dataset Lifecycle Monitor collector.
+AWS Quick — Dataset Lifecycle Monitor collector.
 
 One Lambda, two loops, selected by the EventBridge schedule payload:
 
@@ -39,7 +39,7 @@ Design rules honored (see module README):
 Storage layout (cost-optimized, no database):
   * S3 (STATE_BUCKET / SNAPSHOT_BUCKET, the shared analytics bucket): per-run
     JSONL snapshots under dataset-lifecycle/fast/ and slow/ - the system of
-    record read by the Amazon Quick dashboard through Athena - and the
+    record read by the AWS Quick dashboard through Athena - and the
     collector's alert-dedupe + lineage + usage state under dataset-lifecycle/state/.
   * CloudWatch metrics (QuickGovernance/DatasetLifecycle): low-cardinality
     fleet KPIs that drive the alarms.
@@ -518,7 +518,7 @@ def send_failure_alert(record: dict) -> None:
     name = record.get("datasetName") or record["datasetId"]
     subject = f"Quick dataset refresh FAILED: {name}"[:100]
     body = "\n".join([
-        "Amazon Quick — Dataset Lifecycle Monitor",
+        "AWS Quick — Dataset Lifecycle Monitor",
         "",
         f"Dataset:        {name}",
         f"Dataset ID:     {record['datasetId']}",

@@ -2,7 +2,7 @@
 spreadsheet-file-rename — Lambda handler
 ========================================
 
-Auto-renames Amazon Quick (QuickSight) datasets created from an uploaded
+Auto-renames AWS Quick (QuickSight) datasets created from an uploaded
 Microsoft Excel (.xlsx) file by prefixing the dataset name with ``xls-``.
 
 Trigger
@@ -15,7 +15,7 @@ Amazon EventBridge rule on:
 
 Why this calls the raw QuickSight REST API instead of boto3
 -----------------------------------------------------------
-Datasets created by the Amazon Quick "upload a file" flow store their physical
+Datasets created by the AWS Quick "upload a file" flow store their physical
 table as a ``FileSource``. As of botocore 1.42.x / aws-cli 2.33.x the SDK's
 ``PhysicalTable`` shape models only RelationalTable, CustomSql, S3Source (and
 SaaSTable) -- it does NOT model ``FileSource``. So boto3:
@@ -34,7 +34,7 @@ Idempotency / loop-safety
 
 Required environment variables
 ------------------------------
-    QS_ACCOUNT_ID    AWS account ID hosting the Amazon Quick subscription.
+    QS_ACCOUNT_ID    AWS account ID hosting the AWS Quick subscription.
     PREFIX           Prefix to apply (default: "xls-").
     TARGET_FORMAT    Upload format to act on (default: "XLSX").
 
@@ -92,8 +92,8 @@ _PASSTHROUGH_FIELDS = (
     "DataSetUsageConfiguration",
     "DatasetParameters",
     "PerformanceConfiguration",
-    "DataPrepConfiguration",       # new Amazon Quick data-prep model
-    "SemanticModelConfiguration",  # new Amazon Quick semantic model
+    "DataPrepConfiguration",       # new AWS Quick data-prep model
+    "SemanticModelConfiguration",  # new AWS Quick semantic model
 )
 
 
@@ -148,7 +148,7 @@ def _update_data_set(dataset_id: str, body: Dict[str, Any]) -> Dict[str, Any]:
 def _is_target_format(dataset: Dict[str, Any]) -> bool:
     """True if any physical table is an uploaded file in TARGET_FORMAT.
 
-    Handles the new Amazon Quick ``FileSource`` uploads and classic ``S3Source``
+    Handles the new AWS Quick ``FileSource`` uploads and classic ``S3Source``
     uploads; both expose the format at ``UploadSettings.Format``.
     """
     for table in (dataset.get("PhysicalTableMap") or {}).values():
