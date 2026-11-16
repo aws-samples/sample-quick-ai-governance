@@ -27,9 +27,9 @@ Design rules honored (see module README):
   * A FAILED refresh never overwrites LastSuccessfulRefreshAt.
   * Direct-query datasets never get SPICE refresh semantics.
   * "No observed use" is evidence-bounded, never presented as proof.
-  * CloudTrail QueryDatabase counts as usage only for direct-query datasets:
-    for SPICE it fires during refresh (per AWS docs), and refreshes are not
-    consumption.
+  * CloudTrail QueryDatabase counts as usage for direct-query datasets.
+    For SPICE it counts only outside a refresh of that dataset: an event
+    inside the ingestion window is the refresh itself, not consumption.
   * Estimated cost is labeled ESTIMATED_PURCHASED, never an invoice amount.
   * Deleted datasets emit tombstone records (assetState=DELETED) so every
     dashboard table drops them on the next scan, whatever the time window.
@@ -57,6 +57,8 @@ from typing import Any
 import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
+
+import lifecycle_rules as rules
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -91,7 +93,7 @@ def is_excluded_asset(asset_id: str | None) -> bool:
 SNS_TOPIC_ARN = os.environ.get("SNS_TOPIC_ARN", "")
 ENABLE_CLOUDTRAIL = os.environ.get("ENABLE_CLOUDTRAIL", "true").lower() == "true"
 SPICE_RATE_PER_GB_MONTH = float(os.environ.get("SPICE_RATE_PER_GB_MONTH", "0.38"))
-UNUSED_THRESHOLD_DAYS = int(os.environ.get("UNUSED_THRESHOLD_DAYS", "30"))
+UNUSED_THRESHOLD_DAYS = int(os.environ.get("UNUSED_THRESHOLD_DAYS", "60"))
 INGESTION_LOOKBACK_RUNS = int(os.environ.get("INGESTION_LOOKBACK_RUNS", "50"))
 CT_LOOKBACK_DAYS = int(os.environ.get("CT_LOOKBACK_DAYS", "90"))
 CHAT_LOG_GROUP = os.environ.get("CHAT_LOG_GROUP", "")
@@ -103,6 +105,7 @@ VIEW_LOOKBACK_DAYS_EXTENDED = 455   # CloudWatch 1-hour/1-day retention bound
 QS_MIN_INTERVAL_SECONDS = 0.22      # ~4.5 TPS, under the 5 TPS/user quota
 CT_MIN_INTERVAL_SECONDS = 0.55      # under the 2 TPS LookupEvents quota
 MAX_CT_PAGES_PER_EVENT_NAME = 200   # safety cap (~10k events per run)
+INGESTION_PAGE_CAP = 120            # one pass covers 90 days of 15-minute refreshes
 ERROR_MESSAGE_MAX_CHARS = 400
 AGENT_LOOKBACK_DAYS = 30            # first CHAT_LOGS scan window
 AGENT_QUERY_LIMIT = 10000           # Logs Insights hard cap per query
@@ -407,25 +410,46 @@ def derive_fast_findings(refresh_state: dict) -> list[str]:
     return findings
 
 
-def describe_spice_capacity(dataset_id: str) -> tuple[float | None, bool]:
+def _data_source_ids(dataset: dict) -> str | None:
+    """Comma-separated data source ids from a DescribeDataSet response."""
+    found: list[str] = []
+
+    def walk(node: Any) -> None:
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if key == "DataSourceArn" and isinstance(value, str):
+                    source_id = value.split("/")[-1]
+                    if source_id and source_id not in found:
+                        found.append(source_id)
+                else:
+                    walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    walk(dataset.get("PhysicalTableMap") or {})
+    return ",".join(found) or None
+
+
+def describe_spice_capacity(dataset_id: str) -> tuple[float | None, bool, str | None]:
     """
-    Best-effort ConsumedSpiceCapacityInBytes -> GB (decimal).
-    Returns (gb, supported). File-upload datasets are not describable
-    through the API and are reported as unsupported, not as errors.
+    Best-effort ConsumedSpiceCapacityInBytes -> GB (decimal), plus the data
+    source id. Returns (gb, supported, data_source). File-upload datasets are
+    not describable through the API and are reported as unsupported, not as errors.
     """
     qs_pacer.wait()
     try:
         response = quicksight.describe_data_set(
             AwsAccountId=ACCOUNT_ID, DataSetId=dataset_id
         )
-        consumed = response["DataSet"].get("ConsumedSpiceCapacityInBytes")
-        if consumed is None:
-            return None, True
-        return round(consumed / 1_000_000_000, 3), True
+        dataset = response["DataSet"]
+        consumed = dataset.get("ConsumedSpiceCapacityInBytes")
+        gb = None if consumed is None else round(consumed / 1_000_000_000, 3)
+        return gb, True, _data_source_ids(dataset)
     except ClientError as error:
         code = error.response["Error"]["Code"]
         if code in ("InvalidParameterValueException", "UnsupportedUserEditionException"):
-            return None, False
+            return None, False, None
         raise
 
 
@@ -542,13 +566,16 @@ def send_failure_alert(record: dict) -> None:
 # SLOW loop — lineage, usage evidence, capacity (PFR 2)
 # ---------------------------------------------------------------------------
 
-def refresh_dashboard_lineage() -> dict:
+def refresh_dashboard_lineage() -> tuple[dict, list[dict], int]:
     """
-    dashboardId -> {name, lastUpdated, dataSetArns}; DescribeDashboard is
-    called only for new/changed dashboards (delta collection).
+    dashboardId -> {name, lastUpdated, createdAt, lastPublishedAt, dataSetArns}.
+    DescribeDashboard is called only for new/changed dashboards (delta collection).
+    Returns the lineage, the ListDashboards summaries, and how many describes failed.
+    A failed describe keeps the previous lineage entry.
     """
     lineage_state = load_state("state/dashboard-lineage.json")
     dashboards: list[dict] = []
+    describe_errors = 0
     paginator = quicksight.get_paginator("list_dashboards")
     for page in paginator.paginate(AwsAccountId=ACCOUNT_ID):
         qs_pacer.wait()
@@ -559,8 +586,13 @@ def refresh_dashboard_lineage() -> dict:
         dashboard_id = summary["DashboardId"]
         current_ids.add(dashboard_id)
         last_updated = _iso(summary.get("LastUpdatedTime"))
+        created_at = _iso(summary.get("CreatedTime"))
+        published_at = _iso(summary.get("LastPublishedTime"))
         cached = lineage_state.get(dashboard_id)
         if cached and cached.get("lastUpdated") == last_updated:
+            cached["name"] = summary.get("Name")
+            cached["createdAt"] = created_at
+            cached["lastPublishedAt"] = published_at
             continue
         qs_pacer.wait()
         try:
@@ -569,20 +601,23 @@ def refresh_dashboard_lineage() -> dict:
             )
             dataset_arns = response["Dashboard"]["Version"].get("DataSetArns", [])
         except ClientError as error:
+            describe_errors += 1
             print(f"WARN DescribeDashboard failed for {dashboard_id}: {error}")
             continue
         lineage_state[dashboard_id] = {
             "name": summary.get("Name"),
             "lastUpdated": last_updated,
+            "createdAt": created_at,
+            "lastPublishedAt": published_at,
             "dataSetArns": dataset_arns,
         }
 
-    # Drop deleted dashboards from state.
+    # Drop deleted dashboards from lineage. Tombstones are a separate state file.
     for stale_id in set(lineage_state) - current_ids:
         lineage_state.pop(stale_id, None)
 
     save_state("state/dashboard-lineage.json", lineage_state)
-    return lineage_state
+    return lineage_state, dashboards, describe_errors
 
 
 def _extract_topic_datasets(response: dict) -> list[str]:
@@ -996,71 +1031,100 @@ def collect_agent_evidence(usage_state: dict) -> dict:
                     _route(resource_type, resource_id, False, ts)
 
     usage_state["agentLastRun"] = _iso(now)
+    if not usage_state.get("agentCoverageStart"):
+        usage_state["agentCoverageStart"] = _iso(start)
     return usage_state
 
 
-def last_view_by_dashboard(dashboard_ids: list[str]) -> dict[str, dt.datetime]:
-    """Latest non-zero DashboardViewCount datapoint per dashboard."""
-    result: dict[str, dt.datetime] = {}
-    remaining = list(dashboard_ids)
+def _metric_points(
+    metric_name: str,
+    dimension_name: str,
+    ids: list[str],
+    start: dt.datetime,
+    end: dt.datetime,
+) -> dict[str, list[tuple[dt.datetime, float]]]:
+    """GetMetricData for one metric, keyed by dimension value.
 
-    def _query(ids: list[str], days: int, batch_size: int) -> None:
-        end = _utcnow()
-        start = end - dt.timedelta(days=days)
-        for chunk_start in range(0, len(ids), batch_size):
-            chunk = ids[chunk_start:chunk_start + batch_size]
-            queries = [
-                {
-                    "Id": f"m{i}",
-                    "MetricStat": {
-                        "Metric": {
-                            "Namespace": "AWS/QuickSight",
-                            "MetricName": "DashboardViewCount",
-                            "Dimensions": [
-                                {"Name": "DashboardId", "Value": dash_id}
-                            ],
-                        },
-                        "Period": 86400,
-                        "Stat": "Sum",
+    Ids are chunked by 100. 455 daily points times 100 metrics stays under the
+    100,800 datapoints-per-call limit.
+    """
+    points: dict[str, list[tuple[dt.datetime, float]]] = {item_id: [] for item_id in ids}
+    for chunk_start in range(0, len(ids), 100):
+        chunk = ids[chunk_start:chunk_start + 100]
+        queries = [
+            {
+                "Id": f"m{i}",
+                "MetricStat": {
+                    "Metric": {
+                        "Namespace": "AWS/QuickSight",
+                        "MetricName": metric_name,
+                        "Dimensions": [{"Name": dimension_name, "Value": item_id}],
                     },
-                    "ReturnData": True,
-                }
-                for i, dash_id in enumerate(chunk)
-            ]
-            id_map = {f"m{i}": dash_id for i, dash_id in enumerate(chunk)}
-            next_token: str | None = None
-            while True:
-                kwargs: dict[str, Any] = {
-                    "MetricDataQueries": queries,
-                    "StartTime": start,
-                    "EndTime": end,
-                    "ScanBy": "TimestampDescending",
-                }
-                if next_token:
-                    kwargs["NextToken"] = next_token
-                response = cloudwatch.get_metric_data(**kwargs)
-                for series in response.get("MetricDataResults", []):
-                    dash_id = id_map[series["Id"]]
-                    if dash_id in result:
-                        continue
-                    for ts, value in zip(series["Timestamps"], series["Values"]):
-                        if value > 0:
-                            existing = result.get(dash_id)
-                            if existing is None or ts > existing:
-                                result[dash_id] = ts
-                            break
-                next_token = response.get("NextToken")
-                if not next_token:
-                    break
+                    "Period": 86400,
+                    "Stat": "Sum",
+                },
+                "ReturnData": True,
+            }
+            for i, item_id in enumerate(chunk)
+        ]
+        id_map = {f"m{i}": item_id for i, item_id in enumerate(chunk)}
+        next_token: str | None = None
+        while True:
+            kwargs: dict[str, Any] = {
+                "MetricDataQueries": queries,
+                "StartTime": start,
+                "EndTime": end,
+            }
+            if next_token:
+                kwargs["NextToken"] = next_token
+            response = cloudwatch.get_metric_data(**kwargs)
+            for series in response.get("MetricDataResults", []):
+                item_id = id_map[series["Id"]]
+                points[item_id].extend(
+                    zip(series.get("Timestamps", []), series.get("Values", []))
+                )
+            next_token = response.get("NextToken")
+            if not next_token:
+                break
+    return points
 
-    # 90-day pass for everyone, then a 15-month pass for the silent ones.
-    _query(remaining, VIEW_LOOKBACK_DAYS_PRIMARY, 500)
-    silent = [d for d in remaining if d not in result]
-    if silent:
-        # 455 daily datapoints x 200 metrics stays under the 100,800
-        # datapoints-per-call limit.
-        _query(silent, VIEW_LOOKBACK_DAYS_EXTENDED, 200)
-    return result
+
+def dashboard_view_stats(dashboard_ids: list[str]) -> dict[str, dict]:
+    """DashboardViewCount over 455 days: last view, history start, and the sums."""
+    now = _utcnow()
+    series = _metric_points(
+        "DashboardViewCount",
+        "DashboardId",
+        dashboard_ids,
+        now - dt.timedelta(days=VIEW_LOOKBACK_DAYS_EXTENDED),
+        now,
+    )
+    return {
+        dash_id: rules.summarize_views(points, now)
+        for dash_id, points in series.items()
+    }
+
+
+def ingestion_counts_30d(dataset_ids: list[str]) -> dict[str, int]:
+    """Sum of IngestionInvocationCount per dataset over 30 days.
+
+    The metric has no RequestSource dimension, so this is scheduled and manual
+    refreshes together. The per-dataset metric, not the account aggregate.
+    """
+    if not dataset_ids:
+        return {}
+    end = _utcnow()
+    series = _metric_points(
+        "IngestionInvocationCount",
+        "DatasetId",
+        dataset_ids,
+        end - dt.timedelta(days=30),
+        end,
+    )
+    return {
+        dataset_id: int(sum(value for _ts, value in points))
+        for dataset_id, points in series.items()
+    }
 
 
 def _find_ids(node: Any, wanted_keys: set[str], found: set[str]) -> None:
@@ -1076,37 +1140,96 @@ def _find_ids(node: Any, wanted_keys: set[str], found: set[str]) -> None:
             _find_ids(item, wanted_keys, found)
 
 
-def collect_cloudtrail_evidence(usage_state: dict) -> dict:
+def _hit_at(value: Any) -> str | None:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        return value.get("at")
+    return None
+
+
+def _migrate_dataset_hits(hits: dict) -> dict[str, dict]:
+    """Re-key dataset hits by bare id. Older state stored a timestamp string."""
+    normalized: dict[str, dict] = {}
+    for key, value in hits.items():
+        bare = _normalize_qs_id(str(key), "dataset")
+        if isinstance(value, str):
+            hit = {"at": value, "kind": None, "assetId": None}
+        elif isinstance(value, dict):
+            hit = {
+                "at": value.get("at"),
+                "kind": value.get("kind"),
+                "assetId": value.get("assetId"),
+            }
+        else:
+            continue
+        previous = normalized.get(bare)
+        if previous is None or (
+            hit.get("at") and hit["at"] > (previous.get("at") or "")
+        ):
+            normalized[bare] = hit
+    return normalized
+
+
+def _resource_strings(node: Any, found: list[str]) -> None:
+    """ARN and resourceId strings, the ones that name a dashboard or analysis."""
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key in ("resourceId", "ResourceId", "ARN", "arn") and isinstance(value, str):
+                found.append(value)
+            else:
+                _resource_strings(value, found)
+    elif isinstance(node, list):
+        for item in node:
+            _resource_strings(item, found)
+
+
+def collect_cloudtrail_evidence(
+    usage_state: dict,
+    spice_ids: set[str],
+    windows_by_dataset: dict[str, list[dict]],
+) -> dict:
     """
     Merge CloudTrail Event history evidence into usage state:
-      datasets:   {datasetId: lastQueriedAt}   from QueryDatabase events
-      dashboards: {dashboardId: lastViewedAt}  from GetDashboard events
+      datasets:   {datasetId: {at, kind, assetId}}  from QueryDatabase
+      dashboards: {dashboardId: lastViewedAt}       from GetDashboard
 
-    CloudTrail events reference resources by ARN (sometimes doubled), so
-    every found value — and every key already in state from older collector
-    versions — is normalized to the bare ID before storing/matching.
+    A SPICE QueryDatabase event inside a refresh of that dataset is not use.
+    The first run after coverageStart is missing rescans the 90-day floor and
+    stamps that floor. Older hits already in state still count.
     """
     now = _utcnow()
     last_run = _parse_iso(usage_state.get("lastRun"))
     floor = now - dt.timedelta(days=CT_LOOKBACK_DAYS)
-    start = max(last_run, floor) if last_run else floor
+    full_rescan = not usage_state.get("coverageStart")
+    start = floor if full_rescan else (max(last_run, floor) if last_run else floor)
 
-    # Migrate pre-fix state: keys may be ARNs; re-key by bare ID.
-    usage_state["datasets"] = _normalize_hit_map(
-        usage_state.get("datasets", {}), "dataset"
-    )
+    usage_state["datasets"] = _migrate_dataset_hits(usage_state.get("datasets", {}))
     usage_state["dashboards"] = _normalize_hit_map(
         usage_state.get("dashboards", {}), "dashboard"
     )
-    dataset_hits: dict[str, str] = usage_state["datasets"]
+    dataset_hits: dict[str, dict] = usage_state["datasets"]
     dashboard_hits: dict[str, str] = usage_state["dashboards"]
+    truncated = False
+
+    def _windows(dataset_id: str) -> list[dict]:
+        converted = []
+        for item in windows_by_dataset.get(dataset_id, []):
+            created = item.get("created")
+            if isinstance(created, dt.datetime):
+                converted.append(item)
+            elif isinstance(created, str):
+                parsed = _parse_iso(created)
+                if parsed is not None:
+                    converted.append({"created": parsed, "duration": item.get("duration")})
+        return converted
 
     def _scan(
         event_name: str,
         wanted_keys: set[str],
-        target: dict[str, str],
         kind: str,
     ) -> None:
+        nonlocal truncated
         pages = 0
         paginator = cloudtrail.get_paginator("lookup_events")
         page_iter = paginator.paginate(
@@ -1120,7 +1243,8 @@ def collect_cloudtrail_evidence(usage_state: dict) -> dict:
             ct_pacer.wait()
             pages += 1
             for event in page.get("Events", []):
-                event_time = _iso(event.get("EventTime"))
+                event_dt = event.get("EventTime")
+                event_time = _iso(event_dt)
                 try:
                     detail = json.loads(event.get("CloudTrailEvent", "{}"))
                 except json.JSONDecodeError:
@@ -1129,35 +1253,242 @@ def collect_cloudtrail_evidence(usage_state: dict) -> dict:
                 _find_ids(detail, wanted_keys, found)
                 for resource_id in found:
                     bare_id = _normalize_qs_id(resource_id, kind)
-                    previous = target.get(bare_id)
-                    if event_time and (previous is None or event_time > previous):
-                        target[bare_id] = event_time
+                    if (
+                        kind == "dataset"
+                        and bare_id in spice_ids
+                        and isinstance(event_dt, dt.datetime)
+                        and not rules.query_counts_as_use(
+                            "SPICE", event_dt, _windows(bare_id), now
+                        )
+                    ):
+                        continue
+                    if kind == "dataset":
+                        previous = _hit_at(dataset_hits.get(bare_id))
+                        if event_time and (previous is None or event_time > previous):
+                            strings: list[str] = []
+                            _resource_strings(detail, strings)
+                            asset_kind, asset_id = rules.named_asset(strings)
+                            dataset_hits[bare_id] = {
+                                "at": event_time,
+                                "kind": asset_kind,
+                                "assetId": asset_id,
+                            }
+                    else:
+                        previous = dashboard_hits.get(bare_id)
+                        if event_time and (previous is None or event_time > previous):
+                            dashboard_hits[bare_id] = event_time
             if pages >= MAX_CT_PAGES_PER_EVENT_NAME:
                 print(f"WARN CloudTrail scan for {event_name} hit page cap")
-                usage_state["telemetryTruncated"] = True
+                truncated = True
                 break
 
-    _scan(
-        "QueryDatabase",
-        {"dataSetId", "datasetId", "DataSetId"},
-        dataset_hits,
-        "dataset",
-    )
-    _scan(
-        "GetDashboard",
-        {"dashboardId", "DashboardId"},
-        dashboard_hits,
-        "dashboard",
-    )
-    _scan(
-        "GetDashboardEmbedUrl",
-        {"dashboardId", "DashboardId"},
-        dashboard_hits,
-        "dashboard",
-    )
+    _scan("QueryDatabase", {"dataSetId", "datasetId", "DataSetId"}, "dataset")
+    _scan("GetDashboard", {"dashboardId", "DashboardId"}, "dashboard")
+    _scan("GetDashboardEmbedUrl", {"dashboardId", "DashboardId"}, "dashboard")
 
+    rules.forget_refresh_hits(dataset_hits, windows_by_dataset, floor, now)
     usage_state["lastRun"] = _iso(now)
+    if full_rescan and not truncated:
+        usage_state["coverageStart"] = _iso(floor)
+    if truncated:
+        usage_state["telemetryTruncated"] = True
     return usage_state
+
+
+def refresh_ingestion_facts(datasets: list[dict], floor: dt.datetime) -> dict[str, dict]:
+    """Ingestion windows, last refresh, and the newest scheduled run.
+
+    Pages newest-first until it overlaps a completed earlier pass or passes
+    ``floor``. The cap is one full 90-day history of a 15-minute schedule.
+    shortcut: a faster cadence than that still stops at the cap, and the next
+    run repeats those pages instead of continuing further back.
+    """
+    state = load_state("state/ingestion-windows.json")
+    stored = state.get("datasets", {})
+    if not isinstance(stored, dict):
+        stored = {}
+    facts: dict[str, dict] = {}
+    current_ids = set()
+    for summary in datasets:
+        if summary.get("ImportMode") != "SPICE":
+            continue
+        dataset_id = summary["DataSetId"]
+        current_ids.add(dataset_id)
+        entry = stored.get(dataset_id) or {}
+        known = {
+            item.get("created")
+            for item in entry.get("windows", [])
+            if isinstance(item, dict)
+        }
+        covered = _parse_iso(entry.get("coveredFrom"))
+        history_complete = covered is not None and covered <= floor
+        fetched: list[dict] = []
+        newest: list[dict] = []
+        reached_floor = False
+        paginator = quicksight.get_paginator("list_ingestions")
+        page_iter = paginator.paginate(
+            AwsAccountId=ACCOUNT_ID,
+            DataSetId=dataset_id,
+            PaginationConfig={"PageSize": 100},
+        )
+        pages = 0
+        try:
+            for page in page_iter:
+                qs_pacer.wait()
+                pages += 1
+                stop = False
+                for ingestion in page.get("Ingestions", []):
+                    created = ingestion.get("CreatedTime")
+                    if not isinstance(created, dt.datetime):
+                        continue
+                    created_iso = _iso(created)
+                    if len(newest) < INGESTION_LOOKBACK_RUNS:
+                        newest.append(ingestion)
+                    if created_iso not in known:
+                        fetched.append({
+                            "created": created_iso,
+                            "duration": ingestion.get("IngestionTimeInSeconds"),
+                            "source": ingestion.get("RequestSource"),
+                        })
+                    if created < floor:
+                        reached_floor = True
+                        stop = True
+                        break
+                    if history_complete and created_iso in known:
+                        stop = True
+                        break
+                if stop or pages >= INGESTION_PAGE_CAP:
+                    if pages >= INGESTION_PAGE_CAP and not stop:
+                        print(f"WARN ingestion history page cap for {dataset_id}")
+                    break
+        except ClientError as error:
+            print(f"WARN ListIngestions failed for {dataset_id}: {error}")
+        merged = rules.merge_windows(entry.get("windows", []), fetched, floor)
+        if reached_floor:
+            covered_from = _iso(floor)
+        elif merged:
+            covered_from = merged[0]["created"]
+        else:
+            covered_from = entry.get("coveredFrom")
+        stored[dataset_id] = {"windows": merged, "coveredFrom": covered_from}
+        refresh = derive_refresh_state(newest) if newest else {}
+        newest_scheduled = None
+        for ingestion in newest:
+            if ingestion.get("RequestSource") == "SCHEDULED":
+                newest_scheduled = ingestion.get("CreatedTime")
+                break
+        facts[dataset_id] = {
+            "windows": [
+                {
+                    "created": _parse_iso(item["created"]),
+                    "duration": item.get("duration"),
+                }
+                for item in merged
+                if _parse_iso(item.get("created")) is not None
+            ],
+            "last_refresh_at": refresh.get("lastAttemptAt"),
+            "last_refresh_source": refresh.get("lastRequestSource"),
+            "last_refresh_status": refresh.get("lastStatus"),
+            "avg_duration_sec": refresh.get("avgDurationSec"),
+            "newest_scheduled": newest_scheduled,
+        }
+    for stale_id in list(stored):
+        if stale_id not in current_ids:
+            stored.pop(stale_id, None)
+    save_state("state/ingestion-windows.json", {"datasets": stored})
+    return facts
+
+
+def list_dataset_schedules(dataset_id: str) -> list[dict]:
+    """Refresh schedules for one dataset. A dataset holds at most five.
+
+    A ClientError propagates. The caller counts it and leaves the schedule
+    count unset, instead of recording zero schedules.
+    """
+    qs_pacer.wait()
+    response = quicksight.list_refresh_schedules(
+        AwsAccountId=ACCOUNT_ID, DataSetId=dataset_id
+    )
+    schedules = []
+    for item in response.get("RefreshSchedules", []):
+        frequency = item.get("ScheduleFrequency") or {}
+        day = frequency.get("RefreshOnDay") or {}
+        start = item.get("StartAfterDateTime")
+        if isinstance(start, dt.datetime) and start.tzinfo is None:
+            start = start.replace(tzinfo=dt.timezone.utc)
+        schedules.append({
+            "schedule_id": item.get("ScheduleId"),
+            "interval": frequency.get("Interval"),
+            "time_of_day": frequency.get("TimeOfTheDay"),
+            "timezone": frequency.get("Timezone"),
+            "day_of_week": day.get("DayOfWeek"),
+            "day_of_month": day.get("DayOfMonth"),
+            "refresh_type": item.get("RefreshType"),
+            "start_after": start if isinstance(start, dt.datetime) else None,
+        })
+    return schedules
+
+
+def load_owner_index() -> dict[tuple[str, str], str]:
+    """findingType from the Orphaned Assets snapshot, when that module is deployed."""
+    try:
+        response = s3.get_object(
+            Bucket=STATE_BUCKET,
+            Key="orphaned-assets/latest-ownership.jsonl",
+        )
+        body = response["Body"].read().decode("utf-8")
+    except ClientError as error:
+        print(f"WARN owner snapshot unavailable: {error}")
+        return {}
+    index: dict[tuple[str, str], str] = {}
+    for line in body.splitlines():
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        asset_type = row.get("assetType")
+        asset_id = row.get("assetId")
+        if asset_type and asset_id:
+            index[(asset_type, asset_id)] = row.get("findingType") or "not available"
+    return index
+
+
+def reconcile_deleted_dashboards(current: list[dict]) -> list[dict]:
+    """Tombstones for dashboards that disappeared from ListDashboards."""
+    known = load_state("state/known-dashboards.json")
+    now = _utcnow()
+    now_iso = _iso(now)
+    for summary in current:
+        known[summary["DashboardId"]] = {
+            "name": summary.get("Name"),
+            "lastSeen": now_iso,
+        }
+    current_ids = {summary["DashboardId"] for summary in current}
+    tombstones: list[dict] = []
+    for dashboard_id in list(known):
+        if dashboard_id in current_ids:
+            known[dashboard_id].pop("deletedAt", None)
+            continue
+        entry = known[dashboard_id]
+        deleted_at = _parse_iso(entry.get("deletedAt"))
+        if deleted_at is None:
+            deleted_at = now
+            entry["deletedAt"] = now_iso
+        if (now - deleted_at).days > LOG_RETENTION_DAYS:
+            known.pop(dashboard_id)
+            continue
+        tombstones.append(
+            rules.dashboard_tombstone(now, dashboard_id, entry.get("name"))
+        )
+    save_state("state/known-dashboards.json", known)
+    return tombstones
+
+
+def _earliest(*values: dt.datetime | None) -> dt.datetime | None:
+    present = [value for value in values if value is not None]
+    return min(present) if present else None
 
 
 def run_slow_loop() -> dict:
@@ -1167,7 +1498,8 @@ def run_slow_loop() -> dict:
     now_iso = _iso(now)
 
     datasets = list_datasets()
-    lineage_state = refresh_dashboard_lineage()
+    lineage_state, dashboard_summaries, lineage_errors = refresh_dashboard_lineage()
+    api_errors += lineage_errors
     space_lineage, agent_count = refresh_space_lineage()
     space_topic_ids = {
         topic_id
@@ -1202,17 +1534,52 @@ def run_slow_loop() -> dict:
         for dataset_arn in effective:
             arn_to_spaces.setdefault(dataset_arn, []).append(space_id)
 
-    view_times = last_view_by_dashboard(list(lineage_state.keys()))
+    spice_ids = {
+        summary["DataSetId"]
+        for summary in datasets
+        if summary.get("ImportMode") == "SPICE"
+    }
+    try:
+        ingestion_facts = refresh_ingestion_facts(
+            datasets, now - dt.timedelta(days=CT_LOOKBACK_DAYS)
+        )
+    except ClientError as error:
+        api_errors += 1
+        ingestion_facts = {}
+        print(f"WARN ingestion windows failed: {error}")
+    view_stats = dashboard_view_stats([
+        summary["DashboardId"] for summary in dashboard_summaries
+    ])
+    dashboard_names = {
+        dashboard_id: info.get("name") or dashboard_id
+        for dashboard_id, info in lineage_state.items()
+    }
 
     usage_state = load_state("state/usage-state.json")
     if ENABLE_CLOUDTRAIL:
         try:
-            usage_state = collect_cloudtrail_evidence(usage_state)
+            usage_state = collect_cloudtrail_evidence(
+                usage_state,
+                spice_ids,
+                {
+                    dataset_id: facts.get("windows", [])
+                    for dataset_id, facts in ingestion_facts.items()
+                },
+            )
         except ClientError as error:
             api_errors += 1
             print(f"WARN CloudTrail evidence collection failed: {error}")
     usage_state = collect_agent_evidence(usage_state)
     save_state("state/usage-state.json", usage_state)
+    owner_index = load_owner_index()
+    refresh_counts_read = True
+    try:
+        refresh_counts = ingestion_counts_30d(sorted(spice_ids))
+    except ClientError as error:
+        api_errors += 1
+        refresh_counts = {}
+        refresh_counts_read = False
+        print(f"WARN ingestion counts failed: {error}")
     ct_dataset_hits = usage_state.get("datasets", {})
     ct_dashboard_hits = usage_state.get("dashboards", {})
     agent_cited_datasets = usage_state.get("agentDatasets", {})
@@ -1248,6 +1615,8 @@ def run_slow_loop() -> dict:
                 scope_hits[dataset_arn] = candidate
 
     records: list[dict] = []
+    schedule_rows: list[dict] = []
+    planned_rows: list[dict] = []
     no_observed_use = 0
     unreferenced = 0
     total_spice_gb = 0.0
@@ -1265,71 +1634,75 @@ def run_slow_loop() -> dict:
             for agent_id in space_lineage.get(space_id, {}).get("agentIds", [])
         })
 
-        # --- usage evidence -------------------------------------------------
-        # Candidates: (timestamp, confidence, source). Highest timestamp wins;
-        # on a tie, the higher-confidence source wins.
-        candidates: list[tuple[dt.datetime, str, str]] = []
+        # Candidates: (timestamp, confidence, source, query label).
+        # Highest timestamp wins; on a tie, the higher-confidence source wins.
+        candidates: list[tuple[dt.datetime, str, str, str | None]] = []
 
         # Agent evidence (CHAT_LOGS): the consumption path dashboards miss.
         agent_cited_at = _parse_iso(agent_cited_datasets.get(dataset_id))
         if agent_cited_at:
-            candidates.append((agent_cited_at, "HIGH", "AGENT_CITED_DATASET"))
+            candidates.append((agent_cited_at, "HIGH", "AGENT_CITED_DATASET", None))
         agent_selected_at = _parse_iso(agent_selected_datasets.get(dataset_id))
         if agent_selected_at:
             candidates.append(
-                (agent_selected_at, "MEDIUM", "AGENT_SELECTED_RESOURCE")
+                (agent_selected_at, "MEDIUM", "AGENT_SELECTED_RESOURCE", None)
             )
         for topic_id in topic_ids:
             topic_at = _parse_iso(agent_topic_hits.get(topic_id))
             if topic_at:
-                candidates.append((topic_at, "MEDIUM", "AGENT_CITED_TOPIC"))
+                candidates.append((topic_at, "MEDIUM", "AGENT_CITED_TOPIC", None))
         for space_id in space_ids:
             space_at = _parse_iso(agent_space_hits.get(space_id))
             if space_at:
-                candidates.append((space_at, "MEDIUM", "AGENT_USED_SPACE"))
+                candidates.append((space_at, "MEDIUM", "AGENT_USED_SPACE", None))
         scope_hit = scope_hits.get(dataset_arn)
         if scope_hit:
             candidates.append(
-                (scope_hit[0], scope_hit[1], "AGENT_CONVERSATION_SCOPE")
+                (scope_hit[0], scope_hit[1], "AGENT_CONVERSATION_SCOPE", None)
             )
 
-        # CloudTrail QueryDatabase: HIGH for direct-query datasets (queries
-        # only happen when something actually uses them). For SPICE the
-        # signal is ambiguous — verified empirically: interactive sessions
-        # emit service-initiated queries (e.g. "dataset-prewarm-count") AND
-        # refreshes query the source too — so it counts as MEDIUM, never
-        # discarded.
-        queried_at = _parse_iso(ct_dataset_hits.get(dataset_id))
+        # CloudTrail QueryDatabase. Refresh-time SPICE events were dropped
+        # while the evidence was collected. What remains is MEDIUM for SPICE
+        # (a query and a refresh can still look alike outside the window) and
+        # HIGH for direct query.
+        query_hit = ct_dataset_hits.get(dataset_id)
+        queried_at = _parse_iso(_hit_at(query_hit))
+        query_label = None
+        if isinstance(query_hit, dict):
+            query_label = rules.query_source_label(
+                query_hit.get("kind"), query_hit.get("assetId"), dashboard_names
+            )
         if queried_at:
             confidence = "MEDIUM" if import_mode == "SPICE" else "HIGH"
-            candidates.append((queried_at, confidence, "CLOUDTRAIL_QUERY"))
+            candidates.append((queried_at, confidence, "CLOUDTRAIL_QUERY", query_label))
 
         # Dashboard-view evidence (native metric + CloudTrail + agent cite).
         for dashboard_id in dashboard_ids:
-            metric_ts = view_times.get(dashboard_id)
+            metric_ts = view_stats.get(dashboard_id, {}).get("last")
             if metric_ts:
-                candidates.append((metric_ts, "MEDIUM", "DASHBOARD_VIEW_METRIC"))
+                candidates.append((metric_ts, "MEDIUM", "DASHBOARD_VIEW_METRIC", None))
             trail_ts = _parse_iso(ct_dashboard_hits.get(dashboard_id))
             if trail_ts:
                 candidates.append(
-                    (trail_ts, "MEDIUM", "DASHBOARD_VIEW_CLOUDTRAIL")
+                    (trail_ts, "MEDIUM", "DASHBOARD_VIEW_CLOUDTRAIL", None)
                 )
             agent_dash_ts = _parse_iso(agent_dashboard_hits.get(dashboard_id))
             if agent_dash_ts:
                 candidates.append(
-                    (agent_dash_ts, "MEDIUM", "AGENT_CITED_DASHBOARD")
+                    (agent_dash_ts, "MEDIUM", "AGENT_CITED_DASHBOARD", None)
                 )
 
         is_referenced = bool(dashboard_ids or topic_ids or space_ids)
         last_used_at: dt.datetime | None = None
         usage_confidence = "NO_EVIDENCE"
         usage_source = None
+        query_asset_label = None
         if candidates:
             candidates.sort(
                 key=lambda c: (c[0], CONFIDENCE_RANK.get(c[1], 0)),
                 reverse=True,
             )
-            last_used_at, usage_confidence, usage_source = candidates[0]
+            last_used_at, usage_confidence, usage_source, query_asset_label = candidates[0]
         elif is_referenced:
             usage_confidence = "LOW"
             usage_source = "DEPENDENCY_ONLY"
@@ -1340,11 +1713,12 @@ def run_slow_loop() -> dict:
 
         # --- capacity + estimated cost (SPICE only, best effort) -----------
         spice_gb: float | None = None
+        data_source: str | None = None
         cost_type = "UNKNOWN"
         est_monthly_cost: float | None = None
         if import_mode == "SPICE":
             try:
-                spice_gb, _supported = describe_spice_capacity(dataset_id)
+                spice_gb, _supported, data_source = describe_spice_capacity(dataset_id)
             except ClientError as error:
                 api_errors += 1
                 print(f"WARN DescribeDataSet failed for {dataset_id}: {error}")
@@ -1353,19 +1727,93 @@ def run_slow_loop() -> dict:
                 cost_type = "ESTIMATED_PURCHASED"
                 est_monthly_cost = round(spice_gb * SPICE_RATE_PER_GB_MONTH, 2)
 
+        refresh_fact = ingestion_facts.get(dataset_id, {})
+        expanded_schedules: list[dict] = []
+        schedules_read = True
+        if import_mode == "SPICE":
+            try:
+                raw_schedules = list_dataset_schedules(dataset_id)
+            except ClientError as error:
+                api_errors += 1
+                schedules_read = False
+                raw_schedules = []
+                print(f"WARN schedules failed for {dataset_id}: {error}")
+            if schedules_read:
+                for raw in raw_schedules:
+                    expanded = rules.expand_schedule(
+                        raw, now, refresh_fact.get("newest_scheduled")
+                    )
+                    expanded["schedule_id"] = raw.get("schedule_id")
+                    expanded["refresh_type"] = raw.get("refresh_type")
+                    expanded["interval"] = raw.get("interval")
+                    expanded["timezone"] = raw.get("timezone")
+                    expanded["start_after"] = raw.get("start_after")
+                    expanded_schedules.append(expanded)
+        schedule_count = rules.observed_count(schedules_read, len(expanded_schedules))
+        concrete_next = [
+            item["next_run_at"] for item in expanded_schedules if item.get("next_run_at")
+        ]
+        next_run_at = min(concrete_next) if concrete_next else None
+        for item in expanded_schedules:
+            planned = rules.planned_runs(item)
+            schedule_rows.append({
+                "ts": now_iso,
+                "recordKind": "schedule",
+                "datasetId": dataset_id,
+                "datasetName": summary.get("Name"),
+                "scheduleId": item.get("schedule_id"),
+                "refreshType": item.get("refresh_type"),
+                "interval": item.get("interval"),
+                "timezone": item.get("timezone"),
+                "definition": item.get("definition"),
+                "nextRunAt": item.get("next_run_at"),
+                "nextRunLabel": item.get("next_run_label"),
+                "runsPerDay": item.get("runs_per_day"),
+                "minuteKnown": "true" if item.get("minute_known") else "false",
+                "minuteSource": item.get("minute_source"),
+                "startAfterAt": _iso(item.get("start_after")),
+                "avgDurationSec": refresh_fact.get("avg_duration_sec"),
+                "lastRefreshStatus": refresh_fact.get("last_refresh_status"),
+                "dataSource": data_source,
+            })
+            for run_iso in planned:
+                run_at = _parse_iso(run_iso)
+                planned_rows.append({
+                    "ts": now_iso,
+                    "recordKind": "planned_run",
+                    "datasetId": dataset_id,
+                    "datasetName": summary.get("Name"),
+                    "scheduleId": item.get("schedule_id"),
+                    "refreshType": item.get("refresh_type"),
+                    "runAt": run_iso,
+                    "hourUtc": run_at.hour if run_at else None,
+                    "dataSource": data_source,
+                })
+
+        metric_starts = [
+            view_stats.get(dashboard_id, {}).get("history_start")
+            for dashboard_id in dashboard_ids
+        ]
+        coverage_start = _earliest(
+            _parse_iso(usage_state.get("coverageStart")) if ENABLE_CLOUDTRAIL else None,
+            _parse_iso(usage_state.get("agentCoverageStart")) if CHAT_LOG_GROUP else None,
+            *metric_starts,
+        )
+        created_at = summary.get("CreatedTime")
+        if isinstance(created_at, dt.datetime) and created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=dt.timezone.utc)
+        if not isinstance(created_at, dt.datetime):
+            created_at = None
+        judged = rules.judge(
+            now, last_used_at, coverage_start, created_at, UNUSED_THRESHOLD_DAYS
+        )
+
         # --- findings -------------------------------------------------------
         findings: list[str] = []
         if import_mode == "SPICE" and not is_referenced:
             findings.append("SPICE_DATASET_NOT_REFERENCED")
             unreferenced += 1
-        evidence_window_covers_threshold = (
-            VIEW_LOOKBACK_DAYS_EXTENDED >= UNUSED_THRESHOLD_DAYS
-        )
-        if (
-            is_referenced
-            and evidence_window_covers_threshold
-            and (days_since_use is None or days_since_use > UNUSED_THRESHOLD_DAYS)
-        ):
+        if judged["usageState"] == "IDLE":
             findings.append("NO_OBSERVED_USE")
             no_observed_use += 1
 
@@ -1384,9 +1832,27 @@ def run_slow_loop() -> dict:
             "daysSinceObservedUse": days_since_use,
             "usageConfidence": usage_confidence,
             "usageSource": usage_source,
+            "usageSourceLabel": rules.evidence_label(usage_source, query_asset_label),
             "viewLookbackDays": VIEW_LOOKBACK_DAYS_EXTENDED,
             "queryLookbackDays": CT_LOOKBACK_DAYS if ENABLE_CLOUDTRAIL else 0,
             "agentLookbackDays": AGENT_LOOKBACK_DAYS if CHAT_LOG_GROUP else 0,
+            "coverageStart": _iso(coverage_start),
+            "coverageDays": judged["coverageDays"],
+            "datasetCreatedAt": _iso(created_at),
+            "usageState": judged["usageState"],
+            "unknownReason": judged["unknownReason"],
+            "recheckAfter": judged["recheckAfter"],
+            "scheduleCount": schedule_count,
+            "nextRunAt": next_run_at,
+            "refreshCount30d": rules.observed_count(
+                refresh_counts_read, refresh_counts.get(dataset_id, 0)
+            ),
+            "lastRefreshAt": refresh_fact.get("last_refresh_at"),
+            "lastRefreshSource": refresh_fact.get("last_refresh_source"),
+            "lastRefreshStatus": refresh_fact.get("last_refresh_status"),
+            "avgDurationSec": refresh_fact.get("avg_duration_sec"),
+            "dataSource": data_source,
+            "ownerStatus": owner_index.get(("DATASET", dataset_id), "not available"),
             "spiceGB": spice_gb,
             "estMonthlyCostUsd": est_monthly_cost,
             "costType": cost_type,
@@ -1396,6 +1862,46 @@ def run_slow_loop() -> dict:
 
     records.extend(reconcile_deleted_datasets("slow", datasets))
     write_snapshot("slow", records)
+
+    dataset_names_by_id = {
+        summary["DataSetId"]: summary.get("Name") for summary in datasets
+    }
+    dashboard_records: list[dict] = []
+    ct_coverage = _parse_iso(usage_state.get("coverageStart")) if ENABLE_CLOUDTRAIL else None
+    for summary in dashboard_summaries:
+        dashboard_id = summary["DashboardId"]
+        info = lineage_state.get(dashboard_id, {})
+        dataset_arns = info.get("dataSetArns", [])
+        dataset_ids = [_normalize_qs_id(arn, "dataset") for arn in dataset_arns]
+        views = view_stats.get(dashboard_id) or rules.summarize_views([], now)
+        created_at = summary.get("CreatedTime")
+        published_at = summary.get("LastPublishedTime")
+        if isinstance(created_at, dt.datetime) and created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=dt.timezone.utc)
+        if isinstance(published_at, dt.datetime) and published_at.tzinfo is None:
+            published_at = published_at.replace(tzinfo=dt.timezone.utc)
+        dashboard_records.append(rules.build_dashboard_record(
+            now,
+            dashboard_id,
+            summary.get("Name"),
+            created_at if isinstance(created_at, dt.datetime) else None,
+            published_at if isinstance(published_at, dt.datetime) else None,
+            views,
+            _parse_iso(ct_dashboard_hits.get(dashboard_id)),
+            _earliest(ct_coverage, views.get("history_start")),
+            dataset_ids,
+            [dataset_names_by_id.get(dataset_id) or dataset_id for dataset_id in dataset_ids],
+            owner_index.get(("DASHBOARD", dashboard_id), "not available"),
+            UNUSED_THRESHOLD_DAYS,
+        ))
+    dashboard_records.extend(reconcile_deleted_dashboards(dashboard_summaries))
+    write_snapshot("dashboards", dashboard_records)
+    write_snapshot("schedules", schedule_rows + planned_rows)
+
+    idle_datasets = sum(1 for record in records if record.get("usageState") == "IDLE")
+    idle_dashboards = sum(
+        1 for record in dashboard_records if record.get("usageState") == "IDLE"
+    )
 
     scan_seconds = round(time.monotonic() - started)
     put_kpis({
@@ -1414,6 +1920,9 @@ def run_slow_loop() -> dict:
         "dashboards": len(lineage_state), "topics": len(topic_lineage),
         "spaces": len(space_lineage), "agents": agent_count,
         "noObservedUse": no_observed_use,
+        "idleDatasets": idle_datasets,
+        "idleDashboards": idle_dashboards,
+        "schedules": len(schedule_rows),
         "unreferenced": unreferenced, "apiErrors": api_errors,
         "seconds": scan_seconds,
     }
