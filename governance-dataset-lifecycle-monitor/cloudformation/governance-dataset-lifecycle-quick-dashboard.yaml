@@ -1,10 +1,11 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
   AWS Quick dataset lifecycle monitor - native AWS Quick dashboard for
-  administrators. Glue tables over the fast (refresh health) and slow (usage,
-  lineage, capacity) snapshots the module writes to S3, current-state datasets
-  (latest run per dataset) plus a refresh history dataset, and a five-tab
-  dashboard: Overview, Refresh health, Usage, Capacity and cost, History.
+  administrators. Glue tables over the fast (refresh health), slow (usage,
+  lineage, capacity), dashboard and schedule snapshots the module writes to S3,
+  current-state datasets plus refresh and idle history, and a seven-tab
+  dashboard: Overview, Refresh health, Refresh plan, Usage, Dashboards,
+  Capacity and cost, History.
   Requires the governance analytics foundation stack in the same Region.
 
 # Prerequisites: governance-analytics-foundation in this Region; the Dataset
@@ -40,6 +41,16 @@ Parameters:
     Default: 'dataset-lifecycle/slow/'
     AllowedPattern: '^([A-Za-z0-9_=./-]+/)?$'
     Description: Prefix of the slow-loop (usage, lineage, capacity) snapshots.
+  DashboardsPrefix:
+    Type: String
+    Default: 'dataset-lifecycle/dashboards/'
+    AllowedPattern: '^([A-Za-z0-9_=./-]+/)?$'
+    Description: Prefix of the per-dashboard slow-loop snapshots.
+  SchedulesPrefix:
+    Type: String
+    Default: 'dataset-lifecycle/schedules/'
+    AllowedPattern: '^([A-Za-z0-9_=./-]+/)?$'
+    Description: Prefix of the refresh-schedule slow-loop snapshots.
   QuickPrincipalArn:
     Type: String
     AllowedPattern: '^arn:aws[a-z-]*:quicksight:[a-z0-9-]+:[0-9]{12}:(user|group)/.+$'
@@ -145,6 +156,124 @@ Resources:
             - {Name: estmonthlycostusd, Type: double}
             - {Name: costtype, Type: string}
             - {Name: findingscsv, Type: string}
+            - {Name: coveragestart, Type: string}
+            - {Name: coveragedays, Type: int}
+            - {Name: datasetcreatedat, Type: string}
+            - {Name: usagestate, Type: string}
+            - {Name: unknownreason, Type: string}
+            - {Name: recheckafter, Type: string}
+            - {Name: usagesourcelabel, Type: string}
+            - {Name: schedulecount, Type: int}
+            - {Name: nextrunat, Type: string}
+            - {Name: runsplanned24h, Type: int}
+            - {Name: runsplanned7d, Type: int}
+            - {Name: refreshcount30d, Type: int}
+            - {Name: lastrefreshat, Type: string}
+            - {Name: lastrefreshsource, Type: string}
+            - {Name: lastrefreshstatus, Type: string}
+            - {Name: avgdurationsec, Type: int}
+            - {Name: datasource, Type: string}
+            - {Name: ownerstatus, Type: string}
+
+  DashboardsTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref 'AWS::AccountId'
+      DatabaseName:
+        Fn::ImportValue: !Sub '${FoundationStackName}-GlueDatabase'
+      TableInput:
+        Name: dataset_lifecycle_dashboards
+        Description: Dataset Lifecycle Monitor - one record per dashboard per daily scan, plus tombstones.
+        TableType: EXTERNAL_TABLE
+        Parameters: {classification: json, EXTERNAL: 'TRUE'}
+        StorageDescriptor:
+          Location: !If
+            - UseSharedBucket
+            - !Sub
+              - 's3://${Bucket}/${DashboardsPrefix}'
+              - Bucket:
+                  Fn::ImportValue: !Sub '${FoundationStackName}-AnalyticsBucket'
+            - !Sub 's3://${DataBucketName}/${DashboardsPrefix}'
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.openx.data.jsonserde.JsonSerDe
+            Parameters: {ignore.malformed.json: 'true', case.insensitive: 'true'}
+          Columns:
+            - {Name: ts, Type: string}
+            - {Name: dashboardid, Type: string}
+            - {Name: dashboardname, Type: string}
+            - {Name: assetstate, Type: string}
+            - {Name: createdat, Type: string}
+            - {Name: lastpublishedat, Type: string}
+            - {Name: metriclastviewat, Type: string}
+            - {Name: cloudtraillastviewat, Type: string}
+            - {Name: lastviewat, Type: string}
+            - {Name: lastviewsource, Type: string}
+            - {Name: lastviewlabel, Type: string}
+            - {Name: dayssincelastview, Type: int}
+            - {Name: sortdays, Type: int}
+            - {Name: views30, Type: int}
+            - {Name: views60, Type: int}
+            - {Name: views90, Type: int}
+            - {Name: viewsyearago90, Type: int}
+            - {Name: metrichistorystart, Type: string}
+            - {Name: historycoversyearago, Type: string}
+            - {Name: datasetids, Type: string}
+            - {Name: datasetnames, Type: string}
+            - {Name: coveragestart, Type: string}
+            - {Name: coveragedays, Type: int}
+            - {Name: usagestate, Type: string}
+            - {Name: unknownreason, Type: string}
+            - {Name: recheckafter, Type: string}
+            - {Name: ownerstatus, Type: string}
+            - {Name: deletioncandidate, Type: string}
+
+  SchedulesTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref 'AWS::AccountId'
+      DatabaseName:
+        Fn::ImportValue: !Sub '${FoundationStackName}-GlueDatabase'
+      TableInput:
+        Name: dataset_lifecycle_schedules
+        Description: Dataset Lifecycle Monitor - one row per refresh schedule and one row per planned run.
+        TableType: EXTERNAL_TABLE
+        Parameters: {classification: json, EXTERNAL: 'TRUE'}
+        StorageDescriptor:
+          Location: !If
+            - UseSharedBucket
+            - !Sub
+              - 's3://${Bucket}/${SchedulesPrefix}'
+              - Bucket:
+                  Fn::ImportValue: !Sub '${FoundationStackName}-AnalyticsBucket'
+            - !Sub 's3://${DataBucketName}/${SchedulesPrefix}'
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.openx.data.jsonserde.JsonSerDe
+            Parameters: {ignore.malformed.json: 'true', case.insensitive: 'true'}
+          Columns:
+            - {Name: ts, Type: string}
+            - {Name: recordkind, Type: string}
+            - {Name: datasetid, Type: string}
+            - {Name: datasetname, Type: string}
+            - {Name: scheduleid, Type: string}
+            - {Name: refreshtype, Type: string}
+            - {Name: interval, Type: string}
+            - {Name: timezone, Type: string}
+            - {Name: definition, Type: string}
+            - {Name: nextrunat, Type: string}
+            - {Name: nextrunlabel, Type: string}
+            - {Name: runsperday, Type: double}
+            - {Name: minuteknown, Type: string}
+            - {Name: minutesource, Type: string}
+            - {Name: startafterat, Type: string}
+            - {Name: avgdurationsec, Type: int}
+            - {Name: lastrefreshstatus, Type: string}
+            - {Name: datasource, Type: string}
+            - {Name: runat, Type: string}
+            - {Name: hourutc, Type: int}
 
   # Refresh health: latest fast-loop record per dataset.
   HealthDataSet:
@@ -260,6 +389,7 @@ Resources:
                 )
                 SELECT
                   from_iso8601_timestamp(ts) AS scan_time,
+                  'Latest' AS scan_label,
                   datasetid AS dataset_id,
                   COALESCE(datasetname, datasetid) AS dataset_name,
                   COALESCE(importmode, 'UNKNOWN') AS import_mode,
@@ -273,12 +403,30 @@ Resources:
                   dayssinceobserveduse AS days_since_observed_use,
                   COALESCE(usageconfidence, 'NO_EVIDENCE') AS usage_confidence,
                   COALESCE(usagesource, '(none)') AS usage_source,
+                  COALESCE(usagesourcelabel, usagesource, '(none)') AS usage_source_label,
+                  TRY(from_iso8601_timestamp(coveragestart)) AS coverage_start,
+                  COALESCE(coveragedays, 0) AS coverage_days,
+                  TRY(from_iso8601_timestamp(datasetcreatedat)) AS dataset_created_at,
+                  COALESCE(usagestate, 'UNKNOWN') AS stored_state,
+                  schedulecount AS schedule_count,
+                  TRY(from_iso8601_timestamp(nextrunat)) AS next_run_at,
+                  runsplanned24h AS runs_planned_24h,
+                  refreshcount30d AS refresh_count_30d,
+                  TRY(from_iso8601_timestamp(lastrefreshat)) AS last_refresh_at,
+                  COALESCE(lastrefreshsource, '') AS started_by,
+                  COALESCE(ownerstatus, 'not available') AS owner_status,
+                  COALESCE(datasource, '(none)') AS data_source,
                   spicegb AS spice_gb,
                   estmonthlycostusd AS est_monthly_cost_usd,
                   COALESCE(costtype, '(n/a)') AS cost_type,
                   COALESCE(findingscsv, '') AS findings,
-                  CASE WHEN findingscsv LIKE '%SPICE_DATASET_NOT_REFERENCED%' THEN 1 ELSE 0 END AS unreferenced_count,
-                  CASE WHEN findingscsv LIKE '%NO_OBSERVED_USE%' THEN 1 ELSE 0 END AS no_observed_use_count,
+                  CASE WHEN importmode = 'SPICE' AND schedulecount = 0 THEN 1 ELSE 0 END AS no_schedule_count,
+                  CASE WHEN importmode = 'SPICE' AND schedulecount > 0 THEN 1 ELSE 0 END AS has_schedule_count,
+                  CASE
+                    WHEN refreshcount30d IS NULL THEN NULL
+                    WHEN importmode = 'SPICE' AND schedulecount = 0 THEN refreshcount30d
+                    ELSE 0
+                  END AS manual_refreshes_30d,
                   CASE WHEN importmode = 'SPICE' THEN 1 ELSE 0 END AS spice_count,
                   1 AS dataset_count
                 FROM ranked WHERE rn = 1 AND COALESCE(assetstate, 'ACTIVE') <> 'DELETED'
@@ -286,6 +434,7 @@ Resources:
                   Fn::ImportValue: !Sub '${FoundationStackName}-GlueDatabase'
             Columns:
               - {Name: scan_time, Type: DATETIME}
+              - {Name: scan_label, Type: STRING}
               - {Name: dataset_id, Type: STRING}
               - {Name: dataset_name, Type: STRING}
               - {Name: import_mode, Type: STRING}
@@ -299,12 +448,26 @@ Resources:
               - {Name: days_since_observed_use, Type: INTEGER}
               - {Name: usage_confidence, Type: STRING}
               - {Name: usage_source, Type: STRING}
+              - {Name: usage_source_label, Type: STRING}
+              - {Name: coverage_start, Type: DATETIME}
+              - {Name: coverage_days, Type: INTEGER}
+              - {Name: dataset_created_at, Type: DATETIME}
+              - {Name: stored_state, Type: STRING}
+              - {Name: schedule_count, Type: INTEGER}
+              - {Name: next_run_at, Type: DATETIME}
+              - {Name: runs_planned_24h, Type: INTEGER}
+              - {Name: refresh_count_30d, Type: INTEGER}
+              - {Name: last_refresh_at, Type: DATETIME}
+              - {Name: started_by, Type: STRING}
+              - {Name: owner_status, Type: STRING}
+              - {Name: data_source, Type: STRING}
               - {Name: spice_gb, Type: DECIMAL}
               - {Name: est_monthly_cost_usd, Type: DECIMAL}
               - {Name: cost_type, Type: STRING}
               - {Name: findings, Type: STRING}
-              - {Name: unreferenced_count, Type: INTEGER}
-              - {Name: no_observed_use_count, Type: INTEGER}
+              - {Name: no_schedule_count, Type: INTEGER}
+              - {Name: has_schedule_count, Type: INTEGER}
+              - {Name: manual_refreshes_30d, Type: INTEGER}
               - {Name: spice_count, Type: INTEGER}
               - {Name: dataset_count, Type: INTEGER}
       LogicalTableMap:
@@ -378,6 +541,262 @@ Resources:
         - {Key: Purpose, Value: !Ref ResourcePrefix}
         - {Key: ManagedBy, Value: CloudFormation}
 
+  SchedulesDataSet:
+    Type: AWS::QuickSight::DataSet
+    DependsOn: SchedulesTable
+    Properties:
+      AwsAccountId: !Ref 'AWS::AccountId'
+      DataSetId: !Sub '${ResourcePrefix}-schedules'
+      Name: Quick governance - dataset refresh schedules
+      ImportMode: DIRECT_QUERY
+      PhysicalTableMap:
+        schedules:
+          CustomSql:
+            DataSourceArn:
+              Fn::ImportValue: !Sub '${FoundationStackName}-QuickDataSourceArn'
+            Name: refresh_schedules
+            SqlQuery: !Sub
+              - |
+                WITH latest AS (
+                  SELECT max(ts) AS ts FROM "${Db}"."dataset_lifecycle_schedules"
+                ),
+                src AS (
+                  SELECT s.*
+                  FROM "${Db}"."dataset_lifecycle_schedules" s
+                  JOIN latest l ON s.ts = l.ts
+                ),
+                future AS (
+                  SELECT *
+                  FROM src
+                  WHERE recordkind = 'planned_run'
+                    AND TRY(from_iso8601_timestamp(runat)) > current_timestamp
+                ),
+                counts AS (
+                  SELECT datasetid, scheduleid,
+                         count(*) AS runs_7d,
+                         count_if(TRY(from_iso8601_timestamp(runat)) <= date_add('day', 1, current_timestamp)) AS runs_24h
+                  FROM future
+                  GROUP BY 1, 2
+                ),
+                next_run AS (
+                  SELECT datasetid, scheduleid, min(runat) AS next_run
+                  FROM future
+                  GROUP BY 1, 2
+                )
+                SELECT
+                  from_iso8601_timestamp(s.ts) AS scan_time,
+                  s.recordkind AS record_kind,
+                  s.datasetid AS dataset_id,
+                  COALESCE(s.datasetname, s.datasetid) AS dataset_name,
+                  'SPICE' AS import_mode,
+                  COALESCE(s.scheduleid, '') AS schedule_id,
+                  COALESCE(s.refreshtype, '') AS refresh_type,
+                  COALESCE(s.definition, '') AS definition,
+                  COALESCE(s.nextrunlabel, '') AS next_run_label,
+                  COALESCE(TRY(from_iso8601_timestamp(n.next_run)), TRY(from_iso8601_timestamp(s.nextrunat))) AS next_run_at,
+                  s.runsperday AS runs_per_day,
+                  CASE
+                    WHEN s.recordkind <> 'schedule' THEN NULL
+                    WHEN s.minuteknown = 'true' THEN COALESCE(c.runs_24h, 0)
+                    ELSE CAST(round(s.runsperday) AS integer)
+                  END AS runs_next_24h,
+                  CASE
+                    WHEN s.recordkind <> 'schedule' THEN NULL
+                    WHEN s.minuteknown = 'true' THEN COALESCE(c.runs_7d, 0)
+                    ELSE CAST(round(s.runsperday * 7) AS integer)
+                  END AS runs_next_7d,
+                  s.avgdurationsec AS avg_duration_sec,
+                  COALESCE(s.lastrefreshstatus, '') AS last_status,
+                  COALESCE(s.datasource, '(none)') AS data_source,
+                  CASE
+                    WHEN s.recordkind = 'schedule' AND s.runsperday IS NOT NULL AND s.avgdurationsec IS NOT NULL
+                    THEN s.runsperday * s.avgdurationsec / 60.0
+                  END AS refresh_minutes_per_day,
+                  TRY(from_iso8601_timestamp(s.runat)) AS run_at,
+                  date_trunc('day', TRY(from_iso8601_timestamp(s.runat))) AS run_day,
+                  CASE WHEN s.hourutc IS NULL THEN NULL ELSE lpad(cast(s.hourutc AS varchar), 2, '0') END AS hour_utc,
+                  CASE WHEN s.recordkind = 'planned_run' THEN 1 ELSE 0 END AS planned_count
+                FROM src s
+                LEFT JOIN next_run n ON s.datasetid = n.datasetid AND s.scheduleid = n.scheduleid
+                LEFT JOIN counts c ON s.datasetid = c.datasetid AND s.scheduleid = c.scheduleid
+                WHERE s.recordkind = 'schedule'
+                   OR (s.recordkind = 'planned_run' AND TRY(from_iso8601_timestamp(s.runat)) > current_timestamp)
+              - Db:
+                  Fn::ImportValue: !Sub '${FoundationStackName}-GlueDatabase'
+            Columns:
+              - {Name: scan_time, Type: DATETIME}
+              - {Name: record_kind, Type: STRING}
+              - {Name: dataset_id, Type: STRING}
+              - {Name: dataset_name, Type: STRING}
+              - {Name: import_mode, Type: STRING}
+              - {Name: schedule_id, Type: STRING}
+              - {Name: refresh_type, Type: STRING}
+              - {Name: definition, Type: STRING}
+              - {Name: next_run_label, Type: STRING}
+              - {Name: next_run_at, Type: DATETIME}
+              - {Name: runs_per_day, Type: DECIMAL}
+              - {Name: runs_next_24h, Type: INTEGER}
+              - {Name: runs_next_7d, Type: INTEGER}
+              - {Name: avg_duration_sec, Type: INTEGER}
+              - {Name: last_status, Type: STRING}
+              - {Name: data_source, Type: STRING}
+              - {Name: refresh_minutes_per_day, Type: DECIMAL}
+              - {Name: run_at, Type: DATETIME}
+              - {Name: run_day, Type: DATETIME}
+              - {Name: hour_utc, Type: STRING}
+              - {Name: planned_count, Type: INTEGER}
+      LogicalTableMap:
+        schedules:
+          Alias: refresh_schedules
+          Source: {PhysicalTableId: schedules}
+      Permissions:
+        - Principal: !Ref QuickPrincipalArn
+          Actions: [quicksight:DescribeDataSet, quicksight:DescribeDataSetPermissions, quicksight:PassDataSet, quicksight:DescribeIngestion, quicksight:ListIngestions, quicksight:UpdateDataSet, quicksight:DeleteDataSet, quicksight:CreateIngestion, quicksight:CancelIngestion, quicksight:UpdateDataSetPermissions]
+      Tags:
+        - {Key: Purpose, Value: !Ref ResourcePrefix}
+        - {Key: ManagedBy, Value: CloudFormation}
+
+  DashboardsDataSet:
+    Type: AWS::QuickSight::DataSet
+    DependsOn: DashboardsTable
+    Properties:
+      AwsAccountId: !Ref 'AWS::AccountId'
+      DataSetId: !Sub '${ResourcePrefix}-dashboards'
+      Name: Quick governance - dashboard usage
+      ImportMode: DIRECT_QUERY
+      PhysicalTableMap:
+        dashboards:
+          CustomSql:
+            DataSourceArn:
+              Fn::ImportValue: !Sub '${FoundationStackName}-QuickDataSourceArn'
+            Name: dashboard_usage
+            SqlQuery: !Sub
+              - |
+                WITH ranked AS (
+                  SELECT d.*, row_number() OVER (PARTITION BY dashboardid ORDER BY ts DESC) AS rn
+                  FROM "${Db}"."dataset_lifecycle_dashboards" d
+                  WHERE ts IS NOT NULL
+                ),
+                latest AS (
+                  SELECT * FROM ranked WHERE rn = 1 AND COALESCE(assetstate, 'ACTIVE') <> 'DELETED'
+                )
+                SELECT
+                  from_iso8601_timestamp(l.ts) AS scan_time,
+                  l.dashboardid AS dashboard_id,
+                  COALESCE(l.dashboardname, l.dashboardid) AS dashboard_name,
+                  CASE WHEN trim(u.name) = '' THEN '(no dataset)' ELSE trim(u.name) END AS dataset_name,
+                  'DASHBOARD' AS import_mode,
+                  COALESCE(l.usagestate, 'UNKNOWN') AS stored_state,
+                  TRY(from_iso8601_timestamp(l.lastviewat)) AS last_view_at,
+                  COALESCE(l.lastviewsource, '') AS last_view_source,
+                  COALESCE(l.lastviewlabel, '') AS last_view_label,
+                  l.dayssincelastview AS days_since_last_view,
+                  COALESCE(l.sortdays, 999999) AS sort_days,
+                  COALESCE(l.views30, 0) AS views_30,
+                  COALESCE(l.views60, 0) AS views_60,
+                  COALESCE(l.views90, 0) AS views_90,
+                  l.viewsyearago90 AS views_year_ago_90,
+                  TRY(from_iso8601_timestamp(l.metrichistorystart)) AS metric_history_start,
+                  COALESCE(l.historycoversyearago, 'false') AS history_covers_year_ago,
+                  TRY(from_iso8601_timestamp(l.lastpublishedat)) AS last_published_at,
+                  TRY(from_iso8601_timestamp(l.createdat)) AS created_at,
+                  TRY(from_iso8601_timestamp(l.coveragestart)) AS coverage_start,
+                  COALESCE(l.coveragedays, 0) AS coverage_days,
+                  COALESCE(l.datasetnames, '') AS dataset_names,
+                  COALESCE(l.ownerstatus, 'not available') AS owner_status,
+                  CASE WHEN l.lastviewat IS NULL THEN 1 ELSE 0 END AS never_viewed
+                FROM latest l
+                CROSS JOIN UNNEST(split(coalesce(nullif(l.datasetnames, ''), ' '), ',')) AS u(name)
+              - Db:
+                  Fn::ImportValue: !Sub '${FoundationStackName}-GlueDatabase'
+            Columns:
+              - {Name: scan_time, Type: DATETIME}
+              - {Name: dashboard_id, Type: STRING}
+              - {Name: dashboard_name, Type: STRING}
+              - {Name: dataset_name, Type: STRING}
+              - {Name: import_mode, Type: STRING}
+              - {Name: stored_state, Type: STRING}
+              - {Name: last_view_at, Type: DATETIME}
+              - {Name: last_view_source, Type: STRING}
+              - {Name: last_view_label, Type: STRING}
+              - {Name: days_since_last_view, Type: INTEGER}
+              - {Name: sort_days, Type: INTEGER}
+              - {Name: views_30, Type: INTEGER}
+              - {Name: views_60, Type: INTEGER}
+              - {Name: views_90, Type: INTEGER}
+              - {Name: views_year_ago_90, Type: INTEGER}
+              - {Name: metric_history_start, Type: DATETIME}
+              - {Name: history_covers_year_ago, Type: STRING}
+              - {Name: last_published_at, Type: DATETIME}
+              - {Name: created_at, Type: DATETIME}
+              - {Name: coverage_start, Type: DATETIME}
+              - {Name: coverage_days, Type: INTEGER}
+              - {Name: dataset_names, Type: STRING}
+              - {Name: owner_status, Type: STRING}
+              - {Name: never_viewed, Type: INTEGER}
+      LogicalTableMap:
+        dashboards:
+          Alias: dashboard_usage
+          Source: {PhysicalTableId: dashboards}
+      Permissions:
+        - Principal: !Ref QuickPrincipalArn
+          Actions: [quicksight:DescribeDataSet, quicksight:DescribeDataSetPermissions, quicksight:PassDataSet, quicksight:DescribeIngestion, quicksight:ListIngestions, quicksight:UpdateDataSet, quicksight:DeleteDataSet, quicksight:CreateIngestion, quicksight:CancelIngestion, quicksight:UpdateDataSetPermissions]
+      Tags:
+        - {Key: Purpose, Value: !Ref ResourcePrefix}
+        - {Key: ManagedBy, Value: CloudFormation}
+
+  IdleHistoryDataSet:
+    Type: AWS::QuickSight::DataSet
+    DependsOn: [SlowTable, DashboardsTable]
+    Properties:
+      AwsAccountId: !Ref 'AWS::AccountId'
+      DataSetId: !Sub '${ResourcePrefix}-idle-history'
+      Name: Quick governance - idle history
+      ImportMode: DIRECT_QUERY
+      PhysicalTableMap:
+        idlehist:
+          CustomSql:
+            DataSourceArn:
+              Fn::ImportValue: !Sub '${FoundationStackName}-QuickDataSourceArn'
+            Name: idle_history
+            SqlQuery: !Sub
+              - |
+                SELECT
+                  from_iso8601_timestamp(ts) AS scan_time,
+                  COALESCE(datasetname, datasetid) AS dataset_name,
+                  COALESCE(importmode, 'UNKNOWN') AS import_mode,
+                  'Datasets' AS series,
+                  CASE WHEN usagestate = 'IDLE' THEN 1 ELSE 0 END AS idle_count
+                FROM "${Db}"."dataset_lifecycle_slow"
+                WHERE ts IS NOT NULL AND COALESCE(assetstate, 'ACTIVE') <> 'DELETED'
+                UNION ALL
+                SELECT
+                  from_iso8601_timestamp(ts) AS scan_time,
+                  '(dashboards)' AS dataset_name,
+                  'DASHBOARD' AS import_mode,
+                  'Dashboards' AS series,
+                  CASE WHEN usagestate = 'IDLE' THEN 1 ELSE 0 END AS idle_count
+                FROM "${Db}"."dataset_lifecycle_dashboards"
+                WHERE ts IS NOT NULL AND COALESCE(assetstate, 'ACTIVE') <> 'DELETED'
+              - Db:
+                  Fn::ImportValue: !Sub '${FoundationStackName}-GlueDatabase'
+            Columns:
+              - {Name: scan_time, Type: DATETIME}
+              - {Name: dataset_name, Type: STRING}
+              - {Name: import_mode, Type: STRING}
+              - {Name: series, Type: STRING}
+              - {Name: idle_count, Type: INTEGER}
+      LogicalTableMap:
+        idlehist:
+          Alias: idle_history
+          Source: {PhysicalTableId: idlehist}
+      Permissions:
+        - Principal: !Ref QuickPrincipalArn
+          Actions: [quicksight:DescribeDataSet, quicksight:DescribeDataSetPermissions, quicksight:PassDataSet, quicksight:DescribeIngestion, quicksight:ListIngestions, quicksight:UpdateDataSet, quicksight:DeleteDataSet, quicksight:CreateIngestion, quicksight:CancelIngestion, quicksight:UpdateDataSetPermissions]
+      Tags:
+        - {Key: Purpose, Value: !Ref ResourcePrefix}
+        - {Key: ManagedBy, Value: CloudFormation}
+
   Dashboard:
     Type: AWS::QuickSight::Dashboard
     Properties:
@@ -400,6 +819,12 @@ Resources:
             DataSetArn: !GetAtt UsageDataSet.Arn
           - Identifier: hist
             DataSetArn: !GetAtt HistoryDataSet.Arn
+          - Identifier: sched
+            DataSetArn: !GetAtt SchedulesDataSet.Arn
+          - Identifier: dashes
+            DataSetArn: !GetAtt DashboardsDataSet.Arn
+          - Identifier: idlehist
+            DataSetArn: !GetAtt IdleHistoryDataSet.Arn
         ParameterDeclarations:
           - DateTimeParameterDeclaration:
               Name: pStart
@@ -411,9 +836,75 @@ Resources:
               TimeGranularity: DAY
               DefaultValues:
                 RollingDate: {Expression: "addDateTime(1, 'DD', truncDate('DD', now()))"}
+          - StringParameterDeclaration:
+              Name: pIdleDays
+              ParameterValueType: SINGLE_VALUED
+              DefaultValues:
+                StaticValues: ['60']
+        CalculatedFields:
+          - DataSetIdentifier: usage
+            Name: usage_state
+            Expression: 'ifelse(isNotNull({last_observed_use_at}) AND dateDiff({last_observed_use_at}, now(), ''DD'') <= parseInt(${pIdleDays}), ''ACTIVE'', ifelse(isNotNull({coverage_start}) AND isNotNull({dataset_created_at}) AND dateDiff({coverage_start}, now(), ''DD'') >= parseInt(${pIdleDays}) AND dateDiff({dataset_created_at}, now(), ''DD'') > parseInt(${pIdleDays}), ''IDLE'', ''UNKNOWN''))'
+          - DataSetIdentifier: usage
+            Name: active_flag
+            Expression: 'ifelse({usage_state} = ''ACTIVE'', 1, 0)'
+          - DataSetIdentifier: usage
+            Name: idle_flag
+            Expression: 'ifelse({usage_state} = ''IDLE'', 1, 0)'
+          - DataSetIdentifier: usage
+            Name: unknown_flag
+            Expression: 'ifelse({usage_state} = ''UNKNOWN'', 1, 0)'
+          - DataSetIdentifier: usage
+            Name: idle_spice
+            Expression: 'ifelse({usage_state} = ''IDLE'', ifelse(isNull({spice_gb}), 0, {spice_gb}), 0)'
+          - DataSetIdentifier: usage
+            Name: idle_cost
+            Expression: 'ifelse({usage_state} = ''IDLE'', ifelse(isNull({est_monthly_cost_usd}), 0, {est_monthly_cost_usd}), 0)'
+          - DataSetIdentifier: usage
+            Name: staleness
+            Expression: 'ifelse(isNull({last_observed_use_at}), 999999, dateDiff({last_observed_use_at}, now(), ''DD''))'
+          - DataSetIdentifier: usage
+            Name: days_now
+            Expression: 'ifelse(isNull({last_observed_use_at}), NULL, dateDiff({last_observed_use_at}, now(), ''DD''))'
+          - DataSetIdentifier: usage
+            Name: days_since_refresh
+            Expression: 'ifelse(isNull({last_refresh_at}), NULL, dateDiff({last_refresh_at}, now(), ''DD''))'
+          - DataSetIdentifier: usage
+            Name: unknown_reason
+            Expression: 'ifelse({usage_state} <> ''UNKNOWN'', NULL, ifelse(isNull({dataset_created_at}), ''created date is missing'', ifelse(dateDiff({dataset_created_at}, now(), ''DD'') <= parseInt(${pIdleDays}), concat(''created '', toString(dateDiff({dataset_created_at}, now(), ''DD'')), '' days ago''), concat(''coverage is '', toString(ifelse(isNull({coverage_start}), 0, dateDiff({coverage_start}, now(), ''DD''))), '' days''))))'
+          - DataSetIdentifier: usage
+            Name: recheck_after
+            Expression: 'ifelse({usage_state} <> ''UNKNOWN'', NULL, ifelse(isNull({dataset_created_at}), addDateTime(parseInt(${pIdleDays}), ''DD'', {coverage_start}), ifelse(isNull({coverage_start}), addDateTime(parseInt(${pIdleDays}), ''DD'', {dataset_created_at}), ifelse(addDateTime(parseInt(${pIdleDays}), ''DD'', {dataset_created_at}) > addDateTime(parseInt(${pIdleDays}), ''DD'', {coverage_start}), addDateTime(parseInt(${pIdleDays}), ''DD'', {dataset_created_at}), addDateTime(parseInt(${pIdleDays}), ''DD'', {coverage_start})))))'
+          - DataSetIdentifier: dashes
+            Name: usage_state
+            Expression: 'ifelse(isNotNull({last_view_at}) AND dateDiff({last_view_at}, now(), ''DD'') <= parseInt(${pIdleDays}), ''ACTIVE'', ifelse(isNotNull({coverage_start}) AND isNotNull({created_at}) AND dateDiff({coverage_start}, now(), ''DD'') >= parseInt(${pIdleDays}) AND dateDiff({created_at}, now(), ''DD'') > parseInt(${pIdleDays}), ''IDLE'', ''UNKNOWN''))'
+          - DataSetIdentifier: dashes
+            Name: active_id
+            Expression: 'ifelse({usage_state} = ''ACTIVE'', {dashboard_id}, NULL)'
+          - DataSetIdentifier: dashes
+            Name: idle_id
+            Expression: 'ifelse({usage_state} = ''IDLE'', {dashboard_id}, NULL)'
+          - DataSetIdentifier: dashes
+            Name: unknown_id
+            Expression: 'ifelse({usage_state} = ''UNKNOWN'', {dashboard_id}, NULL)'
+          - DataSetIdentifier: dashes
+            Name: deletion_candidate
+            Expression: 'ifelse({usage_state} = ''IDLE'' AND {history_covers_year_ago} = ''true'' AND {views_year_ago_90} = 0, ''true'', ''false'')'
+          - DataSetIdentifier: dashes
+            Name: staleness
+            Expression: 'ifelse(isNull({last_view_at}), 999999, dateDiff({last_view_at}, now(), ''DD''))'
+          - DataSetIdentifier: dashes
+            Name: days_now
+            Expression: 'ifelse(isNull({last_view_at}), NULL, dateDiff({last_view_at}, now(), ''DD''))'
+          - DataSetIdentifier: dashes
+            Name: unknown_reason
+            Expression: 'ifelse({usage_state} <> ''UNKNOWN'', NULL, ifelse(isNull({created_at}), ''created date is missing'', ifelse(dateDiff({created_at}, now(), ''DD'') <= parseInt(${pIdleDays}), concat(''created '', toString(dateDiff({created_at}, now(), ''DD'')), '' days ago''), concat(''coverage is '', toString(ifelse(isNull({coverage_start}), 0, dateDiff({coverage_start}, now(), ''DD''))), '' days''))))'
+          - DataSetIdentifier: dashes
+            Name: recheck_after
+            Expression: 'ifelse({usage_state} <> ''UNKNOWN'', NULL, ifelse(isNull({created_at}), addDateTime(parseInt(${pIdleDays}), ''DD'', {coverage_start}), ifelse(isNull({coverage_start}), addDateTime(parseInt(${pIdleDays}), ''DD'', {created_at}), ifelse(addDateTime(parseInt(${pIdleDays}), ''DD'', {created_at}) > addDateTime(parseInt(${pIdleDays}), ''DD'', {coverage_start}), addDateTime(parseInt(${pIdleDays}), ''DD'', {created_at}), addDateTime(parseInt(${pIdleDays}), ''DD'', {coverage_start})))))'
         FilterGroups:
           - FilterGroupId: fg-range
-            CrossDataset: SINGLE_DATASET
+            CrossDataset: ALL_DATASETS
             Status: ENABLED
             Filters:
               - TimeRangeFilter:
@@ -494,6 +985,86 @@ Resources:
                 SheetVisualScopingConfigurations:
                   - SheetId: sh-health
                     Scope: ALL_VISUALS
+          - FilterGroupId: fg-mode-rp
+            CrossDataset: ALL_DATASETS
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-mode-rp
+                  Column: {DataSetIdentifier: health, ColumnName: import_mode}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      SelectAllOptions: FILTER_ALL_VALUES
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-refresh-plan
+                    Scope: ALL_VISUALS
+          - FilterGroupId: fg-dataset-rp
+            CrossDataset: ALL_DATASETS
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-dataset-rp
+                  Column: {DataSetIdentifier: health, ColumnName: dataset_name}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      SelectAllOptions: FILTER_ALL_VALUES
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-refresh-plan
+                    Scope: ALL_VISUALS
+          - FilterGroupId: fg-state-rp
+            CrossDataset: SINGLE_DATASET
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-state-rp
+                  Column: {DataSetIdentifier: usage, ColumnName: usage_state}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      SelectAllOptions: FILTER_ALL_VALUES
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-refresh-plan
+                    Scope: ALL_VISUALS
+          - FilterGroupId: fg-rtype-rp
+            CrossDataset: SINGLE_DATASET
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-rtype-rp
+                  Column: {DataSetIdentifier: sched, ColumnName: refresh_type}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      SelectAllOptions: FILTER_ALL_VALUES
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-refresh-plan
+                    Scope: ALL_VISUALS
+          - FilterGroupId: fg-dsource-rp
+            CrossDataset: SINGLE_DATASET
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-dsource-rp
+                  Column: {DataSetIdentifier: sched, ColumnName: data_source}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      SelectAllOptions: FILTER_ALL_VALUES
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-refresh-plan
+                    Scope: ALL_VISUALS
           - FilterGroupId: fg-mode-us
             CrossDataset: ALL_DATASETS
             Status: ENABLED
@@ -526,6 +1097,70 @@ Resources:
                 SheetVisualScopingConfigurations:
                   - SheetId: sh-usage
                     Scope: ALL_VISUALS
+          - FilterGroupId: fg-state-us
+            CrossDataset: SINGLE_DATASET
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-state-us
+                  Column: {DataSetIdentifier: usage, ColumnName: usage_state}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      SelectAllOptions: FILTER_ALL_VALUES
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-usage
+                    Scope: ALL_VISUALS
+          - FilterGroupId: fg-mode-db
+            CrossDataset: ALL_DATASETS
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-mode-db
+                  Column: {DataSetIdentifier: health, ColumnName: import_mode}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      SelectAllOptions: FILTER_ALL_VALUES
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-dashboards
+                    Scope: ALL_VISUALS
+          - FilterGroupId: fg-dataset-db
+            CrossDataset: ALL_DATASETS
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-dataset-db
+                  Column: {DataSetIdentifier: health, ColumnName: dataset_name}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      SelectAllOptions: FILTER_ALL_VALUES
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-dashboards
+                    Scope: ALL_VISUALS
+          - FilterGroupId: fg-dstate-db
+            CrossDataset: SINGLE_DATASET
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-dstate-db
+                  Column: {DataSetIdentifier: dashes, ColumnName: usage_state}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      SelectAllOptions: FILTER_ALL_VALUES
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-dashboards
+                    Scope: ALL_VISUALS
           - FilterGroupId: fg-mode-cp
             CrossDataset: ALL_DATASETS
             Status: ENABLED
@@ -549,6 +1184,22 @@ Resources:
               - CategoryFilter:
                   FilterId: f-dataset-cp
                   Column: {DataSetIdentifier: health, ColumnName: dataset_name}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      SelectAllOptions: FILTER_ALL_VALUES
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-capacity
+                    Scope: ALL_VISUALS
+          - FilterGroupId: fg-state-cp
+            CrossDataset: SINGLE_DATASET
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-state-cp
+                  Column: {DataSetIdentifier: usage, ColumnName: usage_state}
                   Configuration:
                     FilterListConfiguration:
                       MatchOperator: CONTAINS
@@ -641,12 +1292,96 @@ Resources:
                   - SheetId: sh-health
                     Scope: SELECTED_VISUALS
                     VisualIds: [rh-tbl-slowest, rh-bar-duration]
-          - FilterGroupId: fg-unreferenced-sh-usage
+          - FilterGroupId: fg-sched-rows-sh-refresh-plan
             CrossDataset: SINGLE_DATASET
             Status: ENABLED
             Filters:
               - CategoryFilter:
-                  FilterId: f-unreferenced-sh-usage
+                  FilterId: f-sched-rows-sh-refresh-plan
+                  Column: {DataSetIdentifier: sched, ColumnName: record_kind}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      CategoryValues: ['schedule']
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-refresh-plan
+                    Scope: SELECTED_VISUALS
+                    VisualIds: [rp-tbl-schedules]
+          - FilterGroupId: fg-planned-rows-sh-refresh-plan
+            CrossDataset: SINGLE_DATASET
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-planned-rows-sh-refresh-plan
+                  Column: {DataSetIdentifier: sched, ColumnName: record_kind}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      CategoryValues: ['planned_run']
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-refresh-plan
+                    Scope: SELECTED_VISUALS
+                    VisualIds: [rp-bar-hour, rp-bar-day]
+          - FilterGroupId: fg-no-schedule-mode-sh-refresh-plan
+            CrossDataset: SINGLE_DATASET
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-no-schedule-mode-sh-refresh-plan
+                  Column: {DataSetIdentifier: usage, ColumnName: import_mode}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      CategoryValues: ['SPICE']
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-refresh-plan
+                    Scope: SELECTED_VISUALS
+                    VisualIds: [rp-tbl-nosched]
+          - FilterGroupId: fg-no-schedule-count-sh-refresh-plan
+            CrossDataset: SINGLE_DATASET
+            Status: ENABLED
+            Filters:
+              - NumericEqualityFilter:
+                  FilterId: f-no-schedule-count-sh-refresh-plan
+                  Column: {DataSetIdentifier: usage, ColumnName: schedule_count}
+                  MatchOperator: EQUALS
+                  Value: 0
+                  NullOption: NON_NULLS_ONLY
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-refresh-plan
+                    Scope: SELECTED_VISUALS
+                    VisualIds: [rp-tbl-nosched]
+          - FilterGroupId: fg-retire-state-sh-usage
+            CrossDataset: SINGLE_DATASET
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-retire-state-sh-usage
+                  Column: {DataSetIdentifier: usage, ColumnName: usage_state}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      CategoryValues: ['IDLE']
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-usage
+                    Scope: SELECTED_VISUALS
+                    VisualIds: [us-tbl-retire]
+          - FilterGroupId: fg-retire-unref-sh-usage
+            CrossDataset: SINGLE_DATASET
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-retire-unref-sh-usage
                   Column: {DataSetIdentifier: usage, ColumnName: reference_state}
                   Configuration:
                     FilterListConfiguration:
@@ -657,13 +1392,47 @@ Resources:
                 SheetVisualScopingConfigurations:
                   - SheetId: sh-usage
                     Scope: SELECTED_VISUALS
-                    VisualIds: [us-tbl-unreferenced]
-          - FilterGroupId: fg-referenced-sh-usage
+                    VisualIds: [us-tbl-retire]
+          - FilterGroupId: fg-unknown-state-sh-usage
             CrossDataset: SINGLE_DATASET
             Status: ENABLED
             Filters:
               - CategoryFilter:
-                  FilterId: f-referenced-sh-usage
+                  FilterId: f-unknown-state-sh-usage
+                  Column: {DataSetIdentifier: usage, ColumnName: usage_state}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      CategoryValues: ['UNKNOWN']
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-usage
+                    Scope: SELECTED_VISUALS
+                    VisualIds: [us-tbl-unknown]
+          - FilterGroupId: fg-idle-ref-state-sh-usage
+            CrossDataset: SINGLE_DATASET
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-idle-ref-state-sh-usage
+                  Column: {DataSetIdentifier: usage, ColumnName: usage_state}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      CategoryValues: ['IDLE']
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-usage
+                    Scope: SELECTED_VISUALS
+                    VisualIds: [us-tbl-referenced]
+          - FilterGroupId: fg-idle-ref-sh-usage
+            CrossDataset: SINGLE_DATASET
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-idle-ref-sh-usage
                   Column: {DataSetIdentifier: usage, ColumnName: reference_state}
                   Configuration:
                     FilterListConfiguration:
@@ -674,24 +1443,24 @@ Resources:
                 SheetVisualScopingConfigurations:
                   - SheetId: sh-usage
                     Scope: SELECTED_VISUALS
-                    VisualIds: [us-tbl-lru]
-          - FilterGroupId: fg-no-evidence-sh-usage
+                    VisualIds: [us-tbl-referenced]
+          - FilterGroupId: fg-deletion-sh-dashboards
             CrossDataset: SINGLE_DATASET
             Status: ENABLED
             Filters:
               - CategoryFilter:
-                  FilterId: f-no-evidence-sh-usage
-                  Column: {DataSetIdentifier: usage, ColumnName: usage_confidence}
+                  FilterId: f-deletion-sh-dashboards
+                  Column: {DataSetIdentifier: dashes, ColumnName: deletion_candidate}
                   Configuration:
                     FilterListConfiguration:
                       MatchOperator: CONTAINS
-                      CategoryValues: ['NO_EVIDENCE']
+                      CategoryValues: ['true']
             ScopeConfiguration:
               SelectedSheets:
                 SheetVisualScopingConfigurations:
-                  - SheetId: sh-usage
+                  - SheetId: sh-dashboards
                     Scope: SELECTED_VISUALS
-                    VisualIds: [us-tbl-noevidence]
+                    VisualIds: [db-tbl-delete]
           - FilterGroupId: fg-spice-usage-sh-capacity
             CrossDataset: SINGLE_DATASET
             Status: ENABLED
@@ -730,7 +1499,7 @@ Resources:
           - SheetId: sh-overview
             Name: 'Overview'
             Title: 'Dataset lifecycle - overview'
-            Description: 'Fleet health from the latest scans: refresh status, usage evidence and SPICE capacity, without co-owning a single dataset.'
+            Description: 'Which datasets and dashboards need a decision, from the latest scans.'
             ParameterControls:
               - DateTimePicker:
                   ParameterControlId: pc-ov-start
@@ -742,6 +1511,16 @@ Resources:
                   Title: 'To (exclusive)'
                   SourceParameterName: pEnd
                   DisplayOptions: {DateTimeFormat: 'YYYY-MM-DD'}
+              - Dropdown:
+                  ParameterControlId: pc-ov-pIdleDays
+                  Title: 'Idle after (days)'
+                  SourceParameterName: pIdleDays
+                  Type: SINGLE_SELECT
+                  SelectableValues:
+                    Values: ['30', '60', '90', '180']
+                  DisplayOptions:
+                    SelectAllOptions: {Visibility: HIDDEN}
+                    TitleOptions: {Visibility: VISIBLE}
             FilterControls:
               - Dropdown:
                   FilterControlId: fc-ov-mode
@@ -765,6 +1544,7 @@ Resources:
                     Elements:
                       - {ElementId: pc-ov-start, ElementType: PARAMETER_CONTROL, ColumnSpan: 2, RowSpan: 1}
                       - {ElementId: pc-ov-end, ElementType: PARAMETER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: pc-ov-pIdleDays, ElementType: PARAMETER_CONTROL, ColumnSpan: 2, RowSpan: 1}
                       - {ElementId: fc-ov-mode, ElementType: FILTER_CONTROL, ColumnSpan: 2, RowSpan: 1}
                       - {ElementId: fc-ov-dataset, ElementType: FILTER_CONTROL, ColumnSpan: 2, RowSpan: 1}
             Visuals:
@@ -797,20 +1577,6 @@ Resources:
                       Values:
                         - NumericalMeasureField: {FieldId: ov-kpi-failed-v, Column: {DataSetIdentifier: health, ColumnName: failed_count}, AggregationFunction: {SimpleNumericalAggregation: SUM}}
               - KPIVisual:
-                  VisualId: ov-kpi-unref
-                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Unreferenced SPICE datasets'}}
-                  ChartConfiguration:
-                    FieldWells:
-                      Values:
-                        - NumericalMeasureField: {FieldId: ov-kpi-unref-v, Column: {DataSetIdentifier: usage, ColumnName: unreferenced_count}, AggregationFunction: {SimpleNumericalAggregation: SUM}}
-              - KPIVisual:
-                  VisualId: ov-kpi-nouse
-                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Referenced, no observed use'}}
-                  ChartConfiguration:
-                    FieldWells:
-                      Values:
-                        - NumericalMeasureField: {FieldId: ov-kpi-nouse-v, Column: {DataSetIdentifier: usage, ColumnName: no_observed_use_count}, AggregationFunction: {SimpleNumericalAggregation: SUM}}
-              - KPIVisual:
                   VisualId: ov-kpi-gb
                   Title: {Visibility: VISIBLE, FormatText: {PlainText: 'SPICE consumed (GB, estimated)'}}
                   ChartConfiguration:
@@ -824,6 +1590,58 @@ Resources:
                     FieldWells:
                       Values:
                         - NumericalMeasureField: {FieldId: ov-kpi-cost-v, Column: {DataSetIdentifier: usage, ColumnName: est_monthly_cost_usd}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 2}}}}}
+              - KPIVisual:
+                  VisualId: ov-kpi-idle
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Idle datasets'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      Values:
+                        - NumericalMeasureField: {FieldId: ov-kpi-idle-v, Column: {DataSetIdentifier: usage, ColumnName: idle_flag}, AggregationFunction: {SimpleNumericalAggregation: SUM}}
+              - KPIVisual:
+                  VisualId: ov-kpi-unknown
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Unknown datasets'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      Values:
+                        - NumericalMeasureField: {FieldId: ov-kpi-unknown-v, Column: {DataSetIdentifier: usage, ColumnName: unknown_flag}, AggregationFunction: {SimpleNumericalAggregation: SUM}}
+              - KPIVisual:
+                  VisualId: ov-kpi-didle
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Idle dashboards'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      Values:
+                        - CategoricalMeasureField: {FieldId: ov-kpi-didle-v, Column: {DataSetIdentifier: dashes, ColumnName: idle_id}, AggregationFunction: DISTINCT_COUNT}
+              - KPIVisual:
+                  VisualId: ov-kpi-next
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Refreshes in the next 24 h'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      Values:
+                        - NumericalMeasureField: {FieldId: ov-kpi-next-v, Column: {DataSetIdentifier: sched, ColumnName: runs_next_24h}, AggregationFunction: {SimpleNumericalAggregation: SUM}}
+              - KPIVisual:
+                  VisualId: ov-kpi-nosched
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'SPICE datasets without a schedule'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      Values:
+                        - NumericalMeasureField: {FieldId: ov-kpi-nosched-v, Column: {DataSetIdentifier: usage, ColumnName: no_schedule_count}, AggregationFunction: {SimpleNumericalAggregation: SUM}}
+              - TableVisual:
+                  VisualId: ov-tbl-scan
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Last scan (UTC)'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      TableAggregatedFieldWells:
+                        GroupBy:
+                          - CategoricalDimensionField: {FieldId: ov-tbl-scan-g0, Column: {DataSetIdentifier: usage, ColumnName: scan_label}}
+                        Values:
+                          - DateMeasureField: {FieldId: ov-tbl-scan-m0, Column: {DataSetIdentifier: usage, ColumnName: scan_time}, AggregationFunction: MAX, FormatConfiguration: {DateTimeFormat: 'YYYY-MM-DD HH:mm'}}
+                    SortConfiguration:
+                      RowSort:
+                        - FieldSort: {FieldId: ov-tbl-scan-m0, Direction: DESC}
+                    FieldOptions:
+                      SelectedFieldOptions:
+                        - {FieldId: ov-tbl-scan-g0, CustomLabel: 'Scan'}
+                        - {FieldId: ov-tbl-scan-m0, CustomLabel: 'Last scan (UTC)'}
               - BarChartVisual:
                   VisualId: ov-bar-status
                   Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Datasets by last refresh status and import mode'}}
@@ -845,7 +1663,7 @@ Resources:
               - BarChartVisual:
                   VisualId: ov-bar-confidence
                   Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Datasets by usage confidence'}}
-                  Subtitle: {Visibility: VISIBLE, FormatText: {PlainText: 'HIGH: agent citation or direct query; MEDIUM: dashboard view or scope-level agent evidence; LOW: referenced only; NO_EVIDENCE: nothing observed'}}
+                  Subtitle: {Visibility: VISIBLE, FormatText: {PlainText: 'HIGH: agent citation or direct query. MEDIUM: dashboard view, SPICE query, or scope-level agent evidence. LOW: referenced only. NO_EVIDENCE: nothing observed.'}}
                   ChartConfiguration:
                     FieldWells:
                       BarChartAggregatedFieldWells:
@@ -890,24 +1708,28 @@ Resources:
                         - {FieldId: ov-tbl-failed-m2, CustomLabel: 'Failures in window'}
             TextBoxes:
               - SheetTextBoxId: ov-txt-howto
-                Content: '<text-box><block align="left"><inline font-weight="bold">How to read usage evidence.</inline> Quick exposes no authoritative "last used" attribute, so usage is a signal with a confidence label, never a verdict. A topic-grounded agent answer can cite nothing and leave no trace; ad-hoc analyses are invisible. Never delete a dataset on this signal alone. Refresh state comes from ListIngestions (hourly); usage, lineage and capacity from the daily scan. All collection is read-only through IAM - the governance team sees the operation without becoming a co-owner of anyone''s data.</block></text-box>'
+                Content: '<text-box><block align="left"><inline font-weight="bold">How to read this dashboard.</inline> ACTIVE means evidence of use inside the window. IDLE means no evidence inside the window, the evidence covers the whole window, and the asset is older than the window. UNKNOWN means the evidence covers less than the window, or the asset is newer than it. The Idle after control recalculates the current tabs. Retire dashboards first, then the datasets they leave unused: those appear in the retire candidates at the next daily scan. A row is a candidate for review. Confirm with the owner. Never treat a missing event as proof on its own. Refresh state comes from ListIngestions (hourly). Usage, schedules and dashboard views come from the daily scan.</block></text-box>'
             Layouts:
               - Configuration:
                   GridLayout:
                     CanvasSizeOptions:
                       ScreenCanvasSizeOptions: {ResizeOption: FIXED, OptimizedViewPortWidth: '1600px'}
                     Elements:
-                      - {ElementId: ov-kpi-datasets, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 4, RowIndex: 0, RowSpan: 5}
-                      - {ElementId: ov-kpi-spice, ElementType: VISUAL, ColumnIndex: 4, ColumnSpan: 4, RowIndex: 0, RowSpan: 5}
-                      - {ElementId: ov-kpi-dq, ElementType: VISUAL, ColumnIndex: 8, ColumnSpan: 4, RowIndex: 0, RowSpan: 5}
-                      - {ElementId: ov-kpi-failed, ElementType: VISUAL, ColumnIndex: 12, ColumnSpan: 4, RowIndex: 0, RowSpan: 5}
-                      - {ElementId: ov-kpi-unref, ElementType: VISUAL, ColumnIndex: 16, ColumnSpan: 5, RowIndex: 0, RowSpan: 5}
-                      - {ElementId: ov-kpi-nouse, ElementType: VISUAL, ColumnIndex: 21, ColumnSpan: 5, RowIndex: 0, RowSpan: 5}
-                      - {ElementId: ov-kpi-gb, ElementType: VISUAL, ColumnIndex: 26, ColumnSpan: 5, RowIndex: 0, RowSpan: 5}
-                      - {ElementId: ov-kpi-cost, ElementType: VISUAL, ColumnIndex: 31, ColumnSpan: 5, RowIndex: 0, RowSpan: 5}
-                      - {ElementId: ov-bar-status, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 18, RowIndex: 5, RowSpan: 10}
-                      - {ElementId: ov-bar-confidence, ElementType: VISUAL, ColumnIndex: 18, ColumnSpan: 18, RowIndex: 5, RowSpan: 10}
-                      - {ElementId: ov-tbl-failed, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 36, RowIndex: 15, RowSpan: 10}
+                      - {ElementId: ov-kpi-datasets, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 6, RowIndex: 0, RowSpan: 4}
+                      - {ElementId: ov-kpi-spice, ElementType: VISUAL, ColumnIndex: 6, ColumnSpan: 6, RowIndex: 0, RowSpan: 4}
+                      - {ElementId: ov-kpi-dq, ElementType: VISUAL, ColumnIndex: 12, ColumnSpan: 6, RowIndex: 0, RowSpan: 4}
+                      - {ElementId: ov-kpi-failed, ElementType: VISUAL, ColumnIndex: 18, ColumnSpan: 6, RowIndex: 0, RowSpan: 4}
+                      - {ElementId: ov-kpi-gb, ElementType: VISUAL, ColumnIndex: 24, ColumnSpan: 6, RowIndex: 0, RowSpan: 4}
+                      - {ElementId: ov-kpi-cost, ElementType: VISUAL, ColumnIndex: 30, ColumnSpan: 6, RowIndex: 0, RowSpan: 4}
+                      - {ElementId: ov-kpi-idle, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 6, RowIndex: 4, RowSpan: 4}
+                      - {ElementId: ov-kpi-unknown, ElementType: VISUAL, ColumnIndex: 6, ColumnSpan: 6, RowIndex: 4, RowSpan: 4}
+                      - {ElementId: ov-kpi-didle, ElementType: VISUAL, ColumnIndex: 12, ColumnSpan: 6, RowIndex: 4, RowSpan: 4}
+                      - {ElementId: ov-kpi-next, ElementType: VISUAL, ColumnIndex: 18, ColumnSpan: 6, RowIndex: 4, RowSpan: 4}
+                      - {ElementId: ov-kpi-nosched, ElementType: VISUAL, ColumnIndex: 24, ColumnSpan: 6, RowIndex: 4, RowSpan: 4}
+                      - {ElementId: ov-tbl-scan, ElementType: VISUAL, ColumnIndex: 30, ColumnSpan: 6, RowIndex: 4, RowSpan: 4}
+                      - {ElementId: ov-bar-status, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 18, RowIndex: 8, RowSpan: 9}
+                      - {ElementId: ov-bar-confidence, ElementType: VISUAL, ColumnIndex: 18, ColumnSpan: 18, RowIndex: 8, RowSpan: 9}
+                      - {ElementId: ov-tbl-failed, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 36, RowIndex: 17, RowSpan: 8}
                       - {ElementId: ov-txt-howto, ElementType: TEXT_BOX, ColumnIndex: 0, ColumnSpan: 36, RowIndex: 25, RowSpan: 4}
           - SheetId: sh-health
             Name: 'Refresh health'
@@ -1075,10 +1897,260 @@ Resources:
                       - {ElementId: rh-tbl-slowest, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 22, RowIndex: 9, RowSpan: 11}
                       - {ElementId: rh-bar-duration, ElementType: VISUAL, ColumnIndex: 22, ColumnSpan: 14, RowIndex: 9, RowSpan: 11}
                       - {ElementId: rh-tbl-all, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 36, RowIndex: 20, RowSpan: 11}
+          - SheetId: sh-refresh-plan
+            Name: 'Refresh plan'
+            Title: 'Refresh plan'
+            Description: 'When will each SPICE dataset refresh, and how often?'
+            ParameterControls:
+              - DateTimePicker:
+                  ParameterControlId: pc-rp-start
+                  Title: 'From'
+                  SourceParameterName: pStart
+                  DisplayOptions: {DateTimeFormat: 'YYYY-MM-DD'}
+              - DateTimePicker:
+                  ParameterControlId: pc-rp-end
+                  Title: 'To (exclusive)'
+                  SourceParameterName: pEnd
+                  DisplayOptions: {DateTimeFormat: 'YYYY-MM-DD'}
+              - Dropdown:
+                  ParameterControlId: pc-rp-pIdleDays
+                  Title: 'Idle after (days)'
+                  SourceParameterName: pIdleDays
+                  Type: SINGLE_SELECT
+                  SelectableValues:
+                    Values: ['30', '60', '90', '180']
+                  DisplayOptions:
+                    SelectAllOptions: {Visibility: HIDDEN}
+                    TitleOptions: {Visibility: VISIBLE}
+            FilterControls:
+              - Dropdown:
+                  FilterControlId: fc-rp-mode
+                  Title: 'Import mode'
+                  SourceFilterId: f-mode-rp
+                  Type: MULTI_SELECT
+                  DisplayOptions:
+                    SelectAllOptions: {Visibility: VISIBLE}
+                    TitleOptions: {Visibility: VISIBLE}
+              - Dropdown:
+                  FilterControlId: fc-rp-dataset
+                  Title: 'Dataset'
+                  SourceFilterId: f-dataset-rp
+                  Type: MULTI_SELECT
+                  DisplayOptions:
+                    SelectAllOptions: {Visibility: VISIBLE}
+                    TitleOptions: {Visibility: VISIBLE}
+              - Dropdown:
+                  FilterControlId: fc-rp-state
+                  Title: 'State'
+                  SourceFilterId: f-state-rp
+                  Type: MULTI_SELECT
+                  DisplayOptions:
+                    SelectAllOptions: {Visibility: VISIBLE}
+                    TitleOptions: {Visibility: VISIBLE}
+              - Dropdown:
+                  FilterControlId: fc-rp-rtype
+                  Title: 'Refresh type'
+                  SourceFilterId: f-rtype-rp
+                  Type: MULTI_SELECT
+                  DisplayOptions:
+                    SelectAllOptions: {Visibility: VISIBLE}
+                    TitleOptions: {Visibility: VISIBLE}
+              - Dropdown:
+                  FilterControlId: fc-rp-dsource
+                  Title: 'Data source'
+                  SourceFilterId: f-dsource-rp
+                  Type: MULTI_SELECT
+                  DisplayOptions:
+                    SelectAllOptions: {Visibility: VISIBLE}
+                    TitleOptions: {Visibility: VISIBLE}
+            SheetControlLayouts:
+              - Configuration:
+                  GridLayout:
+                    Elements:
+                      - {ElementId: pc-rp-start, ElementType: PARAMETER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: pc-rp-end, ElementType: PARAMETER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: pc-rp-pIdleDays, ElementType: PARAMETER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: fc-rp-mode, ElementType: FILTER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: fc-rp-dataset, ElementType: FILTER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: fc-rp-state, ElementType: FILTER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: fc-rp-rtype, ElementType: FILTER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: fc-rp-dsource, ElementType: FILTER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+            Visuals:
+              - KPIVisual:
+                  VisualId: rp-kpi-spice
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'SPICE datasets'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      Values:
+                        - NumericalMeasureField: {FieldId: rp-kpi-spice-v, Column: {DataSetIdentifier: usage, ColumnName: spice_count}, AggregationFunction: {SimpleNumericalAggregation: SUM}}
+              - KPIVisual:
+                  VisualId: rp-kpi-with
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'With a schedule'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      Values:
+                        - NumericalMeasureField: {FieldId: rp-kpi-with-v, Column: {DataSetIdentifier: usage, ColumnName: has_schedule_count}, AggregationFunction: {SimpleNumericalAggregation: SUM}}
+              - KPIVisual:
+                  VisualId: rp-kpi-without
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Without a schedule'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      Values:
+                        - NumericalMeasureField: {FieldId: rp-kpi-without-v, Column: {DataSetIdentifier: usage, ColumnName: no_schedule_count}, AggregationFunction: {SimpleNumericalAggregation: SUM}}
+              - KPIVisual:
+                  VisualId: rp-kpi-24h
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Planned in the next 24 h'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      Values:
+                        - NumericalMeasureField: {FieldId: rp-kpi-24h-v, Column: {DataSetIdentifier: sched, ColumnName: runs_next_24h}, AggregationFunction: {SimpleNumericalAggregation: SUM}}
+              - KPIVisual:
+                  VisualId: rp-kpi-7d
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Planned in the next 7 days'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      Values:
+                        - NumericalMeasureField: {FieldId: rp-kpi-7d-v, Column: {DataSetIdentifier: sched, ColumnName: runs_next_7d}, AggregationFunction: {SimpleNumericalAggregation: SUM}}
+              - KPIVisual:
+                  VisualId: rp-kpi-manual
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Manual refreshes in the last 30 days'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      Values:
+                        - NumericalMeasureField: {FieldId: rp-kpi-manual-v, Column: {DataSetIdentifier: usage, ColumnName: manual_refreshes_30d}, AggregationFunction: {SimpleNumericalAggregation: SUM}}
+              - TableVisual:
+                  VisualId: rp-tbl-schedules
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Schedules, next run first'}}
+                  Subtitle: {Visibility: VISIBLE, FormatText: {PlainText: 'Schedules with no known minute are in the counts and not in the bars. Manual and API refreshes are never planned.'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      TableAggregatedFieldWells:
+                        GroupBy:
+                          - CategoricalDimensionField: {FieldId: rp-tbl-schedules-g0, Column: {DataSetIdentifier: sched, ColumnName: dataset_name}}
+                          - CategoricalDimensionField: {FieldId: rp-tbl-schedules-g1, Column: {DataSetIdentifier: sched, ColumnName: definition}}
+                          - CategoricalDimensionField: {FieldId: rp-tbl-schedules-g2, Column: {DataSetIdentifier: sched, ColumnName: refresh_type}}
+                          - CategoricalDimensionField: {FieldId: rp-tbl-schedules-g3, Column: {DataSetIdentifier: sched, ColumnName: next_run_label}}
+                          - CategoricalDimensionField: {FieldId: rp-tbl-schedules-g4, Column: {DataSetIdentifier: sched, ColumnName: last_status}}
+                        Values:
+                          - DateMeasureField: {FieldId: rp-tbl-schedules-m0, Column: {DataSetIdentifier: sched, ColumnName: next_run_at}, AggregationFunction: MIN, FormatConfiguration: {DateTimeFormat: 'YYYY-MM-DD HH:mm'}}
+                          - NumericalMeasureField: {FieldId: rp-tbl-schedules-m1, Column: {DataSetIdentifier: sched, ColumnName: runs_per_day}, AggregationFunction: {SimpleNumericalAggregation: MAX}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 3}}}}}
+                          - NumericalMeasureField: {FieldId: rp-tbl-schedules-m2, Column: {DataSetIdentifier: sched, ColumnName: runs_next_7d}, AggregationFunction: {SimpleNumericalAggregation: MAX}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                          - NumericalMeasureField: {FieldId: rp-tbl-schedules-m3, Column: {DataSetIdentifier: sched, ColumnName: avg_duration_sec}, AggregationFunction: {SimpleNumericalAggregation: MAX}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                    SortConfiguration:
+                      RowSort:
+                        - FieldSort: {FieldId: rp-tbl-schedules-m0, Direction: ASC}
+                    FieldOptions:
+                      SelectedFieldOptions:
+                        - {FieldId: rp-tbl-schedules-g0, CustomLabel: 'Dataset'}
+                        - {FieldId: rp-tbl-schedules-g1, CustomLabel: 'Schedule'}
+                        - {FieldId: rp-tbl-schedules-g2, CustomLabel: 'Refresh type'}
+                        - {FieldId: rp-tbl-schedules-g3, CustomLabel: 'Window'}
+                        - {FieldId: rp-tbl-schedules-g4, CustomLabel: 'Last status'}
+                        - {FieldId: rp-tbl-schedules-m0, CustomLabel: 'Next run (UTC)'}
+                        - {FieldId: rp-tbl-schedules-m1, CustomLabel: 'Runs per day'}
+                        - {FieldId: rp-tbl-schedules-m2, CustomLabel: 'Runs in the next 7 days'}
+                        - {FieldId: rp-tbl-schedules-m3, CustomLabel: 'Average duration (s)'}
+              - BarChartVisual:
+                  VisualId: rp-bar-hour
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Planned refreshes by hour of day (UTC), next 7 days'}}
+                  Subtitle: {Visibility: VISIBLE, FormatText: {PlainText: 'Schedules with no known minute are in the counts above and not in this chart.'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      BarChartAggregatedFieldWells:
+                        Category:
+                          - CategoricalDimensionField: {FieldId: rp-bar-hour-cat, Column: {DataSetIdentifier: sched, ColumnName: hour_utc}}
+                        Values:
+                          - NumericalMeasureField: {FieldId: rp-bar-hour-val, Column: {DataSetIdentifier: sched, ColumnName: planned_count}, AggregationFunction: {SimpleNumericalAggregation: SUM}}
+                        Colors:
+                          - CategoricalDimensionField: {FieldId: rp-bar-hour-color, Column: {DataSetIdentifier: sched, ColumnName: refresh_type}}
+                    Orientation: VERTICAL
+                    BarsArrangement: STACKED
+                    Legend: {Visibility: VISIBLE, Position: BOTTOM}
+              - BarChartVisual:
+                  VisualId: rp-bar-day
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Planned refreshes per day, next 7 days'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      BarChartAggregatedFieldWells:
+                        Category:
+                          - DateDimensionField: {FieldId: rp-bar-day-cat, Column: {DataSetIdentifier: sched, ColumnName: run_day}, DateGranularity: DAY}
+                        Values:
+                          - NumericalMeasureField: {FieldId: rp-bar-day-val, Column: {DataSetIdentifier: sched, ColumnName: planned_count}, AggregationFunction: {SimpleNumericalAggregation: SUM}}
+                        Colors:
+                          - CategoricalDimensionField: {FieldId: rp-bar-day-color, Column: {DataSetIdentifier: sched, ColumnName: refresh_type}}
+                    Orientation: VERTICAL
+                    BarsArrangement: STACKED
+                    Legend: {Visibility: VISIBLE, Position: BOTTOM}
+              - TableVisual:
+                  VisualId: rp-tbl-nosched
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'SPICE datasets without a schedule'}}
+                  Subtitle: {Visibility: VISIBLE, FormatText: {PlainText: 'Refreshed by hand or by API only. Schedule it, or check Usage before retiring it.'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      TableAggregatedFieldWells:
+                        GroupBy:
+                          - CategoricalDimensionField: {FieldId: rp-tbl-nosched-g0, Column: {DataSetIdentifier: usage, ColumnName: dataset_name}}
+                          - CategoricalDimensionField: {FieldId: rp-tbl-nosched-g1, Column: {DataSetIdentifier: usage, ColumnName: started_by}}
+                          - CategoricalDimensionField: {FieldId: rp-tbl-nosched-g2, Column: {DataSetIdentifier: usage, ColumnName: usage_state}}
+                        Values:
+                          - DateMeasureField: {FieldId: rp-tbl-nosched-m0, Column: {DataSetIdentifier: usage, ColumnName: last_refresh_at}, AggregationFunction: MAX, FormatConfiguration: {DateTimeFormat: 'YYYY-MM-DD HH:mm'}}
+                          - NumericalMeasureField: {FieldId: rp-tbl-nosched-m1, Column: {DataSetIdentifier: usage, ColumnName: refresh_count_30d}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                          - NumericalMeasureField: {FieldId: rp-tbl-nosched-m2, Column: {DataSetIdentifier: usage, ColumnName: days_since_refresh}, AggregationFunction: {SimpleNumericalAggregation: MAX}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                          - NumericalMeasureField: {FieldId: rp-tbl-nosched-m3, Column: {DataSetIdentifier: usage, ColumnName: spice_gb}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 3}}}}}
+                    SortConfiguration:
+                      RowSort:
+                        - FieldSort: {FieldId: rp-tbl-nosched-m2, Direction: DESC}
+                    FieldOptions:
+                      SelectedFieldOptions:
+                        - {FieldId: rp-tbl-nosched-g0, CustomLabel: 'Dataset'}
+                        - {FieldId: rp-tbl-nosched-g1, CustomLabel: 'Started by'}
+                        - {FieldId: rp-tbl-nosched-g2, CustomLabel: 'Usage state'}
+                        - {FieldId: rp-tbl-nosched-m0, CustomLabel: 'Last refresh (UTC)'}
+                        - {FieldId: rp-tbl-nosched-m1, CustomLabel: 'Refreshes in the last 30 days'}
+                        - {FieldId: rp-tbl-nosched-m2, CustomLabel: 'Days since the last refresh'}
+                        - {FieldId: rp-tbl-nosched-m3, CustomLabel: 'SPICE GB'}
+              - BarChartVisual:
+                  VisualId: rp-bar-minutes
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Refresh minutes per day by data source'}}
+                  Subtitle: {Visibility: VISIBLE, FormatText: {PlainText: 'Runs per day times the average duration. The load each source system carries.'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      BarChartAggregatedFieldWells:
+                        Category:
+                          - CategoricalDimensionField: {FieldId: rp-bar-minutes-cat, Column: {DataSetIdentifier: sched, ColumnName: data_source}}
+                        Values:
+                          - NumericalMeasureField: {FieldId: rp-bar-minutes-val, Column: {DataSetIdentifier: sched, ColumnName: refresh_minutes_per_day}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 1}}}}}
+                    SortConfiguration:
+                      CategorySort:
+                        - FieldSort: {FieldId: rp-bar-minutes-val, Direction: DESC}
+                      CategoryItemsLimit: {ItemsLimit: 15, OtherCategories: EXCLUDE}
+                    Orientation: HORIZONTAL
+                    BarsArrangement: STACKED
+            TextBoxes:
+              - SheetTextBoxId: rp-txt-note
+                Content: '<text-box><block align="left"><inline font-weight="bold">How the next run is calculated.</inline> Each schedule''s interval, time of day, time zone and day produce the runs. The chart keeps only runs still in the future, so the next run stays right between daily scans. The API does not give a minute for 15-minute, 30-minute or hourly schedules: the minute comes from the newest scheduled refresh, and otherwise the schedule says within that interval. An unknown time zone has no planned runs.</block></text-box>'
+            Layouts:
+              - Configuration:
+                  GridLayout:
+                    CanvasSizeOptions:
+                      ScreenCanvasSizeOptions: {ResizeOption: FIXED, OptimizedViewPortWidth: '1600px'}
+                    Elements:
+                      - {ElementId: rp-kpi-spice, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 6, RowIndex: 0, RowSpan: 4}
+                      - {ElementId: rp-kpi-with, ElementType: VISUAL, ColumnIndex: 6, ColumnSpan: 6, RowIndex: 0, RowSpan: 4}
+                      - {ElementId: rp-kpi-without, ElementType: VISUAL, ColumnIndex: 12, ColumnSpan: 6, RowIndex: 0, RowSpan: 4}
+                      - {ElementId: rp-kpi-24h, ElementType: VISUAL, ColumnIndex: 18, ColumnSpan: 6, RowIndex: 0, RowSpan: 4}
+                      - {ElementId: rp-kpi-7d, ElementType: VISUAL, ColumnIndex: 24, ColumnSpan: 6, RowIndex: 0, RowSpan: 4}
+                      - {ElementId: rp-kpi-manual, ElementType: VISUAL, ColumnIndex: 30, ColumnSpan: 6, RowIndex: 0, RowSpan: 4}
+                      - {ElementId: rp-tbl-schedules, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 36, RowIndex: 4, RowSpan: 10}
+                      - {ElementId: rp-bar-hour, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 18, RowIndex: 14, RowSpan: 8}
+                      - {ElementId: rp-bar-day, ElementType: VISUAL, ColumnIndex: 18, ColumnSpan: 18, RowIndex: 14, RowSpan: 8}
+                      - {ElementId: rp-tbl-nosched, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 36, RowIndex: 22, RowSpan: 8}
+                      - {ElementId: rp-bar-minutes, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 36, RowIndex: 30, RowSpan: 8}
+                      - {ElementId: rp-txt-note, ElementType: TEXT_BOX, ColumnIndex: 0, ColumnSpan: 36, RowIndex: 38, RowSpan: 4}
           - SheetId: sh-usage
             Name: 'Usage'
-            Title: 'Usage and lineage'
-            Description: 'Who depends on each dataset (dashboards, topics, spaces, agents) and the last observed use with its confidence label.'
+            Title: 'Usage'
+            Description: 'Which datasets are still used, and which can be retired?'
             ParameterControls:
               - DateTimePicker:
                   ParameterControlId: pc-us-start
@@ -1090,6 +2162,16 @@ Resources:
                   Title: 'To (exclusive)'
                   SourceParameterName: pEnd
                   DisplayOptions: {DateTimeFormat: 'YYYY-MM-DD'}
+              - Dropdown:
+                  ParameterControlId: pc-us-pIdleDays
+                  Title: 'Idle after (days)'
+                  SourceParameterName: pIdleDays
+                  Type: SINGLE_SELECT
+                  SelectableValues:
+                    Values: ['30', '60', '90', '180']
+                  DisplayOptions:
+                    SelectAllOptions: {Visibility: HIDDEN}
+                    TitleOptions: {Visibility: VISIBLE}
             FilterControls:
               - Dropdown:
                   FilterControlId: fc-us-mode
@@ -1107,130 +2189,411 @@ Resources:
                   DisplayOptions:
                     SelectAllOptions: {Visibility: VISIBLE}
                     TitleOptions: {Visibility: VISIBLE}
+              - Dropdown:
+                  FilterControlId: fc-us-state
+                  Title: 'State'
+                  SourceFilterId: f-state-us
+                  Type: MULTI_SELECT
+                  DisplayOptions:
+                    SelectAllOptions: {Visibility: VISIBLE}
+                    TitleOptions: {Visibility: VISIBLE}
             SheetControlLayouts:
               - Configuration:
                   GridLayout:
                     Elements:
                       - {ElementId: pc-us-start, ElementType: PARAMETER_CONTROL, ColumnSpan: 2, RowSpan: 1}
                       - {ElementId: pc-us-end, ElementType: PARAMETER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: pc-us-pIdleDays, ElementType: PARAMETER_CONTROL, ColumnSpan: 2, RowSpan: 1}
                       - {ElementId: fc-us-mode, ElementType: FILTER_CONTROL, ColumnSpan: 2, RowSpan: 1}
                       - {ElementId: fc-us-dataset, ElementType: FILTER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: fc-us-state, ElementType: FILTER_CONTROL, ColumnSpan: 2, RowSpan: 1}
             Visuals:
+              - KPIVisual:
+                  VisualId: us-kpi-active
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Active'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      Values:
+                        - NumericalMeasureField: {FieldId: us-kpi-active-v, Column: {DataSetIdentifier: usage, ColumnName: active_flag}, AggregationFunction: {SimpleNumericalAggregation: SUM}}
+              - KPIVisual:
+                  VisualId: us-kpi-idle
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Idle'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      Values:
+                        - NumericalMeasureField: {FieldId: us-kpi-idle-v, Column: {DataSetIdentifier: usage, ColumnName: idle_flag}, AggregationFunction: {SimpleNumericalAggregation: SUM}}
+              - KPIVisual:
+                  VisualId: us-kpi-unknown
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Unknown'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      Values:
+                        - NumericalMeasureField: {FieldId: us-kpi-unknown-v, Column: {DataSetIdentifier: usage, ColumnName: unknown_flag}, AggregationFunction: {SimpleNumericalAggregation: SUM}}
+              - KPIVisual:
+                  VisualId: us-kpi-gb
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'SPICE GB held by idle datasets'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      Values:
+                        - NumericalMeasureField: {FieldId: us-kpi-gb-v, Column: {DataSetIdentifier: usage, ColumnName: idle_spice}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 3}}}}}
+              - KPIVisual:
+                  VisualId: us-kpi-cost
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Est. SPICE cost of idle datasets (USD / month)'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      Values:
+                        - NumericalMeasureField: {FieldId: us-kpi-cost-v, Column: {DataSetIdentifier: usage, ColumnName: idle_cost}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 2}}}}}
               - TableVisual:
-                  VisualId: us-tbl-unreferenced
-                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Unreferenced datasets - in no dashboard, topic or space'}}
-                  Subtitle: {Visibility: VISIBLE, FormatText: {PlainText: 'Cost vs evidence - candidates for review, not deletion'}}
+                  VisualId: us-tbl-all
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'All datasets, stalest first'}}
                   ChartConfiguration:
                     FieldWells:
                       TableAggregatedFieldWells:
                         GroupBy:
-                          - CategoricalDimensionField: {FieldId: us-tbl-unreferenced-g0, Column: {DataSetIdentifier: usage, ColumnName: dataset_name}}
-                          - CategoricalDimensionField: {FieldId: us-tbl-unreferenced-g1, Column: {DataSetIdentifier: usage, ColumnName: import_mode}}
-                          - CategoricalDimensionField: {FieldId: us-tbl-unreferenced-g2, Column: {DataSetIdentifier: usage, ColumnName: usage_confidence}}
-                          - CategoricalDimensionField: {FieldId: us-tbl-unreferenced-g3, Column: {DataSetIdentifier: usage, ColumnName: findings}}
+                          - CategoricalDimensionField: {FieldId: us-tbl-all-g0, Column: {DataSetIdentifier: usage, ColumnName: dataset_name}}
+                          - CategoricalDimensionField: {FieldId: us-tbl-all-g1, Column: {DataSetIdentifier: usage, ColumnName: usage_state}}
+                          - CategoricalDimensionField: {FieldId: us-tbl-all-g2, Column: {DataSetIdentifier: usage, ColumnName: usage_source_label}}
+                          - CategoricalDimensionField: {FieldId: us-tbl-all-g3, Column: {DataSetIdentifier: usage, ColumnName: usage_confidence}}
+                          - CategoricalDimensionField: {FieldId: us-tbl-all-g4, Column: {DataSetIdentifier: usage, ColumnName: import_mode}}
+                          - CategoricalDimensionField: {FieldId: us-tbl-all-g5, Column: {DataSetIdentifier: usage, ColumnName: owner_status}}
                         Values:
-                          - NumericalMeasureField: {FieldId: us-tbl-unreferenced-m0, Column: {DataSetIdentifier: usage, ColumnName: spice_gb}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 3}}}}}
-                          - NumericalMeasureField: {FieldId: us-tbl-unreferenced-m1, Column: {DataSetIdentifier: usage, ColumnName: est_monthly_cost_usd}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 2}}}}}
-                          - NumericalMeasureField: {FieldId: us-tbl-unreferenced-m2, Column: {DataSetIdentifier: usage, ColumnName: agents}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                          - NumericalMeasureField: {FieldId: us-tbl-all-m0, Column: {DataSetIdentifier: usage, ColumnName: staleness}, AggregationFunction: {SimpleNumericalAggregation: MAX}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                          - NumericalMeasureField: {FieldId: us-tbl-all-m1, Column: {DataSetIdentifier: usage, ColumnName: days_now}, AggregationFunction: {SimpleNumericalAggregation: MAX}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                          - DateMeasureField: {FieldId: us-tbl-all-m2, Column: {DataSetIdentifier: usage, ColumnName: last_observed_use_at}, AggregationFunction: MAX, FormatConfiguration: {DateTimeFormat: 'YYYY-MM-DD HH:mm'}}
+                          - NumericalMeasureField: {FieldId: us-tbl-all-m3, Column: {DataSetIdentifier: usage, ColumnName: coverage_days}, AggregationFunction: {SimpleNumericalAggregation: MAX}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                          - NumericalMeasureField: {FieldId: us-tbl-all-m4, Column: {DataSetIdentifier: usage, ColumnName: dashboards}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                          - NumericalMeasureField: {FieldId: us-tbl-all-m5, Column: {DataSetIdentifier: usage, ColumnName: topics}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                          - NumericalMeasureField: {FieldId: us-tbl-all-m6, Column: {DataSetIdentifier: usage, ColumnName: spaces}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                          - NumericalMeasureField: {FieldId: us-tbl-all-m7, Column: {DataSetIdentifier: usage, ColumnName: agents}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                          - NumericalMeasureField: {FieldId: us-tbl-all-m8, Column: {DataSetIdentifier: usage, ColumnName: spice_gb}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 3}}}}}
                     SortConfiguration:
                       RowSort:
-                        - FieldSort: {FieldId: us-tbl-unreferenced-m0, Direction: DESC}
+                        - FieldSort: {FieldId: us-tbl-all-m0, Direction: DESC}
+                        - FieldSort: {FieldId: us-tbl-all-m8, Direction: DESC}
                     FieldOptions:
                       SelectedFieldOptions:
-                        - {FieldId: us-tbl-unreferenced-g0, CustomLabel: 'Dataset'}
-                        - {FieldId: us-tbl-unreferenced-g1, CustomLabel: 'Mode'}
-                        - {FieldId: us-tbl-unreferenced-g2, CustomLabel: 'Confidence'}
-                        - {FieldId: us-tbl-unreferenced-g3, CustomLabel: 'Findings'}
-                        - {FieldId: us-tbl-unreferenced-m0, CustomLabel: 'SPICE GB'}
-                        - {FieldId: us-tbl-unreferenced-m1, CustomLabel: 'Est. USD / month'}
-                        - {FieldId: us-tbl-unreferenced-m2, CustomLabel: 'Agents reaching it'}
+                        - {FieldId: us-tbl-all-g0, CustomLabel: 'Dataset'}
+                        - {FieldId: us-tbl-all-g1, CustomLabel: 'State'}
+                        - {FieldId: us-tbl-all-g2, CustomLabel: 'Source'}
+                        - {FieldId: us-tbl-all-g3, CustomLabel: 'Confidence'}
+                        - {FieldId: us-tbl-all-g4, CustomLabel: 'Import mode'}
+                        - {FieldId: us-tbl-all-g5, CustomLabel: 'Owner status'}
+                        - {FieldId: us-tbl-all-m0, CustomLabel: 'Order', Visibility: HIDDEN}
+                        - {FieldId: us-tbl-all-m1, CustomLabel: 'Days since the last evidence'}
+                        - {FieldId: us-tbl-all-m2, CustomLabel: 'Last evidence (UTC)'}
+                        - {FieldId: us-tbl-all-m3, CustomLabel: 'Coverage (days)'}
+                        - {FieldId: us-tbl-all-m4, CustomLabel: 'Dashboards'}
+                        - {FieldId: us-tbl-all-m5, CustomLabel: 'Topics'}
+                        - {FieldId: us-tbl-all-m6, CustomLabel: 'Spaces'}
+                        - {FieldId: us-tbl-all-m7, CustomLabel: 'Agents'}
+                        - {FieldId: us-tbl-all-m8, CustomLabel: 'SPICE GB'}
               - TableVisual:
-                  VisualId: us-tbl-lru
-                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Least recently used - referenced datasets with usage evidence, stalest first'}}
+                  VisualId: us-tbl-retire
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Retire candidates: idle, nothing depends on them'}}
+                  Subtitle: {Visibility: VISIBLE, FormatText: {PlainText: 'At equal days, the largest SPICE dataset is first. Confirm with the owner.'}}
                   ChartConfiguration:
                     FieldWells:
                       TableAggregatedFieldWells:
                         GroupBy:
-                          - CategoricalDimensionField: {FieldId: us-tbl-lru-g0, Column: {DataSetIdentifier: usage, ColumnName: dataset_name}}
-                          - CategoricalDimensionField: {FieldId: us-tbl-lru-g1, Column: {DataSetIdentifier: usage, ColumnName: import_mode}}
-                          - CategoricalDimensionField: {FieldId: us-tbl-lru-g2, Column: {DataSetIdentifier: usage, ColumnName: usage_confidence}}
-                          - CategoricalDimensionField: {FieldId: us-tbl-lru-g3, Column: {DataSetIdentifier: usage, ColumnName: usage_source}}
+                          - CategoricalDimensionField: {FieldId: us-tbl-retire-g0, Column: {DataSetIdentifier: usage, ColumnName: dataset_name}}
+                          - CategoricalDimensionField: {FieldId: us-tbl-retire-g1, Column: {DataSetIdentifier: usage, ColumnName: usage_source_label}}
+                          - CategoricalDimensionField: {FieldId: us-tbl-retire-g2, Column: {DataSetIdentifier: usage, ColumnName: usage_confidence}}
+                          - CategoricalDimensionField: {FieldId: us-tbl-retire-g3, Column: {DataSetIdentifier: usage, ColumnName: import_mode}}
                         Values:
-                          - NumericalMeasureField: {FieldId: us-tbl-lru-m0, Column: {DataSetIdentifier: usage, ColumnName: days_since_observed_use}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
-                          - DateMeasureField: {FieldId: us-tbl-lru-m1, Column: {DataSetIdentifier: usage, ColumnName: last_observed_use_at}, AggregationFunction: MAX, FormatConfiguration: {DateTimeFormat: 'YYYY-MM-DD HH:mm'}}
-                          - NumericalMeasureField: {FieldId: us-tbl-lru-m2, Column: {DataSetIdentifier: usage, ColumnName: dashboards}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
-                          - NumericalMeasureField: {FieldId: us-tbl-lru-m3, Column: {DataSetIdentifier: usage, ColumnName: topics}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
-                          - NumericalMeasureField: {FieldId: us-tbl-lru-m4, Column: {DataSetIdentifier: usage, ColumnName: spaces}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
-                          - NumericalMeasureField: {FieldId: us-tbl-lru-m5, Column: {DataSetIdentifier: usage, ColumnName: agents}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                          - NumericalMeasureField: {FieldId: us-tbl-retire-m0, Column: {DataSetIdentifier: usage, ColumnName: staleness}, AggregationFunction: {SimpleNumericalAggregation: MAX}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                          - NumericalMeasureField: {FieldId: us-tbl-retire-m1, Column: {DataSetIdentifier: usage, ColumnName: days_now}, AggregationFunction: {SimpleNumericalAggregation: MAX}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                          - DateMeasureField: {FieldId: us-tbl-retire-m2, Column: {DataSetIdentifier: usage, ColumnName: last_observed_use_at}, AggregationFunction: MAX, FormatConfiguration: {DateTimeFormat: 'YYYY-MM-DD HH:mm'}}
+                          - NumericalMeasureField: {FieldId: us-tbl-retire-m3, Column: {DataSetIdentifier: usage, ColumnName: coverage_days}, AggregationFunction: {SimpleNumericalAggregation: MAX}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                          - NumericalMeasureField: {FieldId: us-tbl-retire-m4, Column: {DataSetIdentifier: usage, ColumnName: spice_gb}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 3}}}}}
                     SortConfiguration:
                       RowSort:
-                        - FieldSort: {FieldId: us-tbl-lru-m0, Direction: DESC}
+                        - FieldSort: {FieldId: us-tbl-retire-m0, Direction: DESC}
+                        - FieldSort: {FieldId: us-tbl-retire-m4, Direction: DESC}
                     FieldOptions:
                       SelectedFieldOptions:
-                        - {FieldId: us-tbl-lru-g0, CustomLabel: 'Dataset'}
-                        - {FieldId: us-tbl-lru-g1, CustomLabel: 'Mode'}
-                        - {FieldId: us-tbl-lru-g2, CustomLabel: 'Confidence'}
-                        - {FieldId: us-tbl-lru-g3, CustomLabel: 'Evidence source'}
-                        - {FieldId: us-tbl-lru-m0, CustomLabel: 'Days since use'}
-                        - {FieldId: us-tbl-lru-m1, CustomLabel: 'Last observed use'}
-                        - {FieldId: us-tbl-lru-m2, CustomLabel: 'Dashboards'}
-                        - {FieldId: us-tbl-lru-m3, CustomLabel: 'Topics'}
-                        - {FieldId: us-tbl-lru-m4, CustomLabel: 'Spaces'}
-                        - {FieldId: us-tbl-lru-m5, CustomLabel: 'Agents'}
+                        - {FieldId: us-tbl-retire-g0, CustomLabel: 'Dataset'}
+                        - {FieldId: us-tbl-retire-g1, CustomLabel: 'Source'}
+                        - {FieldId: us-tbl-retire-g2, CustomLabel: 'Confidence'}
+                        - {FieldId: us-tbl-retire-g3, CustomLabel: 'Import mode'}
+                        - {FieldId: us-tbl-retire-m0, CustomLabel: 'Order', Visibility: HIDDEN}
+                        - {FieldId: us-tbl-retire-m1, CustomLabel: 'Days since the last evidence'}
+                        - {FieldId: us-tbl-retire-m2, CustomLabel: 'Last evidence (UTC)'}
+                        - {FieldId: us-tbl-retire-m3, CustomLabel: 'Coverage (days)'}
+                        - {FieldId: us-tbl-retire-m4, CustomLabel: 'SPICE GB'}
               - TableVisual:
-                  VisualId: us-tbl-noevidence
-                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'No usage evidence - telemetry saw nothing (verify before acting)'}}
+                  VisualId: us-tbl-unknown
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Not enough history yet'}}
+                  Subtitle: {Visibility: VISIBLE, FormatText: {PlainText: 'Re-check after the coverage, or the age of the dataset, reaches the window.'}}
                   ChartConfiguration:
                     FieldWells:
                       TableAggregatedFieldWells:
                         GroupBy:
-                          - CategoricalDimensionField: {FieldId: us-tbl-noevidence-g0, Column: {DataSetIdentifier: usage, ColumnName: dataset_name}}
-                          - CategoricalDimensionField: {FieldId: us-tbl-noevidence-g1, Column: {DataSetIdentifier: usage, ColumnName: import_mode}}
-                          - CategoricalDimensionField: {FieldId: us-tbl-noevidence-g2, Column: {DataSetIdentifier: usage, ColumnName: reference_state}}
+                          - CategoricalDimensionField: {FieldId: us-tbl-unknown-g0, Column: {DataSetIdentifier: usage, ColumnName: dataset_name}}
+                          - CategoricalDimensionField: {FieldId: us-tbl-unknown-g1, Column: {DataSetIdentifier: usage, ColumnName: unknown_reason}}
                         Values:
-                          - NumericalMeasureField: {FieldId: us-tbl-noevidence-m0, Column: {DataSetIdentifier: usage, ColumnName: dashboards}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
-                          - NumericalMeasureField: {FieldId: us-tbl-noevidence-m1, Column: {DataSetIdentifier: usage, ColumnName: topics}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
-                          - NumericalMeasureField: {FieldId: us-tbl-noevidence-m2, Column: {DataSetIdentifier: usage, ColumnName: spaces}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
-                          - NumericalMeasureField: {FieldId: us-tbl-noevidence-m3, Column: {DataSetIdentifier: usage, ColumnName: agents}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
-                          - NumericalMeasureField: {FieldId: us-tbl-noevidence-m4, Column: {DataSetIdentifier: usage, ColumnName: spice_gb}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 3}}}}}
+                          - NumericalMeasureField: {FieldId: us-tbl-unknown-m0, Column: {DataSetIdentifier: usage, ColumnName: coverage_days}, AggregationFunction: {SimpleNumericalAggregation: MAX}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                          - DateMeasureField: {FieldId: us-tbl-unknown-m1, Column: {DataSetIdentifier: usage, ColumnName: recheck_after}, AggregationFunction: MAX, FormatConfiguration: {DateTimeFormat: 'YYYY-MM-DD HH:mm'}}
                     SortConfiguration:
                       RowSort:
-                        - FieldSort: {FieldId: us-tbl-noevidence-m4, Direction: DESC}
+                        - FieldSort: {FieldId: us-tbl-unknown-m1, Direction: ASC}
                     FieldOptions:
                       SelectedFieldOptions:
-                        - {FieldId: us-tbl-noevidence-g0, CustomLabel: 'Dataset'}
-                        - {FieldId: us-tbl-noevidence-g1, CustomLabel: 'Mode'}
-                        - {FieldId: us-tbl-noevidence-g2, CustomLabel: 'Referenced'}
-                        - {FieldId: us-tbl-noevidence-m0, CustomLabel: 'Dashboards'}
-                        - {FieldId: us-tbl-noevidence-m1, CustomLabel: 'Topics'}
-                        - {FieldId: us-tbl-noevidence-m2, CustomLabel: 'Spaces'}
-                        - {FieldId: us-tbl-noevidence-m3, CustomLabel: 'Agents'}
-                        - {FieldId: us-tbl-noevidence-m4, CustomLabel: 'SPICE GB'}
-              - BarChartVisual:
-                  VisualId: us-bar-refs
-                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Datasets by reference state and confidence'}}
+                        - {FieldId: us-tbl-unknown-g0, CustomLabel: 'Dataset'}
+                        - {FieldId: us-tbl-unknown-g1, CustomLabel: 'Reason'}
+                        - {FieldId: us-tbl-unknown-m0, CustomLabel: 'Coverage (days)'}
+                        - {FieldId: us-tbl-unknown-m1, CustomLabel: 'Re-check after'}
+              - TableVisual:
+                  VisualId: us-tbl-referenced
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Idle but still used by a dashboard, topic, space or agent: review those first'}}
                   ChartConfiguration:
                     FieldWells:
-                      BarChartAggregatedFieldWells:
-                        Category:
-                          - CategoricalDimensionField: {FieldId: us-bar-refs-cat, Column: {DataSetIdentifier: usage, ColumnName: reference_state}}
+                      TableAggregatedFieldWells:
+                        GroupBy:
+                          - CategoricalDimensionField: {FieldId: us-tbl-referenced-g0, Column: {DataSetIdentifier: usage, ColumnName: dataset_name}}
+                          - CategoricalDimensionField: {FieldId: us-tbl-referenced-g1, Column: {DataSetIdentifier: usage, ColumnName: usage_source_label}}
+                          - CategoricalDimensionField: {FieldId: us-tbl-referenced-g2, Column: {DataSetIdentifier: usage, ColumnName: owner_status}}
                         Values:
-                          - NumericalMeasureField: {FieldId: us-bar-refs-val, Column: {DataSetIdentifier: usage, ColumnName: dataset_count}, AggregationFunction: {SimpleNumericalAggregation: SUM}}
-                        Colors:
-                          - CategoricalDimensionField: {FieldId: us-bar-refs-color, Column: {DataSetIdentifier: usage, ColumnName: usage_confidence}}
-                    Orientation: HORIZONTAL
-                    BarsArrangement: STACKED
-                    Legend: {Visibility: VISIBLE, Position: BOTTOM}
+                          - NumericalMeasureField: {FieldId: us-tbl-referenced-m0, Column: {DataSetIdentifier: usage, ColumnName: days_now}, AggregationFunction: {SimpleNumericalAggregation: MAX}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                          - NumericalMeasureField: {FieldId: us-tbl-referenced-m1, Column: {DataSetIdentifier: usage, ColumnName: dashboards}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                          - NumericalMeasureField: {FieldId: us-tbl-referenced-m2, Column: {DataSetIdentifier: usage, ColumnName: topics}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                          - NumericalMeasureField: {FieldId: us-tbl-referenced-m3, Column: {DataSetIdentifier: usage, ColumnName: spaces}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                          - NumericalMeasureField: {FieldId: us-tbl-referenced-m4, Column: {DataSetIdentifier: usage, ColumnName: agents}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                          - NumericalMeasureField: {FieldId: us-tbl-referenced-m5, Column: {DataSetIdentifier: usage, ColumnName: spice_gb}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 3}}}}}
+                    SortConfiguration:
+                      RowSort:
+                        - FieldSort: {FieldId: us-tbl-referenced-m0, Direction: DESC}
+                    FieldOptions:
+                      SelectedFieldOptions:
+                        - {FieldId: us-tbl-referenced-g0, CustomLabel: 'Dataset'}
+                        - {FieldId: us-tbl-referenced-g1, CustomLabel: 'Source'}
+                        - {FieldId: us-tbl-referenced-g2, CustomLabel: 'Owner status'}
+                        - {FieldId: us-tbl-referenced-m0, CustomLabel: 'Days since the last evidence'}
+                        - {FieldId: us-tbl-referenced-m1, CustomLabel: 'Dashboards'}
+                        - {FieldId: us-tbl-referenced-m2, CustomLabel: 'Topics'}
+                        - {FieldId: us-tbl-referenced-m3, CustomLabel: 'Spaces'}
+                        - {FieldId: us-tbl-referenced-m4, CustomLabel: 'Agents'}
+                        - {FieldId: us-tbl-referenced-m5, CustomLabel: 'SPICE GB'}
+              - PivotTableVisual:
+                  VisualId: us-pivot
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Datasets by state and reference state'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      PivotTableAggregatedFieldWells:
+                        Rows:
+                          - CategoricalDimensionField: {FieldId: us-pivot-row, Column: {DataSetIdentifier: usage, ColumnName: usage_state}}
+                        Columns:
+                          - CategoricalDimensionField: {FieldId: us-pivot-col, Column: {DataSetIdentifier: usage, ColumnName: reference_state}}
+                        Values:
+                          - NumericalMeasureField: {FieldId: us-pivot-val, Column: {DataSetIdentifier: usage, ColumnName: dataset_count}, AggregationFunction: {SimpleNumericalAggregation: SUM}}
+                    TotalOptions:
+                      RowTotalOptions: {TotalsVisibility: VISIBLE}
+                      ColumnTotalOptions: {TotalsVisibility: VISIBLE}
+            TextBoxes:
+              - SheetTextBoxId: us-txt-note
+                Content: '<text-box><block align="left"><inline font-weight="bold">No evidence is not unused.</inline> IDLE needs the evidence to cover the whole window, and the dataset to be older than the window. For a quarterly or yearly dataset, set Idle after to 90 or 180. The source names the dashboard or analysis behind a query when the event carries one. A SPICE query during that dataset''s own refresh does not count.</block></text-box>'
             Layouts:
               - Configuration:
                   GridLayout:
                     CanvasSizeOptions:
                       ScreenCanvasSizeOptions: {ResizeOption: FIXED, OptimizedViewPortWidth: '1600px'}
                     Elements:
-                      - {ElementId: us-tbl-unreferenced, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 22, RowIndex: 0, RowSpan: 10}
-                      - {ElementId: us-bar-refs, ElementType: VISUAL, ColumnIndex: 22, ColumnSpan: 14, RowIndex: 0, RowSpan: 10}
-                      - {ElementId: us-tbl-lru, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 36, RowIndex: 10, RowSpan: 11}
-                      - {ElementId: us-tbl-noevidence, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 36, RowIndex: 21, RowSpan: 10}
+                      - {ElementId: us-kpi-active, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 7, RowIndex: 0, RowSpan: 4}
+                      - {ElementId: us-kpi-idle, ElementType: VISUAL, ColumnIndex: 7, ColumnSpan: 7, RowIndex: 0, RowSpan: 4}
+                      - {ElementId: us-kpi-unknown, ElementType: VISUAL, ColumnIndex: 14, ColumnSpan: 7, RowIndex: 0, RowSpan: 4}
+                      - {ElementId: us-kpi-gb, ElementType: VISUAL, ColumnIndex: 21, ColumnSpan: 7, RowIndex: 0, RowSpan: 4}
+                      - {ElementId: us-kpi-cost, ElementType: VISUAL, ColumnIndex: 28, ColumnSpan: 8, RowIndex: 0, RowSpan: 4}
+                      - {ElementId: us-tbl-all, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 36, RowIndex: 4, RowSpan: 10}
+                      - {ElementId: us-tbl-retire, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 36, RowIndex: 14, RowSpan: 8}
+                      - {ElementId: us-tbl-unknown, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 36, RowIndex: 22, RowSpan: 7}
+                      - {ElementId: us-tbl-referenced, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 22, RowIndex: 29, RowSpan: 8}
+                      - {ElementId: us-pivot, ElementType: VISUAL, ColumnIndex: 22, ColumnSpan: 14, RowIndex: 29, RowSpan: 8}
+                      - {ElementId: us-txt-note, ElementType: TEXT_BOX, ColumnIndex: 0, ColumnSpan: 36, RowIndex: 37, RowSpan: 4}
+          - SheetId: sh-dashboards
+            Name: 'Dashboards'
+            Title: 'Dashboards'
+            Description: 'Which dashboards are still viewed, and which qualify for deletion?'
+            ParameterControls:
+              - DateTimePicker:
+                  ParameterControlId: pc-db-start
+                  Title: 'From'
+                  SourceParameterName: pStart
+                  DisplayOptions: {DateTimeFormat: 'YYYY-MM-DD'}
+              - DateTimePicker:
+                  ParameterControlId: pc-db-end
+                  Title: 'To (exclusive)'
+                  SourceParameterName: pEnd
+                  DisplayOptions: {DateTimeFormat: 'YYYY-MM-DD'}
+              - Dropdown:
+                  ParameterControlId: pc-db-pIdleDays
+                  Title: 'Idle after (days)'
+                  SourceParameterName: pIdleDays
+                  Type: SINGLE_SELECT
+                  SelectableValues:
+                    Values: ['30', '60', '90', '180']
+                  DisplayOptions:
+                    SelectAllOptions: {Visibility: HIDDEN}
+                    TitleOptions: {Visibility: VISIBLE}
+            FilterControls:
+              - Dropdown:
+                  FilterControlId: fc-db-mode
+                  Title: 'Import mode'
+                  SourceFilterId: f-mode-db
+                  Type: MULTI_SELECT
+                  DisplayOptions:
+                    SelectAllOptions: {Visibility: VISIBLE}
+                    TitleOptions: {Visibility: VISIBLE}
+              - Dropdown:
+                  FilterControlId: fc-db-dataset
+                  Title: 'Dataset'
+                  SourceFilterId: f-dataset-db
+                  Type: MULTI_SELECT
+                  DisplayOptions:
+                    SelectAllOptions: {Visibility: VISIBLE}
+                    TitleOptions: {Visibility: VISIBLE}
+              - Dropdown:
+                  FilterControlId: fc-db-dstate
+                  Title: 'State'
+                  SourceFilterId: f-dstate-db
+                  Type: MULTI_SELECT
+                  DisplayOptions:
+                    SelectAllOptions: {Visibility: VISIBLE}
+                    TitleOptions: {Visibility: VISIBLE}
+            SheetControlLayouts:
+              - Configuration:
+                  GridLayout:
+                    Elements:
+                      - {ElementId: pc-db-start, ElementType: PARAMETER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: pc-db-end, ElementType: PARAMETER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: pc-db-pIdleDays, ElementType: PARAMETER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: fc-db-mode, ElementType: FILTER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: fc-db-dataset, ElementType: FILTER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: fc-db-dstate, ElementType: FILTER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+            Visuals:
+              - KPIVisual:
+                  VisualId: db-kpi-all
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Dashboards'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      Values:
+                        - CategoricalMeasureField: {FieldId: db-kpi-all-v, Column: {DataSetIdentifier: dashes, ColumnName: dashboard_id}, AggregationFunction: DISTINCT_COUNT}
+              - KPIVisual:
+                  VisualId: db-kpi-viewed
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Viewed in the window'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      Values:
+                        - CategoricalMeasureField: {FieldId: db-kpi-viewed-v, Column: {DataSetIdentifier: dashes, ColumnName: active_id}, AggregationFunction: DISTINCT_COUNT}
+              - KPIVisual:
+                  VisualId: db-kpi-idle
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Idle'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      Values:
+                        - CategoricalMeasureField: {FieldId: db-kpi-idle-v, Column: {DataSetIdentifier: dashes, ColumnName: idle_id}, AggregationFunction: DISTINCT_COUNT}
+              - KPIVisual:
+                  VisualId: db-kpi-unknown
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Unknown'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      Values:
+                        - CategoricalMeasureField: {FieldId: db-kpi-unknown-v, Column: {DataSetIdentifier: dashes, ColumnName: unknown_id}, AggregationFunction: DISTINCT_COUNT}
+              - TableVisual:
+                  VisualId: db-tbl-all
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Dashboards, least recently viewed first'}}
+                  Subtitle: {Visibility: VISIBLE, FormatText: {PlainText: 'A dashboard with no view in the metric history is labelled no view since that history started.'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      TableAggregatedFieldWells:
+                        GroupBy:
+                          - CategoricalDimensionField: {FieldId: db-tbl-all-g0, Column: {DataSetIdentifier: dashes, ColumnName: dashboard_name}}
+                          - CategoricalDimensionField: {FieldId: db-tbl-all-g1, Column: {DataSetIdentifier: dashes, ColumnName: usage_state}}
+                          - CategoricalDimensionField: {FieldId: db-tbl-all-g2, Column: {DataSetIdentifier: dashes, ColumnName: last_view_label}}
+                          - CategoricalDimensionField: {FieldId: db-tbl-all-g3, Column: {DataSetIdentifier: dashes, ColumnName: last_view_source}}
+                          - CategoricalDimensionField: {FieldId: db-tbl-all-g4, Column: {DataSetIdentifier: dashes, ColumnName: owner_status}}
+                          - NumericalDimensionField: {FieldId: db-tbl-all-g5, Column: {DataSetIdentifier: dashes, ColumnName: days_now}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                          - DateDimensionField: {FieldId: db-tbl-all-g6, Column: {DataSetIdentifier: dashes, ColumnName: last_view_at}, DateGranularity: SECOND, FormatConfiguration: {DateTimeFormat: 'YYYY-MM-DD HH:mm'}}
+                          - NumericalDimensionField: {FieldId: db-tbl-all-g7, Column: {DataSetIdentifier: dashes, ColumnName: views_30}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                          - NumericalDimensionField: {FieldId: db-tbl-all-g8, Column: {DataSetIdentifier: dashes, ColumnName: views_90}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                          - NumericalDimensionField: {FieldId: db-tbl-all-g9, Column: {DataSetIdentifier: dashes, ColumnName: views_year_ago_90}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                          - DateDimensionField: {FieldId: db-tbl-all-g10, Column: {DataSetIdentifier: dashes, ColumnName: last_published_at}, DateGranularity: SECOND, FormatConfiguration: {DateTimeFormat: 'YYYY-MM-DD HH:mm'}}
+                          - CategoricalDimensionField: {FieldId: db-tbl-all-g11, Column: {DataSetIdentifier: dashes, ColumnName: dataset_names}}
+                        Values:
+                          - NumericalMeasureField: {FieldId: db-tbl-all-m0, Column: {DataSetIdentifier: dashes, ColumnName: staleness}, AggregationFunction: {SimpleNumericalAggregation: MAX}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                    SortConfiguration:
+                      RowSort:
+                        - FieldSort: {FieldId: db-tbl-all-m0, Direction: DESC}
+                    FieldOptions:
+                      SelectedFieldOptions:
+                        - {FieldId: db-tbl-all-g0, CustomLabel: 'Dashboard'}
+                        - {FieldId: db-tbl-all-g1, CustomLabel: 'State'}
+                        - {FieldId: db-tbl-all-g2, CustomLabel: 'View label'}
+                        - {FieldId: db-tbl-all-g3, CustomLabel: 'Source'}
+                        - {FieldId: db-tbl-all-g4, CustomLabel: 'Owner status'}
+                        - {FieldId: db-tbl-all-g5, CustomLabel: 'Days since the last view'}
+                        - {FieldId: db-tbl-all-g6, CustomLabel: 'Last view (UTC)'}
+                        - {FieldId: db-tbl-all-g7, CustomLabel: 'Views in 30 days'}
+                        - {FieldId: db-tbl-all-g8, CustomLabel: 'Views in 90 days'}
+                        - {FieldId: db-tbl-all-g9, CustomLabel: 'Views in the same 90 days a year earlier'}
+                        - {FieldId: db-tbl-all-g10, CustomLabel: 'Last published (UTC)'}
+                        - {FieldId: db-tbl-all-g11, CustomLabel: 'Datasets used'}
+                        - {FieldId: db-tbl-all-m0, CustomLabel: 'Order', Visibility: HIDDEN}
+              - TableVisual:
+                  VisualId: db-tbl-delete
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Deletion candidates: idle, and no view in the same 90 days a year earlier'}}
+                  Subtitle: {Visibility: VISIBLE, FormatText: {PlainText: 'Export a backup (asset bundle) and confirm with the owner first. No idle dashboard also has a year-ago history of zero views when this table is empty.'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      TableAggregatedFieldWells:
+                        GroupBy:
+                          - CategoricalDimensionField: {FieldId: db-tbl-delete-g0, Column: {DataSetIdentifier: dashes, ColumnName: dashboard_name}}
+                          - CategoricalDimensionField: {FieldId: db-tbl-delete-g1, Column: {DataSetIdentifier: dashes, ColumnName: dataset_names}}
+                        Values:
+                          - NumericalMeasureField: {FieldId: db-tbl-delete-m0, Column: {DataSetIdentifier: dashes, ColumnName: staleness}, AggregationFunction: {SimpleNumericalAggregation: MAX}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                          - NumericalMeasureField: {FieldId: db-tbl-delete-m1, Column: {DataSetIdentifier: dashes, ColumnName: days_now}, AggregationFunction: {SimpleNumericalAggregation: MAX}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                          - DateMeasureField: {FieldId: db-tbl-delete-m2, Column: {DataSetIdentifier: dashes, ColumnName: last_published_at}, AggregationFunction: MAX, FormatConfiguration: {DateTimeFormat: 'YYYY-MM-DD HH:mm'}}
+                    SortConfiguration:
+                      RowSort:
+                        - FieldSort: {FieldId: db-tbl-delete-m0, Direction: DESC}
+                    FieldOptions:
+                      SelectedFieldOptions:
+                        - {FieldId: db-tbl-delete-g0, CustomLabel: 'Dashboard'}
+                        - {FieldId: db-tbl-delete-g1, CustomLabel: 'Datasets used'}
+                        - {FieldId: db-tbl-delete-m0, CustomLabel: 'Order', Visibility: HIDDEN}
+                        - {FieldId: db-tbl-delete-m1, CustomLabel: 'Days since the last view'}
+                        - {FieldId: db-tbl-delete-m2, CustomLabel: 'Last published (UTC)'}
+              - BarChartVisual:
+                  VisualId: db-bar-viewed
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Most viewed dashboards, last 90 days (top 20)'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      BarChartAggregatedFieldWells:
+                        Category:
+                          - CategoricalDimensionField: {FieldId: db-bar-viewed-cat, Column: {DataSetIdentifier: dashes, ColumnName: dashboard_name}}
+                        Values:
+                          - NumericalMeasureField: {FieldId: db-bar-viewed-val, Column: {DataSetIdentifier: dashes, ColumnName: views_90}, AggregationFunction: {SimpleNumericalAggregation: MAX}}
+                    SortConfiguration:
+                      CategorySort:
+                        - FieldSort: {FieldId: db-bar-viewed-val, Direction: DESC}
+                      CategoryItemsLimit: {ItemsLimit: 20, OtherCategories: EXCLUDE}
+                    Orientation: HORIZONTAL
+                    BarsArrangement: STACKED
+            TextBoxes:
+              - SheetTextBoxId: db-txt-note
+                Content: '<text-box><block align="left"><inline font-weight="bold">What a view is.</inline> Views come from DashboardViewCount (web, mobile and embedded). E-mail report deliveries may not count. CloudTrail adds who opened a dashboard. Every dashboard is listed, the governance dashboards included: nobody opening them is a finding too. A dashboard with no metric history for the same 90 days a year earlier is not a deletion candidate, because that absence is missing history rather than a quiet year.</block></text-box>'
+            Layouts:
+              - Configuration:
+                  GridLayout:
+                    CanvasSizeOptions:
+                      ScreenCanvasSizeOptions: {ResizeOption: FIXED, OptimizedViewPortWidth: '1600px'}
+                    Elements:
+                      - {ElementId: db-kpi-all, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 9, RowIndex: 0, RowSpan: 4}
+                      - {ElementId: db-kpi-viewed, ElementType: VISUAL, ColumnIndex: 9, ColumnSpan: 9, RowIndex: 0, RowSpan: 4}
+                      - {ElementId: db-kpi-idle, ElementType: VISUAL, ColumnIndex: 18, ColumnSpan: 9, RowIndex: 0, RowSpan: 4}
+                      - {ElementId: db-kpi-unknown, ElementType: VISUAL, ColumnIndex: 27, ColumnSpan: 9, RowIndex: 0, RowSpan: 4}
+                      - {ElementId: db-tbl-all, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 36, RowIndex: 4, RowSpan: 11}
+                      - {ElementId: db-tbl-delete, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 36, RowIndex: 15, RowSpan: 8}
+                      - {ElementId: db-bar-viewed, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 36, RowIndex: 23, RowSpan: 8}
+                      - {ElementId: db-txt-note, ElementType: TEXT_BOX, ColumnIndex: 0, ColumnSpan: 36, RowIndex: 31, RowSpan: 4}
           - SheetId: sh-capacity
             Name: 'Capacity and cost'
             Title: 'SPICE capacity and estimated cost'
@@ -1246,6 +2609,16 @@ Resources:
                   Title: 'To (exclusive)'
                   SourceParameterName: pEnd
                   DisplayOptions: {DateTimeFormat: 'YYYY-MM-DD'}
+              - Dropdown:
+                  ParameterControlId: pc-cp-pIdleDays
+                  Title: 'Idle after (days)'
+                  SourceParameterName: pIdleDays
+                  Type: SINGLE_SELECT
+                  SelectableValues:
+                    Values: ['30', '60', '90', '180']
+                  DisplayOptions:
+                    SelectAllOptions: {Visibility: HIDDEN}
+                    TitleOptions: {Visibility: VISIBLE}
             FilterControls:
               - Dropdown:
                   FilterControlId: fc-cp-mode
@@ -1263,14 +2636,24 @@ Resources:
                   DisplayOptions:
                     SelectAllOptions: {Visibility: VISIBLE}
                     TitleOptions: {Visibility: VISIBLE}
+              - Dropdown:
+                  FilterControlId: fc-cp-state
+                  Title: 'State'
+                  SourceFilterId: f-state-cp
+                  Type: MULTI_SELECT
+                  DisplayOptions:
+                    SelectAllOptions: {Visibility: VISIBLE}
+                    TitleOptions: {Visibility: VISIBLE}
             SheetControlLayouts:
               - Configuration:
                   GridLayout:
                     Elements:
                       - {ElementId: pc-cp-start, ElementType: PARAMETER_CONTROL, ColumnSpan: 2, RowSpan: 1}
                       - {ElementId: pc-cp-end, ElementType: PARAMETER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: pc-cp-pIdleDays, ElementType: PARAMETER_CONTROL, ColumnSpan: 2, RowSpan: 1}
                       - {ElementId: fc-cp-mode, ElementType: FILTER_CONTROL, ColumnSpan: 2, RowSpan: 1}
                       - {ElementId: fc-cp-dataset, ElementType: FILTER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: fc-cp-state, ElementType: FILTER_CONTROL, ColumnSpan: 2, RowSpan: 1}
             Visuals:
               - TableVisual:
                   VisualId: cp-tbl-largest
@@ -1280,22 +2663,24 @@ Resources:
                       TableAggregatedFieldWells:
                         GroupBy:
                           - CategoricalDimensionField: {FieldId: cp-tbl-largest-g0, Column: {DataSetIdentifier: usage, ColumnName: dataset_name}}
-                          - CategoricalDimensionField: {FieldId: cp-tbl-largest-g1, Column: {DataSetIdentifier: usage, ColumnName: cost_type}}
-                          - CategoricalDimensionField: {FieldId: cp-tbl-largest-g2, Column: {DataSetIdentifier: usage, ColumnName: usage_confidence}}
+                          - CategoricalDimensionField: {FieldId: cp-tbl-largest-g1, Column: {DataSetIdentifier: usage, ColumnName: usage_state}}
+                          - CategoricalDimensionField: {FieldId: cp-tbl-largest-g2, Column: {DataSetIdentifier: usage, ColumnName: cost_type}}
+                          - CategoricalDimensionField: {FieldId: cp-tbl-largest-g3, Column: {DataSetIdentifier: usage, ColumnName: usage_confidence}}
                         Values:
                           - NumericalMeasureField: {FieldId: cp-tbl-largest-m0, Column: {DataSetIdentifier: usage, ColumnName: spice_gb}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 3}}}}}
                           - NumericalMeasureField: {FieldId: cp-tbl-largest-m1, Column: {DataSetIdentifier: usage, ColumnName: est_monthly_cost_usd}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 2}}}}}
                           - NumericalMeasureField: {FieldId: cp-tbl-largest-m2, Column: {DataSetIdentifier: usage, ColumnName: dashboards}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
                           - NumericalMeasureField: {FieldId: cp-tbl-largest-m3, Column: {DataSetIdentifier: usage, ColumnName: topics}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
-                          - NumericalMeasureField: {FieldId: cp-tbl-largest-m4, Column: {DataSetIdentifier: usage, ColumnName: days_since_observed_use}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                          - NumericalMeasureField: {FieldId: cp-tbl-largest-m4, Column: {DataSetIdentifier: usage, ColumnName: days_now}, AggregationFunction: {SimpleNumericalAggregation: MAX}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
                     SortConfiguration:
                       RowSort:
                         - FieldSort: {FieldId: cp-tbl-largest-m0, Direction: DESC}
                     FieldOptions:
                       SelectedFieldOptions:
                         - {FieldId: cp-tbl-largest-g0, CustomLabel: 'Dataset'}
-                        - {FieldId: cp-tbl-largest-g1, CustomLabel: 'Cost type'}
-                        - {FieldId: cp-tbl-largest-g2, CustomLabel: 'Usage confidence'}
+                        - {FieldId: cp-tbl-largest-g1, CustomLabel: 'State'}
+                        - {FieldId: cp-tbl-largest-g2, CustomLabel: 'Cost type'}
+                        - {FieldId: cp-tbl-largest-g3, CustomLabel: 'Usage confidence'}
                         - {FieldId: cp-tbl-largest-m0, CustomLabel: 'SPICE GB'}
                         - {FieldId: cp-tbl-largest-m1, CustomLabel: 'Est. USD / month'}
                         - {FieldId: cp-tbl-largest-m2, CustomLabel: 'Dashboards'}
@@ -1346,8 +2731,8 @@ Resources:
                       - {ElementId: cp-pivot, ElementType: VISUAL, ColumnIndex: 20, ColumnSpan: 16, RowIndex: 12, RowSpan: 12}
           - SheetId: sh-history
             Name: 'History'
-            Title: 'Refresh history'
-            Description: 'Hourly refresh-state records over the selected period: failure trend and the failure feed.'
+            Title: 'History'
+            Description: 'Hourly refresh-state records, and whether the idle count moves from one daily scan to the next.'
             ParameterControls:
               - DateTimePicker:
                   ParameterControlId: pc-hs-start
@@ -1440,6 +2825,21 @@ Resources:
                         - {FieldId: hs-tbl-failures-c3, CustomLabel: 'Error message'}
                         - {FieldId: hs-tbl-failures-c4, CustomLabel: 'Refresh type'}
                         - {FieldId: hs-tbl-failures-c5, CustomLabel: 'Last failed'}
+              - LineChartVisual:
+                  VisualId: hs-line-idle
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Idle datasets and idle dashboards per daily scan'}}
+                  Subtitle: {Visibility: VISIBLE, FormatText: {PlainText: 'The state stored by that scan, at the module window. The Idle after control does not move this line.'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      LineChartAggregatedFieldWells:
+                        Category:
+                          - DateDimensionField: {FieldId: hs-line-idle-cat, Column: {DataSetIdentifier: idlehist, ColumnName: scan_time}, DateGranularity: DAY}
+                        Values:
+                          - NumericalMeasureField: {FieldId: hs-line-idle-val, Column: {DataSetIdentifier: idlehist, ColumnName: idle_count}, AggregationFunction: {SimpleNumericalAggregation: SUM}}
+                        Colors:
+                          - CategoricalDimensionField: {FieldId: hs-line-idle-color, Column: {DataSetIdentifier: idlehist, ColumnName: series}}
+                    Type: LINE
+                    Legend: {Visibility: VISIBLE, Position: BOTTOM}
             Layouts:
               - Configuration:
                   GridLayout:
@@ -1449,6 +2849,7 @@ Resources:
                       - {ElementId: hs-line-failed, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 18, RowIndex: 0, RowSpan: 11}
                       - {ElementId: hs-bar-status, ElementType: VISUAL, ColumnIndex: 18, ColumnSpan: 18, RowIndex: 0, RowSpan: 11}
                       - {ElementId: hs-tbl-failures, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 36, RowIndex: 11, RowSpan: 12}
+                      - {ElementId: hs-line-idle, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 36, RowIndex: 23, RowSpan: 8}
       Tags:
         - {Key: Purpose, Value: !Ref ResourcePrefix}
         - {Key: ManagedBy, Value: CloudFormation}
