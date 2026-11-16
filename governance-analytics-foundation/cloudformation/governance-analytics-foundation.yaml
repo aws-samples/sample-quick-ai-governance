@@ -198,6 +198,14 @@ Resources:
             Status: Enabled
             Prefix: dataset-lifecycle/slow/
             ExpirationInDays: !Ref AnalyticsExpirationDays
+          - Id: expire-dataset-lifecycle-dashboards
+            Status: Enabled
+            Prefix: dataset-lifecycle/dashboards/
+            ExpirationInDays: !Ref AnalyticsExpirationDays
+          - Id: expire-dataset-lifecycle-schedules
+            Status: Enabled
+            Prefix: dataset-lifecycle/schedules/
+            ExpirationInDays: !Ref AnalyticsExpirationDays
           - Id: expire-orphaned-assets-ownership
             Status: Enabled
             Prefix: orphaned-assets/ownership/
