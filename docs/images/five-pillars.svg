@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="816" viewBox="0 0 1400 816" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="912" viewBox="0 0 1400 912" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">
   <title>AWS Quick AI governance: five pillars, reference modules and native controls</title>
   <desc>Three pillars (Consumption, Interactions, Data asset lifecycle) each combine a reference module from this repository with native AWS Quick controls. Two pillars, Sharing and data security in agent access, are native capabilities of the service and need no module. Everything rests on the AWS Quick service layer.</desc>
   <defs>
@@ -15,7 +15,7 @@
     </filter>
   </defs>
 
-  <rect width="1400" height="816" fill="url(#bg)"/>
+  <rect width="1400" height="912" fill="url(#bg)"/>
 
   <!-- Title -->
   <text x="60" y="52" font-size="26" font-weight="700" fill="#232F3E">AWS Quick — AI governance in five pillars</text>
@@ -25,10 +25,10 @@
   <g font-size="12" font-weight="600" fill="#545B64" text-anchor="end">
     <text x="188" y="212" >REFERENCE MODULES</text>
     <text x="188" y="228" font-weight="400">this repository</text>
-    <text x="188" y="428">NATIVE CONTROLS</text>
-    <text x="188" y="444" font-weight="400">AWS Quick</text>
+    <text x="188" y="524">NATIVE CONTROLS</text>
+    <text x="188" y="540" font-weight="400">AWS Quick</text>
   </g>
-  <line x1="200" y1="150" x2="200" y2="516" stroke="#D5DBDB" stroke-width="1"/>
+  <line x1="200" y1="150" x2="200" y2="612" stroke="#D5DBDB" stroke-width="1"/>
 
   <!-- Pillar columns: x positions -->
   <!-- Column 1: Consumption -->
@@ -47,12 +47,20 @@
     <rect x="232" y="330" width="118" height="22" rx="11" fill="#FFF4E5"/>
     <text x="291" y="345" font-size="11" font-weight="600" fill="#8D6605" text-anchor="middle">CloudFormation</text>
 
-    <rect x="216" y="400" width="270" height="120" rx="8" fill="#F7F8FA" stroke="#AAB7B8" stroke-width="1.5" stroke-dasharray="6 4"/>
-    <text x="232" y="428" font-size="14" font-weight="700" fill="#232F3E">Limit profiles</text>
-    <text x="232" y="452" font-size="12" fill="#545B64">Per-user caps on agent hours and</text>
-    <text x="232" y="470" font-size="12" fill="#545B64">index storage — by user, role or</text>
-    <text x="232" y="488" font-size="12" fill="#545B64">account default; enforced globally.</text>
+    <rect x="216" y="496" width="270" height="120" rx="8" fill="#F7F8FA" stroke="#AAB7B8" stroke-width="1.5" stroke-dasharray="6 4"/>
+    <text x="232" y="524" font-size="14" font-weight="700" fill="#232F3E">Limit profiles</text>
+    <text x="232" y="548" font-size="12" fill="#545B64">Per-user caps on agent hours and</text>
+    <text x="232" y="566" font-size="12" fill="#545B64">index storage — by user, role or</text>
+    <text x="232" y="584" font-size="12" fill="#545B64">account default; enforced globally.</text>
   </g>
+
+
+    <rect x="216" y="372" width="270" height="110" rx="8" fill="#FFFFFF" stroke="#FF9900" stroke-width="2" filter="url(#shadow)"/>
+    <text x="232" y="398" font-size="15" font-weight="700" fill="#232F3E">License and Activity Monitor</text>
+    <text x="232" y="422" font-size="12" fill="#545B64">Last observed activity, idle users,</text>
+    <text x="232" y="440" font-size="12" fill="#545B64">and which license can move.</text>
+    <rect x="232" y="452" width="80" height="22" rx="11" fill="#FFF4E5"/>
+    <text x="272" y="467" font-size="11" font-weight="600" fill="#8D6605" text-anchor="middle">AWS SAM</text>
 
   <!-- Column 2: Interactions -->
   <g>
@@ -70,11 +78,11 @@
     <rect x="518" y="330" width="118" height="22" rx="11" fill="#FFF4E5"/>
     <text x="577" y="345" font-size="11" font-weight="600" fill="#8D6605" text-anchor="middle">CloudFormation</text>
 
-    <rect x="502" y="400" width="270" height="120" rx="8" fill="#F7F8FA" stroke="#AAB7B8" stroke-width="1.5" stroke-dasharray="6 4"/>
-    <text x="518" y="428" font-size="14" font-weight="700" fill="#232F3E">Vended logs</text>
-    <text x="518" y="452" font-size="12" fill="#545B64">CHAT_LOGS and FEEDBACK_LOGS to</text>
-    <text x="518" y="470" font-size="12" fill="#545B64">CloudWatch Logs, S3 or Firehose —</text>
-    <text x="518" y="488" font-size="12" fill="#545B64">per Region, not retroactive.</text>
+    <rect x="502" y="496" width="270" height="120" rx="8" fill="#F7F8FA" stroke="#AAB7B8" stroke-width="1.5" stroke-dasharray="6 4"/>
+    <text x="518" y="524" font-size="14" font-weight="700" fill="#232F3E">Vended logs</text>
+    <text x="518" y="548" font-size="12" fill="#545B64">CHAT_LOGS and FEEDBACK_LOGS to</text>
+    <text x="518" y="566" font-size="12" fill="#545B64">CloudWatch Logs, S3 or Firehose —</text>
+    <text x="518" y="584" font-size="12" fill="#545B64">per Region, not retroactive.</text>
   </g>
 
   <!-- Column 3: Sharing -->
@@ -93,11 +101,11 @@
     <rect x="804" y="330" width="196" height="22" rx="11" fill="#D6EFDA"/>
     <text x="902" y="345" font-size="11" font-weight="600" fill="#1D8102" text-anchor="middle">Native capability · no module</text>
 
-    <rect x="788" y="400" width="270" height="120" rx="8" fill="#F7F8FA" stroke="#AAB7B8" stroke-width="1.5" stroke-dasharray="6 4"/>
-    <text x="804" y="428" font-size="14" font-weight="700" fill="#232F3E">Custom permissions, deny by</text>
-    <text x="804" y="446" font-size="14" font-weight="700" fill="#232F3E">default, approval workflows</text>
-    <text x="804" y="470" font-size="12" fill="#545B64">Allow, require approval, or deny —</text>
-    <text x="804" y="488" font-size="12" fill="#545B64">per asset type and population.</text>
+    <rect x="788" y="496" width="270" height="120" rx="8" fill="#F7F8FA" stroke="#AAB7B8" stroke-width="1.5" stroke-dasharray="6 4"/>
+    <text x="804" y="524" font-size="14" font-weight="700" fill="#232F3E">Custom permissions, deny by</text>
+    <text x="804" y="542" font-size="14" font-weight="700" fill="#232F3E">default, approval workflows</text>
+    <text x="804" y="566" font-size="12" fill="#545B64">Allow, require approval, or deny —</text>
+    <text x="804" y="584" font-size="12" fill="#545B64">per asset type and population.</text>
   </g>
 
   <!-- Column 4: Data asset lifecycle -->
@@ -116,37 +124,37 @@
     <rect x="1090" y="330" width="80" height="22" rx="11" fill="#FFF4E5"/>
     <text x="1130" y="345" font-size="11" font-weight="600" fill="#8D6605" text-anchor="middle">AWS SAM</text>
 
-    <rect x="1074" y="400" width="270" height="120" rx="8" fill="#F7F8FA" stroke="#AAB7B8" stroke-width="1.5" stroke-dasharray="6 4"/>
-    <text x="1090" y="428" font-size="14" font-weight="700" fill="#232F3E">Events, metrics and asset</text>
-    <text x="1090" y="446" font-size="14" font-weight="700" fill="#232F3E">management</text>
-    <text x="1090" y="470" font-size="12" fill="#545B64">EventBridge events, native CloudWatch</text>
-    <text x="1090" y="488" font-size="12" fill="#545B64">metrics, asset management console.</text>
+    <rect x="1074" y="496" width="270" height="120" rx="8" fill="#F7F8FA" stroke="#AAB7B8" stroke-width="1.5" stroke-dasharray="6 4"/>
+    <text x="1090" y="524" font-size="14" font-weight="700" fill="#232F3E">Events, metrics and asset</text>
+    <text x="1090" y="542" font-size="14" font-weight="700" fill="#232F3E">management</text>
+    <text x="1090" y="566" font-size="12" fill="#545B64">EventBridge events, native CloudWatch</text>
+    <text x="1090" y="584" font-size="12" fill="#545B64">metrics, asset management console.</text>
   </g>
 
   <!-- Pillar 5: spans all columns -->
   <g>
-    <rect x="216" y="548" width="1128" height="112" rx="8" fill="#E9F5EC" stroke="#1D8102" stroke-width="2" filter="url(#shadow)"/>
-    <text x="232" y="578" font-size="15" font-weight="700" fill="#232F3E">5 · Data security in agent access — permissions inherited end to end</text>
-    <text x="232" y="604" font-size="12" fill="#3A4750">Every answer is generated in the asking user's context and inherits the dataset permissions: RLS / CLS evaluated per user through the semantic layer.</text>
-    <text x="232" y="624" font-size="12" fill="#3A4750">DLP with Microsoft Purview governs unstructured content. The security rule is defined once, at the data layer, and holds for dashboards, questions, agents and apps.</text>
-    <rect x="1132" y="568" width="196" height="22" rx="11" fill="#D6EFDA"/>
-    <text x="1230" y="583" font-size="11" font-weight="600" fill="#1D8102" text-anchor="middle">Native capability · no module</text>
+    <rect x="216" y="644" width="1128" height="112" rx="8" fill="#E9F5EC" stroke="#1D8102" stroke-width="2" filter="url(#shadow)"/>
+    <text x="232" y="674" font-size="15" font-weight="700" fill="#232F3E">5 · Data security in agent access — permissions inherited end to end</text>
+    <text x="232" y="700" font-size="12" fill="#3A4750">Every answer is generated in the asking user's context and inherits the dataset permissions: RLS / CLS evaluated per user through the semantic layer.</text>
+    <text x="232" y="720" font-size="12" fill="#3A4750">DLP with Microsoft Purview governs unstructured content. The security rule is defined once, at the data layer, and holds for dashboards, questions, agents and apps.</text>
+    <rect x="1132" y="664" width="196" height="22" rx="11" fill="#D6EFDA"/>
+    <text x="1230" y="679" font-size="11" font-weight="600" fill="#1D8102" text-anchor="middle">Native capability · no module</text>
   </g>
 
   <!-- AWS Quick service layer -->
   <g>
-    <rect x="216" y="688" width="1128" height="72" rx="8" fill="url(#quick)"/>
-    <text x="232" y="718" font-size="15" font-weight="700" fill="#FFFFFF">AWS Quick</text>
-    <text x="232" y="742" font-size="12" fill="#D5DBDB">Datasets · semantic layer (topics) · Spaces · Chat Agents · Flows · Automate · Research</text>
+    <rect x="216" y="784" width="1128" height="72" rx="8" fill="url(#quick)"/>
+    <text x="232" y="814" font-size="15" font-weight="700" fill="#FFFFFF">AWS Quick</text>
+    <text x="232" y="838" font-size="12" fill="#D5DBDB">Datasets · semantic layer (topics) · Spaces · Chat Agents · Flows · Automate · Research</text>
   </g>
 
   <!-- Legend -->
   <g font-size="11" fill="#545B64">
-    <rect x="60" y="776" width="14" height="14" rx="3" fill="#FFFFFF" stroke="#FF9900" stroke-width="2"/>
-    <text x="80" y="787">Reference module (deploy only what you need, in any order)</text>
-    <rect x="420" y="776" width="14" height="14" rx="3" fill="#F7F8FA" stroke="#AAB7B8" stroke-width="1.5" stroke-dasharray="4 3"/>
-    <text x="440" y="787">Native AWS Quick control</text>
-    <rect x="640" y="776" width="14" height="14" rx="3" fill="#E9F5EC" stroke="#1D8102" stroke-width="2"/>
-    <text x="660" y="787">Native capability of the service</text>
+    <rect x="60" y="872" width="14" height="14" rx="3" fill="#FFFFFF" stroke="#FF9900" stroke-width="2"/>
+    <text x="80" y="883">Reference module (deploy only what you need, in any order)</text>
+    <rect x="420" y="872" width="14" height="14" rx="3" fill="#F7F8FA" stroke="#AAB7B8" stroke-width="1.5" stroke-dasharray="4 3"/>
+    <text x="440" y="883">Native AWS Quick control</text>
+    <rect x="640" y="872" width="14" height="14" rx="3" fill="#E9F5EC" stroke="#1D8102" stroke-width="2"/>
+    <text x="660" y="883">Native capability of the service</text>
   </g>
 </svg>
