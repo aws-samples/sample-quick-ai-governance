@@ -1,0 +1,1132 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  AWS Quick license and activity monitor. Glue tables over the user, source
+  and tier snapshots, Direct Query datasets, and a five-tab dashboard:
+  Overview, Users, License fit, Evidence, History.
+  Requires the governance analytics foundation and the license-activity module.
+
+Parameters:
+  ResourcePrefix:
+    Type: String
+    Default: 'quick-governance-license-activity'
+    AllowedPattern: '^[a-z0-9-]{1,40}$'
+  FoundationStackName:
+    Type: String
+    Default: 'quick-governance-analytics-foundation'
+  QuickPrincipalArn:
+    Type: String
+    AllowedPattern: '^arn:aws[a-z-]*:quicksight:[a-z0-9-]+:[0-9]{12}:(user|group)/.+$'
+  UsersPrefix:
+    Type: String
+    Default: 'license-activity/users/'
+  SourcesPrefix:
+    Type: String
+    Default: 'license-activity/sources/'
+  TiersPrefix:
+    Type: String
+    Default: 'license-activity/tiers/'
+
+Resources:
+  UsersTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref 'AWS::AccountId'
+      DatabaseName: {Fn::ImportValue: !Sub '${FoundationStackName}-GlueDatabase'}
+      TableInput:
+        Name: license_activity_users
+        TableType: EXTERNAL_TABLE
+        Parameters: {classification: json, EXTERNAL: 'TRUE'}
+        StorageDescriptor:
+          Location: !Sub
+            - 's3://${Bucket}/${UsersPrefix}'
+            - Bucket: {Fn::ImportValue: !Sub '${FoundationStackName}-AnalyticsBucket'}
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.openx.data.jsonserde.JsonSerDe
+            Parameters: {ignore.malformed.json: 'true', case.insensitive: 'true'}
+          Columns:
+            - {Name: ts, Type: string}
+            - {Name: userarn, Type: string}
+            - {Name: username, Type: string}
+            - {Name: role, Type: string}
+            - {Name: identitytype, Type: string}
+            - {Name: active, Type: string}
+            - {Name: assetstate, Type: string}
+            - {Name: lastactivityat, Type: string}
+            - {Name: lastactivitysource, Type: string}
+            - {Name: lastactivitycategory, Type: string}
+            - {Name: dayssinceactivity, Type: int}
+            - {Name: lastsigninat, Type: string}
+            - {Name: coveragestart, Type: string}
+            - {Name: coveragedays, Type: int}
+            - {Name: usagestate, Type: string}
+            - {Name: unknownreason, Type: string}
+            - {Name: recheckafter, Type: string}
+            - {Name: assetsowned, Type: int}
+            - {Name: assetsownedalone, Type: int}
+            - {Name: removalreadiness, Type: string}
+            - {Name: peakhours, Type: double}
+            - {Name: hoursconfidence, Type: string}
+            - {Name: currenttier, Type: string}
+            - {Name: listpriceusd, Type: double}
+            - {Name: candidatetier, Type: string}
+            - {Name: candidatepriceusd, Type: double}
+            - {Name: savingusd, Type: double}
+            - {Name: changepath, Type: string}
+            - {Name: savingfrom, Type: string}
+            - {Name: authoringcount, Type: int}
+            - {Name: didauthoring, Type: int}
+            - {Name: didai, Type: int}
+            - {Name: didviewing, Type: int}
+            - {Name: didadministration, Type: int}
+
+  SourcesTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref 'AWS::AccountId'
+      DatabaseName: {Fn::ImportValue: !Sub '${FoundationStackName}-GlueDatabase'}
+      TableInput:
+        Name: license_activity_sources
+        TableType: EXTERNAL_TABLE
+        Parameters: {classification: json, EXTERNAL: 'TRUE'}
+        StorageDescriptor:
+          Location: !Sub
+            - 's3://${Bucket}/${SourcesPrefix}'
+            - Bucket: {Fn::ImportValue: !Sub '${FoundationStackName}-AnalyticsBucket'}
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.openx.data.jsonserde.JsonSerDe
+            Parameters: {ignore.malformed.json: 'true', case.insensitive: 'true'}
+          Columns:
+            - {Name: ts, Type: string}
+            - {Name: source, Type: string}
+            - {Name: newestrecordat, Type: string}
+            - {Name: coveragestart, Type: string}
+            - {Name: coveragedays, Type: int}
+            - {Name: gapdays30, Type: int}
+            - {Name: status, Type: string}
+
+  TiersTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref 'AWS::AccountId'
+      DatabaseName: {Fn::ImportValue: !Sub '${FoundationStackName}-GlueDatabase'}
+      TableInput:
+        Name: license_activity_tiers
+        TableType: EXTERNAL_TABLE
+        Parameters: {classification: json, EXTERNAL: 'TRUE'}
+        StorageDescriptor:
+          Location: !Sub
+            - 's3://${Bucket}/${TiersPrefix}'
+            - Bucket: {Fn::ImportValue: !Sub '${FoundationStackName}-AnalyticsBucket'}
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.openx.data.jsonserde.JsonSerDe
+            Parameters: {ignore.malformed.json: 'true', case.insensitive: 'true'}
+          Columns:
+            - {Name: ts, Type: string}
+            - {Name: userarn, Type: string}
+            - {Name: username, Type: string}
+            - {Name: tier, Type: string}
+            - {Name: listpriceusd, Type: double}
+            - {Name: includedhours, Type: double}
+            - {Name: coversuse, Type: string}
+            - {Name: costusd, Type: double}
+
+  UsersDataSet:
+    Type: AWS::QuickSight::DataSet
+    DependsOn: UsersTable
+    Properties:
+      AwsAccountId: !Ref 'AWS::AccountId'
+      DataSetId: !Sub '${ResourcePrefix}-users'
+      Name: AWS Quick governance - license activity users
+      ImportMode: DIRECT_QUERY
+      PhysicalTableMap:
+        users:
+          CustomSql:
+            DataSourceArn: {Fn::ImportValue: !Sub '${FoundationStackName}-QuickDataSourceArn'}
+            Name: license_users
+            SqlQuery: !Sub
+              - |
+                WITH ranked AS (
+                  SELECT u.*, row_number() OVER (PARTITION BY userarn ORDER BY ts DESC) AS rn
+                  FROM "${Db}"."license_activity_users" u WHERE ts IS NOT NULL
+                ),
+                latest AS (
+                  SELECT * FROM ranked WHERE rn = 1 AND COALESCE(assetstate, 'ACTIVE') <> 'DELETED'
+                )
+                SELECT
+                  from_iso8601_timestamp(u.ts) AS scan_time,
+                  'Latest' AS scan_label,
+                  u.userarn AS user_arn,
+                  COALESCE(u.username, u.userarn) AS user_name,
+                  COALESCE(u.role, '') AS role,
+                  COALESCE(u.identitytype, '') AS identity_type,
+                  COALESCE(u.active, 'true') AS active_flag,
+                  TRY(from_iso8601_timestamp(u.lastactivityat)) AS last_activity_at,
+                  COALESCE(u.lastactivitysource, '') AS activity_source,
+                  COALESCE(u.lastactivitycategory, '') AS activity_category,
+                  TRY(from_iso8601_timestamp(u.lastsigninat)) AS last_sign_in_at,
+                  TRY(from_iso8601_timestamp(u.coveragestart)) AS coverage_start,
+                  COALESCE(u.coveragedays, 0) AS coverage_days,
+                  COALESCE(u.assetsowned, 0) AS assets_owned,
+                  COALESCE(u.assetsownedalone, 0) AS assets_owned_alone,
+                  COALESCE(u.removalreadiness, '') AS removal_readiness,
+                  u.peakhours AS peak_hours,
+                  COALESCE(u.hoursconfidence, '') AS hours_confidence,
+                  COALESCE(u.currenttier, '') AS current_tier,
+                  u.listpriceusd AS list_price_usd,
+                  COALESCE(u.candidatetier, '') AS candidate_tier,
+                  u.candidatepriceusd AS candidate_price_usd,
+                  u.savingusd AS saving_usd,
+                  COALESCE(u.changepath, '') AS change_path,
+                  COALESCE(u.savingfrom, '') AS saving_from,
+                  COALESCE(u.authoringcount, 0) AS authoring_count,
+                  COALESCE(u.didauthoring, 0) AS did_authoring,
+                  COALESCE(u.didai, 0) AS did_ai,
+                  COALESCE(u.didviewing, 0) AS did_viewing,
+                  COALESCE(u.didadministration, 0) AS did_administration,
+                  CASE WHEN u.savingusd > 0 THEN 1 ELSE 0 END AS candidate_count,
+                  CASE WHEN u.peakhours > t.includedhours THEN 1 ELSE 0 END AS above_included,
+                  1 AS user_count
+                FROM latest u
+                LEFT JOIN "${Db}"."license_activity_tiers" t
+                  ON t.userarn = u.userarn AND t.ts = u.ts AND t.tier = u.currenttier
+              - Db: {Fn::ImportValue: !Sub '${FoundationStackName}-GlueDatabase'}
+            Columns:
+              - {Name: scan_time, Type: DATETIME}
+              - {Name: scan_label, Type: STRING}
+              - {Name: user_arn, Type: STRING}
+              - {Name: user_name, Type: STRING}
+              - {Name: role, Type: STRING}
+              - {Name: identity_type, Type: STRING}
+              - {Name: active_flag, Type: STRING}
+              - {Name: last_activity_at, Type: DATETIME}
+              - {Name: activity_source, Type: STRING}
+              - {Name: activity_category, Type: STRING}
+              - {Name: last_sign_in_at, Type: DATETIME}
+              - {Name: coverage_start, Type: DATETIME}
+              - {Name: coverage_days, Type: INTEGER}
+              - {Name: assets_owned, Type: INTEGER}
+              - {Name: assets_owned_alone, Type: INTEGER}
+              - {Name: removal_readiness, Type: STRING}
+              - {Name: peak_hours, Type: DECIMAL}
+              - {Name: hours_confidence, Type: STRING}
+              - {Name: current_tier, Type: STRING}
+              - {Name: list_price_usd, Type: DECIMAL}
+              - {Name: candidate_tier, Type: STRING}
+              - {Name: candidate_price_usd, Type: DECIMAL}
+              - {Name: saving_usd, Type: DECIMAL}
+              - {Name: change_path, Type: STRING}
+              - {Name: saving_from, Type: STRING}
+              - {Name: authoring_count, Type: INTEGER}
+              - {Name: did_authoring, Type: INTEGER}
+              - {Name: did_ai, Type: INTEGER}
+              - {Name: did_viewing, Type: INTEGER}
+              - {Name: did_administration, Type: INTEGER}
+              - {Name: candidate_count, Type: INTEGER}
+              - {Name: above_included, Type: INTEGER}
+              - {Name: user_count, Type: INTEGER}
+      LogicalTableMap:
+        users:
+          Alias: license_users
+          Source: {PhysicalTableId: users}
+      Permissions:
+        - Principal: !Ref QuickPrincipalArn
+          Actions: [quicksight:DescribeDataSet, quicksight:DescribeDataSetPermissions, quicksight:PassDataSet, quicksight:DescribeIngestion, quicksight:ListIngestions, quicksight:UpdateDataSet, quicksight:DeleteDataSet, quicksight:CreateIngestion, quicksight:CancelIngestion, quicksight:UpdateDataSetPermissions]
+      Tags:
+        - {Key: Purpose, Value: !Ref ResourcePrefix}
+
+  SourcesDataSet:
+    Type: AWS::QuickSight::DataSet
+    DependsOn: SourcesTable
+    Properties:
+      AwsAccountId: !Ref 'AWS::AccountId'
+      DataSetId: !Sub '${ResourcePrefix}-sources'
+      Name: AWS Quick governance - license activity sources
+      ImportMode: DIRECT_QUERY
+      PhysicalTableMap:
+        sources:
+          CustomSql:
+            DataSourceArn: {Fn::ImportValue: !Sub '${FoundationStackName}-QuickDataSourceArn'}
+            Name: license_sources
+            SqlQuery: !Sub
+              - |
+                WITH ranked AS (
+                  SELECT s.*, row_number() OVER (PARTITION BY source ORDER BY ts DESC) AS rn
+                  FROM "${Db}"."license_activity_sources" s WHERE ts IS NOT NULL
+                )
+                SELECT
+                  from_iso8601_timestamp(ts) AS scan_time,
+                  source,
+                  TRY(from_iso8601_timestamp(newestrecordat)) AS newest_record_at,
+                  TRY(from_iso8601_timestamp(coveragestart)) AS coverage_start,
+                  COALESCE(coveragedays, 0) AS coverage_days,
+                  COALESCE(gapdays30, 0) AS gap_days_30,
+                  COALESCE(status, '') AS status
+                FROM ranked WHERE rn = 1
+              - Db: {Fn::ImportValue: !Sub '${FoundationStackName}-GlueDatabase'}
+            Columns:
+              - {Name: scan_time, Type: DATETIME}
+              - {Name: source, Type: STRING}
+              - {Name: newest_record_at, Type: DATETIME}
+              - {Name: coverage_start, Type: DATETIME}
+              - {Name: coverage_days, Type: INTEGER}
+              - {Name: gap_days_30, Type: INTEGER}
+              - {Name: status, Type: STRING}
+      LogicalTableMap:
+        sources:
+          Alias: license_sources
+          Source: {PhysicalTableId: sources}
+      Permissions:
+        - Principal: !Ref QuickPrincipalArn
+          Actions: [quicksight:DescribeDataSet, quicksight:DescribeDataSetPermissions, quicksight:PassDataSet, quicksight:DescribeIngestion, quicksight:ListIngestions, quicksight:UpdateDataSet, quicksight:DeleteDataSet, quicksight:CreateIngestion, quicksight:CancelIngestion, quicksight:UpdateDataSetPermissions]
+      Tags:
+        - {Key: Purpose, Value: !Ref ResourcePrefix}
+
+  TiersDataSet:
+    Type: AWS::QuickSight::DataSet
+    DependsOn: TiersTable
+    Properties:
+      AwsAccountId: !Ref 'AWS::AccountId'
+      DataSetId: !Sub '${ResourcePrefix}-tiers'
+      Name: AWS Quick governance - license activity tiers
+      ImportMode: DIRECT_QUERY
+      PhysicalTableMap:
+        tiers:
+          CustomSql:
+            DataSourceArn: {Fn::ImportValue: !Sub '${FoundationStackName}-QuickDataSourceArn'}
+            Name: license_tiers
+            SqlQuery: !Sub
+              - |
+                WITH ranked AS (
+                  SELECT t.*, row_number() OVER (PARTITION BY userarn, tier ORDER BY ts DESC) AS rn
+                  FROM "${Db}"."license_activity_tiers" t WHERE ts IS NOT NULL
+                )
+                SELECT
+                  from_iso8601_timestamp(ts) AS scan_time,
+                  userarn AS user_arn,
+                  COALESCE(username, userarn) AS user_name,
+                  tier,
+                  listpriceusd AS list_price_usd,
+                  includedhours AS included_hours,
+                  COALESCE(coversuse, 'false') AS covers_use,
+                  costusd AS cost_usd
+                FROM ranked WHERE rn = 1
+              - Db: {Fn::ImportValue: !Sub '${FoundationStackName}-GlueDatabase'}
+            Columns:
+              - {Name: scan_time, Type: DATETIME}
+              - {Name: user_arn, Type: STRING}
+              - {Name: user_name, Type: STRING}
+              - {Name: tier, Type: STRING}
+              - {Name: list_price_usd, Type: DECIMAL}
+              - {Name: included_hours, Type: DECIMAL}
+              - {Name: covers_use, Type: STRING}
+              - {Name: cost_usd, Type: DECIMAL}
+      LogicalTableMap:
+        tiers:
+          Alias: license_tiers
+          Source: {PhysicalTableId: tiers}
+      Permissions:
+        - Principal: !Ref QuickPrincipalArn
+          Actions: [quicksight:DescribeDataSet, quicksight:DescribeDataSetPermissions, quicksight:PassDataSet, quicksight:DescribeIngestion, quicksight:ListIngestions, quicksight:UpdateDataSet, quicksight:DeleteDataSet, quicksight:CreateIngestion, quicksight:CancelIngestion, quicksight:UpdateDataSetPermissions]
+      Tags:
+        - {Key: Purpose, Value: !Ref ResourcePrefix}
+
+  HistoryDataSet:
+    Type: AWS::QuickSight::DataSet
+    DependsOn: UsersTable
+    Properties:
+      AwsAccountId: !Ref 'AWS::AccountId'
+      DataSetId: !Sub '${ResourcePrefix}-history'
+      Name: AWS Quick governance - license activity history
+      ImportMode: DIRECT_QUERY
+      PhysicalTableMap:
+        history:
+          CustomSql:
+            DataSourceArn: {Fn::ImportValue: !Sub '${FoundationStackName}-QuickDataSourceArn'}
+            Name: license_history
+            SqlQuery: !Sub
+              - |
+                WITH latest AS (
+                  SELECT userarn, substr(ts, 1, 10) AS day, max(ts) AS ts
+                  FROM "${Db}"."license_activity_users"
+                  WHERE ts IS NOT NULL AND COALESCE(assetstate, 'ACTIVE') <> 'DELETED'
+                  GROUP BY userarn, substr(ts, 1, 10)
+                )
+                SELECT
+                  from_iso8601_timestamp(u.ts) AS scan_time,
+                  CASE WHEN u.usagestate = 'IDLE' THEN 1 ELSE 0 END AS idle_count,
+                  CASE WHEN u.savingusd > 0 THEN 1 ELSE 0 END AS candidate_count,
+                  COALESCE(u.savingusd, 0) AS saving_usd
+                FROM "${Db}"."license_activity_users" u
+                JOIN latest l ON u.userarn = l.userarn AND u.ts = l.ts
+              - Db: {Fn::ImportValue: !Sub '${FoundationStackName}-GlueDatabase'}
+            Columns:
+              - {Name: scan_time, Type: DATETIME}
+              - {Name: idle_count, Type: INTEGER}
+              - {Name: candidate_count, Type: INTEGER}
+              - {Name: saving_usd, Type: DECIMAL}
+      LogicalTableMap:
+        history:
+          Alias: license_history
+          Source: {PhysicalTableId: history}
+      Permissions:
+        - Principal: !Ref QuickPrincipalArn
+          Actions: [quicksight:DescribeDataSet, quicksight:DescribeDataSetPermissions, quicksight:PassDataSet, quicksight:DescribeIngestion, quicksight:ListIngestions, quicksight:UpdateDataSet, quicksight:DeleteDataSet, quicksight:CreateIngestion, quicksight:CancelIngestion, quicksight:UpdateDataSetPermissions]
+      Tags:
+        - {Key: Purpose, Value: !Ref ResourcePrefix}
+
+  Dashboard:
+    Type: AWS::QuickSight::Dashboard
+    Properties:
+      AwsAccountId: !Ref 'AWS::AccountId'
+      DashboardId: !Sub '${ResourcePrefix}-dashboard'
+      Name: AWS Quick - license and activity
+      VersionDescription: Overview, Users, License fit, Evidence, History.
+      DashboardPublishOptions:
+        AdHocFilteringOption: {AvailabilityStatus: ENABLED}
+        ExportToCSVOption: {AvailabilityStatus: ENABLED}
+        SheetControlsOption: {VisibilityState: EXPANDED}
+      Permissions:
+        - Principal: !Ref QuickPrincipalArn
+          Actions: [quicksight:DescribeDashboard, quicksight:ListDashboardVersions, quicksight:UpdateDashboardPermissions, quicksight:QueryDashboard, quicksight:UpdateDashboard, quicksight:DeleteDashboard, quicksight:DescribeDashboardPermissions, quicksight:UpdateDashboardPublishedVersion]
+      Definition: # GENERATED
+        DataSetIdentifierDeclarations:
+          - Identifier: users
+            DataSetArn: !GetAtt UsersDataSet.Arn
+          - Identifier: sources
+            DataSetArn: !GetAtt SourcesDataSet.Arn
+          - Identifier: tiers
+            DataSetArn: !GetAtt TiersDataSet.Arn
+          - Identifier: hist
+            DataSetArn: !GetAtt HistoryDataSet.Arn
+        ParameterDeclarations:
+          - StringParameterDeclaration:
+              Name: pIdleDays
+              ParameterValueType: SINGLE_VALUED
+              DefaultValues:
+                StaticValues: ['60']
+        CalculatedFields:
+          - DataSetIdentifier: users
+            Name: usage_state
+            Expression: 'ifelse({active_flag} = ''false'', ''PENDING'', ifelse(isNotNull({last_activity_at}) AND dateDiff({last_activity_at}, now(), ''DD'') <= parseInt(${pIdleDays}), ''ACTIVE'', ifelse(dateDiff({coverage_start}, now(), ''DD'') >= parseInt(${pIdleDays}), ''IDLE'', ''UNKNOWN'')))'
+          - DataSetIdentifier: users
+            Name: active_id
+            Expression: 'ifelse({usage_state} = ''ACTIVE'', {user_arn}, NULL)'
+          - DataSetIdentifier: users
+            Name: idle_id
+            Expression: 'ifelse({usage_state} = ''IDLE'', {user_arn}, NULL)'
+          - DataSetIdentifier: users
+            Name: pending_id
+            Expression: 'ifelse({usage_state} = ''PENDING'', {user_arn}, NULL)'
+          - DataSetIdentifier: users
+            Name: unknown_id
+            Expression: 'ifelse({usage_state} = ''UNKNOWN'', {user_arn}, NULL)'
+          - DataSetIdentifier: users
+            Name: staleness
+            Expression: 'ifelse(isNull({last_activity_at}), 999999, dateDiff({last_activity_at}, now(), ''DD''))'
+          - DataSetIdentifier: users
+            Name: days_now
+            Expression: 'ifelse(isNull({last_activity_at}), NULL, dateDiff({last_activity_at}, now(), ''DD''))'
+          - DataSetIdentifier: users
+            Name: saving_now
+            Expression: 'ifelse({usage_state} = ''ACTIVE'', ifelse(isNull({saving_usd}), 0, {saving_usd}), 0)'
+          - DataSetIdentifier: users
+            Name: days_bucket
+            Expression: 'ifelse(isNull({last_activity_at}), ''no activity'', ifelse(dateDiff({last_activity_at}, now(), ''DD'') <= 7, ''0-7'', ifelse(dateDiff({last_activity_at}, now(), ''DD'') <= 30, ''8-30'', ifelse(dateDiff({last_activity_at}, now(), ''DD'') <= 60, ''31-60'', ifelse(dateDiff({last_activity_at}, now(), ''DD'') <= 90, ''61-90'', ''over 90'')))))'
+        FilterGroups:
+          - FilterGroupId: fg-state-ov
+            CrossDataset: SINGLE_DATASET
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-state-ov
+                  Column: {DataSetIdentifier: users, ColumnName: usage_state}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      SelectAllOptions: FILTER_ALL_VALUES
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-overview
+                    Scope: ALL_VISUALS
+          - FilterGroupId: fg-role-us
+            CrossDataset: ALL_DATASETS
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-role-us
+                  Column: {DataSetIdentifier: users, ColumnName: role}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      SelectAllOptions: FILTER_ALL_VALUES
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-users
+                    Scope: ALL_VISUALS
+          - FilterGroupId: fg-identity-us
+            CrossDataset: ALL_DATASETS
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-identity-us
+                  Column: {DataSetIdentifier: users, ColumnName: identity_type}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      SelectAllOptions: FILTER_ALL_VALUES
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-users
+                    Scope: ALL_VISUALS
+          - FilterGroupId: fg-state-us
+            CrossDataset: SINGLE_DATASET
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-state-us
+                  Column: {DataSetIdentifier: users, ColumnName: usage_state}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      SelectAllOptions: FILTER_ALL_VALUES
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-users
+                    Scope: ALL_VISUALS
+          - FilterGroupId: fg-role-lf
+            CrossDataset: ALL_DATASETS
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-role-lf
+                  Column: {DataSetIdentifier: users, ColumnName: role}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      SelectAllOptions: FILTER_ALL_VALUES
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-license
+                    Scope: ALL_VISUALS
+          - FilterGroupId: fg-user-lf
+            CrossDataset: SINGLE_DATASET
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-user-lf
+                  Column: {DataSetIdentifier: tiers, ColumnName: user_name}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      SelectAllOptions: FILTER_ALL_VALUES
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-license
+                    Scope: ALL_VISUALS
+          - FilterGroupId: fg-pending-sh-users
+            CrossDataset: SINGLE_DATASET
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-pending-sh-users
+                  Column: {DataSetIdentifier: users, ColumnName: usage_state}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      CategoryValues: ['PENDING']
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-users
+                    Scope: SELECTED_VISUALS
+                    VisualIds: [us-tbl-pending]
+          - FilterGroupId: fg-active-fit-sh-license
+            CrossDataset: SINGLE_DATASET
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: f-active-fit-sh-license
+                  Column: {DataSetIdentifier: users, ColumnName: usage_state}
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      CategoryValues: ['ACTIVE']
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: sh-license
+                    Scope: SELECTED_VISUALS
+                    VisualIds: [lf-tbl-fit]
+        Sheets:
+          - SheetId: sh-overview
+            Name: 'Overview'
+            Title: 'License and activity - overview'
+            Description: 'Who is not using a license, and what would right-sizing save?'
+            ParameterControls:
+              - Dropdown:
+                  ParameterControlId: pc-ov-pIdleDays
+                  Title: 'Idle after (days)'
+                  SourceParameterName: pIdleDays
+                  Type: SINGLE_SELECT
+                  SelectableValues:
+                    Values: ['30', '60', '90', '180']
+                  DisplayOptions:
+                    SelectAllOptions: {Visibility: HIDDEN}
+                    TitleOptions: {Visibility: VISIBLE}
+            FilterControls:
+              - Dropdown:
+                  FilterControlId: fc-ov-state
+                  Title: 'State'
+                  SourceFilterId: f-state-ov
+                  Type: MULTI_SELECT
+                  DisplayOptions:
+                    SelectAllOptions: {Visibility: VISIBLE}
+                    TitleOptions: {Visibility: VISIBLE}
+            SheetControlLayouts:
+              - Configuration:
+                  GridLayout:
+                    Elements:
+                      - {ElementId: pc-ov-pIdleDays, ElementType: PARAMETER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: fc-ov-state, ElementType: FILTER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+            Visuals:
+              - KPIVisual:
+                  VisualId: ov-kpi-users
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Users'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      Values:
+                        - CategoricalMeasureField: {FieldId: ov-kpi-users-v, Column: {DataSetIdentifier: users, ColumnName: user_arn}, AggregationFunction: DISTINCT_COUNT}
+              - KPIVisual:
+                  VisualId: ov-kpi-active
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Active'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      Values:
+                        - CategoricalMeasureField: {FieldId: ov-kpi-active-v, Column: {DataSetIdentifier: users, ColumnName: active_id}, AggregationFunction: DISTINCT_COUNT}
+              - KPIVisual:
+                  VisualId: ov-kpi-idle
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Idle'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      Values:
+                        - CategoricalMeasureField: {FieldId: ov-kpi-idle-v, Column: {DataSetIdentifier: users, ColumnName: idle_id}, AggregationFunction: DISTINCT_COUNT}
+              - KPIVisual:
+                  VisualId: ov-kpi-pending
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Pending'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      Values:
+                        - CategoricalMeasureField: {FieldId: ov-kpi-pending-v, Column: {DataSetIdentifier: users, ColumnName: pending_id}, AggregationFunction: DISTINCT_COUNT}
+              - KPIVisual:
+                  VisualId: ov-kpi-unknown
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Unknown'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      Values:
+                        - CategoricalMeasureField: {FieldId: ov-kpi-unknown-v, Column: {DataSetIdentifier: users, ColumnName: unknown_id}, AggregationFunction: DISTINCT_COUNT}
+              - KPIVisual:
+                  VisualId: ov-kpi-down
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Downgrade candidates'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      Values:
+                        - NumericalMeasureField: {FieldId: ov-kpi-down-v, Column: {DataSetIdentifier: users, ColumnName: candidate_count}, AggregationFunction: {SimpleNumericalAggregation: SUM}}
+              - KPIVisual:
+                  VisualId: ov-kpi-save
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Est. saving (USD / month)'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      Values:
+                        - NumericalMeasureField: {FieldId: ov-kpi-save-v, Column: {DataSetIdentifier: users, ColumnName: saving_now}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 2}}}}}
+              - TableVisual:
+                  VisualId: ov-tbl-scan
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Last scan (UTC)'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      TableAggregatedFieldWells:
+                        GroupBy:
+                          - CategoricalDimensionField: {FieldId: ov-tbl-scan-g0, Column: {DataSetIdentifier: users, ColumnName: scan_label}}
+                        Values:
+                          - DateMeasureField: {FieldId: ov-tbl-scan-m0, Column: {DataSetIdentifier: users, ColumnName: scan_time}, AggregationFunction: MAX, FormatConfiguration: {DateTimeFormat: 'YYYY-MM-DD HH:mm'}}
+                    SortConfiguration:
+                      RowSort:
+                        - FieldSort: {FieldId: ov-tbl-scan-m0, Direction: DESC}
+                    FieldOptions:
+                      SelectedFieldOptions:
+                        - {FieldId: ov-tbl-scan-g0, CustomLabel: 'Scan'}
+                        - {FieldId: ov-tbl-scan-m0, CustomLabel: 'Last scan (UTC)'}
+              - BarChartVisual:
+                  VisualId: ov-bar-role
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Users by role and state'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      BarChartAggregatedFieldWells:
+                        Category:
+                          - CategoricalDimensionField: {FieldId: ov-bar-role-cat, Column: {DataSetIdentifier: users, ColumnName: role}}
+                        Values:
+                          - NumericalMeasureField: {FieldId: ov-bar-role-val, Column: {DataSetIdentifier: users, ColumnName: user_count}, AggregationFunction: {SimpleNumericalAggregation: SUM}}
+                        Colors:
+                          - CategoricalDimensionField: {FieldId: ov-bar-role-color, Column: {DataSetIdentifier: users, ColumnName: usage_state}}
+                    Orientation: HORIZONTAL
+                    BarsArrangement: STACKED
+                    Legend: {Visibility: VISIBLE, Position: BOTTOM}
+              - TableVisual:
+                  VisualId: ov-tbl-idle
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Longest idle users'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      TableAggregatedFieldWells:
+                        GroupBy:
+                          - CategoricalDimensionField: {FieldId: ov-tbl-idle-g0, Column: {DataSetIdentifier: users, ColumnName: user_name}}
+                          - CategoricalDimensionField: {FieldId: ov-tbl-idle-g1, Column: {DataSetIdentifier: users, ColumnName: role}}
+                          - CategoricalDimensionField: {FieldId: ov-tbl-idle-g2, Column: {DataSetIdentifier: users, ColumnName: usage_state}}
+                        Values:
+                          - NumericalMeasureField: {FieldId: ov-tbl-idle-m0, Column: {DataSetIdentifier: users, ColumnName: staleness}, AggregationFunction: {SimpleNumericalAggregation: MAX}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                          - NumericalMeasureField: {FieldId: ov-tbl-idle-m1, Column: {DataSetIdentifier: users, ColumnName: days_now}, AggregationFunction: {SimpleNumericalAggregation: MAX}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                    SortConfiguration:
+                      RowSort:
+                        - FieldSort: {FieldId: ov-tbl-idle-m0, Direction: DESC}
+                    FieldOptions:
+                      SelectedFieldOptions:
+                        - {FieldId: ov-tbl-idle-g0, CustomLabel: 'User'}
+                        - {FieldId: ov-tbl-idle-g1, CustomLabel: 'Role'}
+                        - {FieldId: ov-tbl-idle-g2, CustomLabel: 'State'}
+                        - {FieldId: ov-tbl-idle-m0, CustomLabel: 'Order', Visibility: HIDDEN}
+                        - {FieldId: ov-tbl-idle-m1, CustomLabel: 'Days since the last activity'}
+              - TableVisual:
+                  VisualId: ov-tbl-save
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Largest estimated savings'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      TableAggregatedFieldWells:
+                        GroupBy:
+                          - CategoricalDimensionField: {FieldId: ov-tbl-save-g0, Column: {DataSetIdentifier: users, ColumnName: user_name}}
+                          - CategoricalDimensionField: {FieldId: ov-tbl-save-g1, Column: {DataSetIdentifier: users, ColumnName: current_tier}}
+                          - CategoricalDimensionField: {FieldId: ov-tbl-save-g2, Column: {DataSetIdentifier: users, ColumnName: candidate_tier}}
+                        Values:
+                          - NumericalMeasureField: {FieldId: ov-tbl-save-m0, Column: {DataSetIdentifier: users, ColumnName: saving_usd}, AggregationFunction: {SimpleNumericalAggregation: MAX}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 2}}}}}
+                    SortConfiguration:
+                      RowSort:
+                        - FieldSort: {FieldId: ov-tbl-save-m0, Direction: DESC}
+                    FieldOptions:
+                      SelectedFieldOptions:
+                        - {FieldId: ov-tbl-save-g0, CustomLabel: 'User'}
+                        - {FieldId: ov-tbl-save-g1, CustomLabel: 'Current tier'}
+                        - {FieldId: ov-tbl-save-g2, CustomLabel: 'Candidate tier'}
+                        - {FieldId: ov-tbl-save-m0, CustomLabel: 'Est. saving (USD / month)'}
+            TextBoxes:
+              - SheetTextBoxId: ov-txt
+                Content: '<text-box><block align="left"><inline font-weight="bold">How to read this dashboard.</inline> Last observed activity is the newest event CloudTrail or the Agent Hours feed attributes to the user. It is not the console Last active. A sign-in never counts as activity. Review Users first, then License fit. A change saves from the first month that starts after it. Prices are list prices. Share this dashboard with administrators only, and involve privacy before acting on a person.</block></text-box>'
+            Layouts:
+              - Configuration:
+                  GridLayout:
+                    CanvasSizeOptions:
+                      ScreenCanvasSizeOptions: {ResizeOption: FIXED, OptimizedViewPortWidth: '1600px'}
+                    Elements:
+                      - {ElementId: ov-kpi-users, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 4, RowIndex: 0, RowSpan: 4}
+                      - {ElementId: ov-kpi-active, ElementType: VISUAL, ColumnIndex: 4, ColumnSpan: 4, RowIndex: 0, RowSpan: 4}
+                      - {ElementId: ov-kpi-idle, ElementType: VISUAL, ColumnIndex: 8, ColumnSpan: 5, RowIndex: 0, RowSpan: 4}
+                      - {ElementId: ov-kpi-pending, ElementType: VISUAL, ColumnIndex: 13, ColumnSpan: 5, RowIndex: 0, RowSpan: 4}
+                      - {ElementId: ov-kpi-unknown, ElementType: VISUAL, ColumnIndex: 18, ColumnSpan: 5, RowIndex: 0, RowSpan: 4}
+                      - {ElementId: ov-kpi-down, ElementType: VISUAL, ColumnIndex: 23, ColumnSpan: 5, RowIndex: 0, RowSpan: 4}
+                      - {ElementId: ov-kpi-save, ElementType: VISUAL, ColumnIndex: 28, ColumnSpan: 4, RowIndex: 0, RowSpan: 4}
+                      - {ElementId: ov-tbl-scan, ElementType: VISUAL, ColumnIndex: 32, ColumnSpan: 4, RowIndex: 0, RowSpan: 4}
+                      - {ElementId: ov-bar-role, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 36, RowIndex: 4, RowSpan: 8}
+                      - {ElementId: ov-tbl-idle, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 18, RowIndex: 12, RowSpan: 10}
+                      - {ElementId: ov-tbl-save, ElementType: VISUAL, ColumnIndex: 18, ColumnSpan: 18, RowIndex: 12, RowSpan: 10}
+                      - {ElementId: ov-txt, ElementType: TEXT_BOX, ColumnIndex: 0, ColumnSpan: 36, RowIndex: 22, RowSpan: 4}
+          - SheetId: sh-users
+            Name: 'Users'
+            Title: 'Users'
+            Description: 'Who has not used AWS Quick, longest first?'
+            ParameterControls:
+              - Dropdown:
+                  ParameterControlId: pc-us-pIdleDays
+                  Title: 'Idle after (days)'
+                  SourceParameterName: pIdleDays
+                  Type: SINGLE_SELECT
+                  SelectableValues:
+                    Values: ['30', '60', '90', '180']
+                  DisplayOptions:
+                    SelectAllOptions: {Visibility: HIDDEN}
+                    TitleOptions: {Visibility: VISIBLE}
+            FilterControls:
+              - Dropdown:
+                  FilterControlId: fc-us-role
+                  Title: 'Role'
+                  SourceFilterId: f-role-us
+                  Type: MULTI_SELECT
+                  DisplayOptions:
+                    SelectAllOptions: {Visibility: VISIBLE}
+                    TitleOptions: {Visibility: VISIBLE}
+              - Dropdown:
+                  FilterControlId: fc-us-identity
+                  Title: 'Identity type'
+                  SourceFilterId: f-identity-us
+                  Type: MULTI_SELECT
+                  DisplayOptions:
+                    SelectAllOptions: {Visibility: VISIBLE}
+                    TitleOptions: {Visibility: VISIBLE}
+              - Dropdown:
+                  FilterControlId: fc-us-state
+                  Title: 'State'
+                  SourceFilterId: f-state-us
+                  Type: MULTI_SELECT
+                  DisplayOptions:
+                    SelectAllOptions: {Visibility: VISIBLE}
+                    TitleOptions: {Visibility: VISIBLE}
+            SheetControlLayouts:
+              - Configuration:
+                  GridLayout:
+                    Elements:
+                      - {ElementId: pc-us-pIdleDays, ElementType: PARAMETER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: fc-us-role, ElementType: FILTER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: fc-us-identity, ElementType: FILTER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: fc-us-state, ElementType: FILTER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+            Visuals:
+              - TableVisual:
+                  VisualId: us-tbl-all
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'All users, longest idle first'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      TableAggregatedFieldWells:
+                        GroupBy:
+                          - CategoricalDimensionField: {FieldId: us-tbl-all-g0, Column: {DataSetIdentifier: users, ColumnName: user_name}}
+                          - CategoricalDimensionField: {FieldId: us-tbl-all-g1, Column: {DataSetIdentifier: users, ColumnName: role}}
+                          - CategoricalDimensionField: {FieldId: us-tbl-all-g2, Column: {DataSetIdentifier: users, ColumnName: identity_type}}
+                          - CategoricalDimensionField: {FieldId: us-tbl-all-g3, Column: {DataSetIdentifier: users, ColumnName: usage_state}}
+                          - CategoricalDimensionField: {FieldId: us-tbl-all-g4, Column: {DataSetIdentifier: users, ColumnName: activity_source}}
+                          - CategoricalDimensionField: {FieldId: us-tbl-all-g5, Column: {DataSetIdentifier: users, ColumnName: removal_readiness}}
+                        Values:
+                          - NumericalMeasureField: {FieldId: us-tbl-all-m0, Column: {DataSetIdentifier: users, ColumnName: staleness}, AggregationFunction: {SimpleNumericalAggregation: MAX}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                          - NumericalMeasureField: {FieldId: us-tbl-all-m1, Column: {DataSetIdentifier: users, ColumnName: days_now}, AggregationFunction: {SimpleNumericalAggregation: MAX}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                          - DateMeasureField: {FieldId: us-tbl-all-m2, Column: {DataSetIdentifier: users, ColumnName: last_activity_at}, AggregationFunction: MAX, FormatConfiguration: {DateTimeFormat: 'YYYY-MM-DD HH:mm'}}
+                          - DateMeasureField: {FieldId: us-tbl-all-m3, Column: {DataSetIdentifier: users, ColumnName: last_sign_in_at}, AggregationFunction: MAX, FormatConfiguration: {DateTimeFormat: 'YYYY-MM-DD HH:mm'}}
+                          - NumericalMeasureField: {FieldId: us-tbl-all-m4, Column: {DataSetIdentifier: users, ColumnName: assets_owned}, AggregationFunction: {SimpleNumericalAggregation: MAX}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                          - NumericalMeasureField: {FieldId: us-tbl-all-m5, Column: {DataSetIdentifier: users, ColumnName: assets_owned_alone}, AggregationFunction: {SimpleNumericalAggregation: MAX}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                          - NumericalMeasureField: {FieldId: us-tbl-all-m6, Column: {DataSetIdentifier: users, ColumnName: coverage_days}, AggregationFunction: {SimpleNumericalAggregation: MAX}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                    SortConfiguration:
+                      RowSort:
+                        - FieldSort: {FieldId: us-tbl-all-m0, Direction: DESC}
+                    FieldOptions:
+                      SelectedFieldOptions:
+                        - {FieldId: us-tbl-all-g0, CustomLabel: 'User'}
+                        - {FieldId: us-tbl-all-g1, CustomLabel: 'Role'}
+                        - {FieldId: us-tbl-all-g2, CustomLabel: 'Identity type'}
+                        - {FieldId: us-tbl-all-g3, CustomLabel: 'State'}
+                        - {FieldId: us-tbl-all-g4, CustomLabel: 'Source'}
+                        - {FieldId: us-tbl-all-g5, CustomLabel: 'Removal readiness'}
+                        - {FieldId: us-tbl-all-m0, CustomLabel: 'Order', Visibility: HIDDEN}
+                        - {FieldId: us-tbl-all-m1, CustomLabel: 'Days since the last activity'}
+                        - {FieldId: us-tbl-all-m2, CustomLabel: 'Last observed activity (UTC)'}
+                        - {FieldId: us-tbl-all-m3, CustomLabel: 'Last sign-in (UTC)'}
+                        - {FieldId: us-tbl-all-m4, CustomLabel: 'Assets owned'}
+                        - {FieldId: us-tbl-all-m5, CustomLabel: 'Assets owned alone'}
+                        - {FieldId: us-tbl-all-m6, CustomLabel: 'Coverage (days)'}
+              - TableVisual:
+                  VisualId: us-tbl-pending
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Pending: invited, never signed in'}}
+                  Subtitle: {Visibility: VISIBLE, FormatText: {PlainText: 'Whether a pending user is billed is not confirmed. Check the bill.'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      TableAggregatedFieldWells:
+                        GroupBy:
+                          - CategoricalDimensionField: {FieldId: us-tbl-pending-g0, Column: {DataSetIdentifier: users, ColumnName: user_name}}
+                          - CategoricalDimensionField: {FieldId: us-tbl-pending-g1, Column: {DataSetIdentifier: users, ColumnName: role}}
+                        Values:
+                          - NumericalMeasureField: {FieldId: us-tbl-pending-m0, Column: {DataSetIdentifier: users, ColumnName: coverage_days}, AggregationFunction: {SimpleNumericalAggregation: MAX}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                    SortConfiguration:
+                      RowSort:
+                        - FieldSort: {FieldId: us-tbl-pending-m0, Direction: DESC}
+                    FieldOptions:
+                      SelectedFieldOptions:
+                        - {FieldId: us-tbl-pending-g0, CustomLabel: 'User'}
+                        - {FieldId: us-tbl-pending-g1, CustomLabel: 'Role'}
+                        - {FieldId: us-tbl-pending-m0, CustomLabel: 'Coverage (days)'}
+              - TableVisual:
+                  VisualId: us-pivot
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Users by activity type in the window'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      TableAggregatedFieldWells:
+                        GroupBy:
+                          - CategoricalDimensionField: {FieldId: us-pivot-g0, Column: {DataSetIdentifier: users, ColumnName: role}}
+                        Values:
+                          - NumericalMeasureField: {FieldId: us-pivot-m0, Column: {DataSetIdentifier: users, ColumnName: did_ai}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                          - NumericalMeasureField: {FieldId: us-pivot-m1, Column: {DataSetIdentifier: users, ColumnName: did_authoring}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                          - NumericalMeasureField: {FieldId: us-pivot-m2, Column: {DataSetIdentifier: users, ColumnName: did_viewing}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                          - NumericalMeasureField: {FieldId: us-pivot-m3, Column: {DataSetIdentifier: users, ColumnName: did_administration}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                          - NumericalMeasureField: {FieldId: us-pivot-m4, Column: {DataSetIdentifier: users, ColumnName: user_count}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                    SortConfiguration:
+                      RowSort:
+                        - FieldSort: {FieldId: us-pivot-g0, Direction: ASC}
+                    FieldOptions:
+                      SelectedFieldOptions:
+                        - {FieldId: us-pivot-g0, CustomLabel: 'Role'}
+                        - {FieldId: us-pivot-m0, CustomLabel: 'AI'}
+                        - {FieldId: us-pivot-m1, CustomLabel: 'Authoring'}
+                        - {FieldId: us-pivot-m2, CustomLabel: 'Viewing'}
+                        - {FieldId: us-pivot-m3, CustomLabel: 'Administration'}
+                        - {FieldId: us-pivot-m4, CustomLabel: 'Users'}
+              - BarChartVisual:
+                  VisualId: us-bar-days
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Users by days since the last activity'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      BarChartAggregatedFieldWells:
+                        Category:
+                          - CategoricalDimensionField: {FieldId: us-bar-days-cat, Column: {DataSetIdentifier: users, ColumnName: days_bucket}}
+                        Values:
+                          - NumericalMeasureField: {FieldId: us-bar-days-val, Column: {DataSetIdentifier: users, ColumnName: user_count}, AggregationFunction: {SimpleNumericalAggregation: SUM}}
+                        Colors:
+                          - CategoricalDimensionField: {FieldId: us-bar-days-color, Column: {DataSetIdentifier: users, ColumnName: role}}
+                    Orientation: HORIZONTAL
+                    BarsArrangement: STACKED
+                    Legend: {Visibility: VISIBLE, Position: BOTTOM}
+            TextBoxes:
+              - SheetTextBoxId: us-txt
+                Content: '<text-box><block align="left"><inline font-weight="bold">Removal.</inline> IAM Identity Center users leave through the identity provider. Transfer ownership first, in the Orphaned Assets dashboard or Manage assets. An administrator is reviewed by hand.</block></text-box>'
+            Layouts:
+              - Configuration:
+                  GridLayout:
+                    CanvasSizeOptions:
+                      ScreenCanvasSizeOptions: {ResizeOption: FIXED, OptimizedViewPortWidth: '1600px'}
+                    Elements:
+                      - {ElementId: us-tbl-all, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 36, RowIndex: 0, RowSpan: 12}
+                      - {ElementId: us-tbl-pending, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 36, RowIndex: 12, RowSpan: 6}
+                      - {ElementId: us-pivot, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 18, RowIndex: 18, RowSpan: 8}
+                      - {ElementId: us-bar-days, ElementType: VISUAL, ColumnIndex: 18, ColumnSpan: 18, RowIndex: 18, RowSpan: 8}
+                      - {ElementId: us-txt, ElementType: TEXT_BOX, ColumnIndex: 0, ColumnSpan: 36, RowIndex: 26, RowSpan: 3}
+          - SheetId: sh-license
+            Name: 'License fit'
+            Title: 'License fit'
+            Description: 'Which users can move to a cheaper tier, and what does it save?'
+            ParameterControls:
+              - Dropdown:
+                  ParameterControlId: pc-lf-pIdleDays
+                  Title: 'Idle after (days)'
+                  SourceParameterName: pIdleDays
+                  Type: SINGLE_SELECT
+                  SelectableValues:
+                    Values: ['30', '60', '90', '180']
+                  DisplayOptions:
+                    SelectAllOptions: {Visibility: HIDDEN}
+                    TitleOptions: {Visibility: VISIBLE}
+            FilterControls:
+              - Dropdown:
+                  FilterControlId: fc-lf-role
+                  Title: 'Role'
+                  SourceFilterId: f-role-lf
+                  Type: MULTI_SELECT
+                  DisplayOptions:
+                    SelectAllOptions: {Visibility: VISIBLE}
+                    TitleOptions: {Visibility: VISIBLE}
+              - Dropdown:
+                  FilterControlId: fc-lf-user
+                  Title: 'User'
+                  SourceFilterId: f-user-lf
+                  Type: MULTI_SELECT
+                  DisplayOptions:
+                    SelectAllOptions: {Visibility: VISIBLE}
+                    TitleOptions: {Visibility: VISIBLE}
+            SheetControlLayouts:
+              - Configuration:
+                  GridLayout:
+                    Elements:
+                      - {ElementId: pc-lf-pIdleDays, ElementType: PARAMETER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: fc-lf-role, ElementType: FILTER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+                      - {ElementId: fc-lf-user, ElementType: FILTER_CONTROL, ColumnSpan: 2, RowSpan: 1}
+            Visuals:
+              - KPIVisual:
+                  VisualId: lf-kpi-cand
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Candidates'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      Values:
+                        - NumericalMeasureField: {FieldId: lf-kpi-cand-v, Column: {DataSetIdentifier: users, ColumnName: candidate_count}, AggregationFunction: {SimpleNumericalAggregation: SUM}}
+              - KPIVisual:
+                  VisualId: lf-kpi-save
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Est. saving (USD / month)'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      Values:
+                        - NumericalMeasureField: {FieldId: lf-kpi-save-v, Column: {DataSetIdentifier: users, ColumnName: saving_now}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 2}}}}}
+              - KPIVisual:
+                  VisualId: lf-kpi-over
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Users above included hours'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      Values:
+                        - NumericalMeasureField: {FieldId: lf-kpi-over-v, Column: {DataSetIdentifier: users, ColumnName: above_included}, AggregationFunction: {SimpleNumericalAggregation: SUM}}
+              - TableVisual:
+                  VisualId: lf-tbl-fit
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'License fit, per user'}}
+                  Subtitle: {Visibility: VISIBLE, FormatText: {PlainText: 'Active users only. An idle user is reviewed on the Users tab. A stale hours feed has no saving.'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      TableAggregatedFieldWells:
+                        GroupBy:
+                          - CategoricalDimensionField: {FieldId: lf-tbl-fit-g0, Column: {DataSetIdentifier: users, ColumnName: user_name}}
+                          - CategoricalDimensionField: {FieldId: lf-tbl-fit-g1, Column: {DataSetIdentifier: users, ColumnName: role}}
+                          - CategoricalDimensionField: {FieldId: lf-tbl-fit-g2, Column: {DataSetIdentifier: users, ColumnName: current_tier}}
+                          - CategoricalDimensionField: {FieldId: lf-tbl-fit-g3, Column: {DataSetIdentifier: users, ColumnName: candidate_tier}}
+                          - CategoricalDimensionField: {FieldId: lf-tbl-fit-g4, Column: {DataSetIdentifier: users, ColumnName: change_path}}
+                          - CategoricalDimensionField: {FieldId: lf-tbl-fit-g5, Column: {DataSetIdentifier: users, ColumnName: saving_from}}
+                          - CategoricalDimensionField: {FieldId: lf-tbl-fit-g6, Column: {DataSetIdentifier: users, ColumnName: hours_confidence}}
+                        Values:
+                          - NumericalMeasureField: {FieldId: lf-tbl-fit-m0, Column: {DataSetIdentifier: users, ColumnName: list_price_usd}, AggregationFunction: {SimpleNumericalAggregation: MAX}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 2}}}}}
+                          - NumericalMeasureField: {FieldId: lf-tbl-fit-m1, Column: {DataSetIdentifier: users, ColumnName: peak_hours}, AggregationFunction: {SimpleNumericalAggregation: MAX}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 2}}}}}
+                          - NumericalMeasureField: {FieldId: lf-tbl-fit-m2, Column: {DataSetIdentifier: users, ColumnName: authoring_count}, AggregationFunction: {SimpleNumericalAggregation: MAX}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                          - NumericalMeasureField: {FieldId: lf-tbl-fit-m3, Column: {DataSetIdentifier: users, ColumnName: candidate_price_usd}, AggregationFunction: {SimpleNumericalAggregation: MAX}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 2}}}}}
+                          - NumericalMeasureField: {FieldId: lf-tbl-fit-m4, Column: {DataSetIdentifier: users, ColumnName: saving_usd}, AggregationFunction: {SimpleNumericalAggregation: MAX}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 2}}}}}
+                    SortConfiguration:
+                      RowSort:
+                        - FieldSort: {FieldId: lf-tbl-fit-m4, Direction: DESC}
+                    FieldOptions:
+                      SelectedFieldOptions:
+                        - {FieldId: lf-tbl-fit-g0, CustomLabel: 'User'}
+                        - {FieldId: lf-tbl-fit-g1, CustomLabel: 'Role'}
+                        - {FieldId: lf-tbl-fit-g2, CustomLabel: 'Current tier'}
+                        - {FieldId: lf-tbl-fit-g3, CustomLabel: 'Cheapest tier'}
+                        - {FieldId: lf-tbl-fit-g4, CustomLabel: 'Path'}
+                        - {FieldId: lf-tbl-fit-g5, CustomLabel: 'Saving from'}
+                        - {FieldId: lf-tbl-fit-g6, CustomLabel: 'Confidence'}
+                        - {FieldId: lf-tbl-fit-m0, CustomLabel: 'List price (USD / month)'}
+                        - {FieldId: lf-tbl-fit-m1, CustomLabel: 'Peak hours'}
+                        - {FieldId: lf-tbl-fit-m2, CustomLabel: 'Authoring in the window'}
+                        - {FieldId: lf-tbl-fit-m3, CustomLabel: 'Cost at that tier'}
+                        - {FieldId: lf-tbl-fit-m4, CustomLabel: 'Est. saving (USD / month)'}
+              - BarChartVisual:
+                  VisualId: lf-bar-tier
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Monthly cost at each tier, selected user'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      BarChartAggregatedFieldWells:
+                        Category:
+                          - CategoricalDimensionField: {FieldId: lf-bar-tier-cat, Column: {DataSetIdentifier: tiers, ColumnName: tier}}
+                        Values:
+                          - NumericalMeasureField: {FieldId: lf-bar-tier-val, Column: {DataSetIdentifier: tiers, ColumnName: cost_usd}, AggregationFunction: {SimpleNumericalAggregation: MAX}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 2}}}}}
+                    Orientation: VERTICAL
+                    BarsArrangement: STACKED
+            TextBoxes:
+              - SheetTextBoxId: lf-txt
+                Content: '<text-box><block align="left"><inline font-weight="bold">How a tier is chosen.</inline> Essentials and Professional are proposed only when their included hours cover the peak month, unless the current tier has a limit that allows overage. Enterprise can cost less when overage on the current tier is larger than the step up. A gap in the Agent Hours feed gives low confidence and no saving.</block></text-box>'
+            Layouts:
+              - Configuration:
+                  GridLayout:
+                    CanvasSizeOptions:
+                      ScreenCanvasSizeOptions: {ResizeOption: FIXED, OptimizedViewPortWidth: '1600px'}
+                    Elements:
+                      - {ElementId: lf-kpi-cand, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 12, RowIndex: 0, RowSpan: 4}
+                      - {ElementId: lf-kpi-save, ElementType: VISUAL, ColumnIndex: 12, ColumnSpan: 12, RowIndex: 0, RowSpan: 4}
+                      - {ElementId: lf-kpi-over, ElementType: VISUAL, ColumnIndex: 24, ColumnSpan: 12, RowIndex: 0, RowSpan: 4}
+                      - {ElementId: lf-tbl-fit, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 36, RowIndex: 4, RowSpan: 18}
+                      - {ElementId: lf-bar-tier, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 36, RowIndex: 22, RowSpan: 8}
+                      - {ElementId: lf-txt, ElementType: TEXT_BOX, ColumnIndex: 0, ColumnSpan: 36, RowIndex: 30, RowSpan: 4}
+          - SheetId: sh-evidence
+            Name: 'Evidence'
+            Title: 'Evidence'
+            Description: 'Why is each user classified this way, and can the data be trusted?'
+            Visuals:
+              - TableVisual:
+                  VisualId: ev-tbl-src
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Data sources'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      TableAggregatedFieldWells:
+                        GroupBy:
+                          - CategoricalDimensionField: {FieldId: ev-tbl-src-g0, Column: {DataSetIdentifier: sources, ColumnName: source}}
+                          - CategoricalDimensionField: {FieldId: ev-tbl-src-g1, Column: {DataSetIdentifier: sources, ColumnName: status}}
+                        Values:
+                          - DateMeasureField: {FieldId: ev-tbl-src-m0, Column: {DataSetIdentifier: sources, ColumnName: newest_record_at}, AggregationFunction: MAX, FormatConfiguration: {DateTimeFormat: 'YYYY-MM-DD HH:mm'}}
+                          - DateMeasureField: {FieldId: ev-tbl-src-m1, Column: {DataSetIdentifier: sources, ColumnName: coverage_start}, AggregationFunction: MAX, FormatConfiguration: {DateTimeFormat: 'YYYY-MM-DD HH:mm'}}
+                          - NumericalMeasureField: {FieldId: ev-tbl-src-m2, Column: {DataSetIdentifier: sources, ColumnName: coverage_days}, AggregationFunction: {SimpleNumericalAggregation: MAX}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                          - NumericalMeasureField: {FieldId: ev-tbl-src-m3, Column: {DataSetIdentifier: sources, ColumnName: gap_days_30}, AggregationFunction: {SimpleNumericalAggregation: MAX}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 0}}}}}
+                    SortConfiguration:
+                      RowSort:
+                        - FieldSort: {FieldId: ev-tbl-src-m0, Direction: DESC}
+                    FieldOptions:
+                      SelectedFieldOptions:
+                        - {FieldId: ev-tbl-src-g0, CustomLabel: 'Source'}
+                        - {FieldId: ev-tbl-src-g1, CustomLabel: 'Status'}
+                        - {FieldId: ev-tbl-src-m0, CustomLabel: 'Newest record (UTC)'}
+                        - {FieldId: ev-tbl-src-m1, CustomLabel: 'Coverage start'}
+                        - {FieldId: ev-tbl-src-m2, CustomLabel: 'Coverage (days)'}
+                        - {FieldId: ev-tbl-src-m3, CustomLabel: 'Gap days in the last 30'}
+              - TableVisual:
+                  VisualId: ev-tbl-last
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Last event per user and source'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      TableAggregatedFieldWells:
+                        GroupBy:
+                          - CategoricalDimensionField: {FieldId: ev-tbl-last-g0, Column: {DataSetIdentifier: users, ColumnName: user_name}}
+                          - CategoricalDimensionField: {FieldId: ev-tbl-last-g1, Column: {DataSetIdentifier: users, ColumnName: activity_source}}
+                          - CategoricalDimensionField: {FieldId: ev-tbl-last-g2, Column: {DataSetIdentifier: users, ColumnName: activity_category}}
+                        Values:
+                          - DateMeasureField: {FieldId: ev-tbl-last-m0, Column: {DataSetIdentifier: users, ColumnName: last_activity_at}, AggregationFunction: MAX, FormatConfiguration: {DateTimeFormat: 'YYYY-MM-DD HH:mm'}}
+                    SortConfiguration:
+                      RowSort:
+                        - FieldSort: {FieldId: ev-tbl-last-m0, Direction: DESC}
+                    FieldOptions:
+                      SelectedFieldOptions:
+                        - {FieldId: ev-tbl-last-g0, CustomLabel: 'User'}
+                        - {FieldId: ev-tbl-last-g1, CustomLabel: 'Source'}
+                        - {FieldId: ev-tbl-last-g2, CustomLabel: 'Category'}
+                        - {FieldId: ev-tbl-last-m0, CustomLabel: 'Time (UTC)'}
+            Layouts:
+              - Configuration:
+                  GridLayout:
+                    CanvasSizeOptions:
+                      ScreenCanvasSizeOptions: {ResizeOption: FIXED, OptimizedViewPortWidth: '1600px'}
+                    Elements:
+                      - {ElementId: ev-tbl-src, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 36, RowIndex: 0, RowSpan: 10}
+                      - {ElementId: ev-tbl-last, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 36, RowIndex: 10, RowSpan: 12}
+          - SheetId: sh-history
+            Name: 'History'
+            Title: 'History'
+            Description: 'Whether idle users and the estimated saving move from one daily scan to the next.'
+            Visuals:
+              - LineChartVisual:
+                  VisualId: hs-line-idle
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Idle users per daily scan'}}
+                  Subtitle: {Visibility: VISIBLE, FormatText: {PlainText: 'The state stored by that scan. The Idle after control does not move this line.'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      LineChartAggregatedFieldWells:
+                        Category:
+                          - DateDimensionField: {FieldId: hs-line-idle-cat, Column: {DataSetIdentifier: hist, ColumnName: scan_time}, DateGranularity: DAY}
+                        Values:
+                          - NumericalMeasureField: {FieldId: hs-line-idle-val, Column: {DataSetIdentifier: hist, ColumnName: idle_count}, AggregationFunction: {SimpleNumericalAggregation: SUM}}
+                    Type: LINE
+              - LineChartVisual:
+                  VisualId: hs-line-save
+                  Title: {Visibility: VISIBLE, FormatText: {PlainText: 'Estimated saving per daily scan (USD)'}}
+                  ChartConfiguration:
+                    FieldWells:
+                      LineChartAggregatedFieldWells:
+                        Category:
+                          - DateDimensionField: {FieldId: hs-line-save-cat, Column: {DataSetIdentifier: hist, ColumnName: scan_time}, DateGranularity: DAY}
+                        Values:
+                          - NumericalMeasureField: {FieldId: hs-line-save-val, Column: {DataSetIdentifier: hist, ColumnName: saving_usd}, AggregationFunction: {SimpleNumericalAggregation: SUM}, FormatConfiguration: {FormatConfiguration: {NumberDisplayFormatConfiguration: {DecimalPlacesConfiguration: {DecimalPlaces: 2}}}}}
+                    Type: LINE
+            Layouts:
+              - Configuration:
+                  GridLayout:
+                    CanvasSizeOptions:
+                      ScreenCanvasSizeOptions: {ResizeOption: FIXED, OptimizedViewPortWidth: '1600px'}
+                    Elements:
+                      - {ElementId: hs-line-idle, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 18, RowIndex: 0, RowSpan: 10}
+                      - {ElementId: hs-line-save, ElementType: VISUAL, ColumnIndex: 18, ColumnSpan: 18, RowIndex: 0, RowSpan: 10}
