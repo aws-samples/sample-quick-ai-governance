@@ -113,4 +113,4 @@ stack.
 | `QuickPrincipalArn` | *(required)* | Quick user or group ARN (identity Region) owning the data source. |
 | `QuickServiceRoleName` | `aws-quicksight-service-role-v0` | Quick's service role to grant access to; empty skips the grant (console/Lake Formation fallback). |
 | `QueryResultsExpirationDays` | `7` | Lifecycle expiry of Athena results. |
-| `AnalyticsExpirationDays` | `365` | Lifecycle expiry of delivered data in the shared analytics bucket (the eight data prefixes, including `dataset-lifecycle/dashboards/` and `dataset-lifecycle/schedules/`; collector state and the agent-name lookup are never expired by age). Noncurrent versions expire after 30 days bucket-wide. |
+| `AnalyticsExpirationDays` | `365` | Lifecycle expiry of delivered data in the shared analytics bucket (the data prefixes, including `dataset-lifecycle/dashboards/`, `dataset-lifecycle/schedules/`, and `license-activity/users/`, `license-activity/sources/`, `license-activity/tiers/`; collector state and the agent-name lookup are never expired by age). Noncurrent versions expire after 30 days bucket-wide. |
