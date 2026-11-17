@@ -1,0 +1,5 @@
+# BatchDescribeUserLimits and ListUsersIndexCapacity are not in the Lambda
+# runtime's boto3. Pin a release that has both. The collector skips either
+# call with a warning when the client does not expose it.
+boto3==1.44.2
+botocore==1.44.2

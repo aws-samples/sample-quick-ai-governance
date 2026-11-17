@@ -1,0 +1,175 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  AWS Quick license and activity monitor. A daily collector reads ListUsers,
+  CloudTrail Event history, and the optional Agent Hours, ownership, limit
+  and index inputs. It writes who was last observed active and which license
+  could change. It never updates a user or a permission. Deploy via
+  scripts/apply-governance-license-activity-monitor.sh.
+
+Parameters:
+  ResourcePrefix:
+    Type: String
+    Default: 'quick-governance-license-activity'
+    AllowedPattern: '^[a-z0-9-]{1,40}$'
+    Description: Prefix for every resource name. Lowercase.
+  DailySchedule:
+    Type: String
+    Default: 'cron(30 4 * * ? *)'
+    Description: Daily scan, 04:30 UTC, away from the Dataset Lifecycle slow loop.
+  AnalyticsBucketName:
+    Type: String
+    AllowedPattern: '^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$'
+    Description: Foundation analytics bucket. Snapshots and state live under license-activity/.
+  IdentityRegion:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^[a-z]{2}-[a-z]+-[0-9]$'
+    Description: Quick identity Region. Empty discovers it from the ListUsers error.
+  ActivityRegions:
+    Type: String
+    Default: ''
+    Description: Comma-separated Regions to scan in CloudTrail. Empty uses the identity Region and this Region.
+  UnusedThresholdDays:
+    Type: Number
+    Default: 60
+    MinValue: 1
+    MaxValue: 180
+    Description: Days without observed activity before a covered user is IDLE.
+  CloudTrailLookbackDays:
+    Type: Number
+    Default: 90
+    MinValue: 1
+    MaxValue: 90
+  LogRetentionDays:
+    Type: Number
+    Default: 90
+  FunctionTimeoutSeconds:
+    Type: Number
+    Default: 900
+  FunctionMemoryMb:
+    Type: Number
+    Default: 512
+
+Resources:
+  CollectorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ResourcePrefix}-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: !Sub '${ResourcePrefix}-policy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: QuickListUsers
+                Effect: Allow
+                Action:
+                  - quicksight:ListUsers
+                  - quicksight:BatchDescribeUserLimits
+                  - quicksight:ListUsersIndexCapacity
+                Resource: '*'
+              - Sid: CloudTrailRead
+                Effect: Allow
+                Action: cloudtrail:LookupEvents
+                Resource: '*'
+              - Sid: SnapshotWrite
+                Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${AnalyticsBucketName}/license-activity/*'
+              - Sid: StateAndOptionalReads
+                Effect: Allow
+                Action: s3:GetObject
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:s3:::${AnalyticsBucketName}/license-activity/state/*'
+                  - !Sub 'arn:${AWS::Partition}:s3:::${AnalyticsBucketName}/agent-hours/*'
+                  - !Sub 'arn:${AWS::Partition}:s3:::${AnalyticsBucketName}/orphaned-assets/latest-ownership.jsonl'
+              - Sid: ListOptionalPrefixes
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${AnalyticsBucketName}'
+              - Sid: KpiMetrics
+                Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    cloudwatch:namespace: QuickGovernance/LicenseActivity
+      Tags:
+        - {Key: Purpose, Value: !Ref ResourcePrefix}
+        - {Key: ManagedBy, Value: CloudFormation}
+
+  CollectorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ResourcePrefix}-fn'
+      RetentionInDays: !Ref LogRetentionDays
+
+  CollectorFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: CollectorLogGroup
+    Properties:
+      FunctionName: !Sub '${ResourcePrefix}-fn'
+      Description: Reads AWS Quick users and their last observed activity. It does not change a user.
+      Runtime: python3.14
+      Architectures: [arm64]
+      Handler: collector.lambda_handler
+      CodeUri: ../lambda/
+      Role: !GetAtt CollectorRole.Arn
+      Timeout: !Ref FunctionTimeoutSeconds
+      MemorySize: !Ref FunctionMemoryMb
+      ReservedConcurrentExecutions: 1
+      Environment:
+        Variables:
+          QS_ACCOUNT_ID: !Ref AWS::AccountId
+          STATE_BUCKET: !Ref AnalyticsBucketName
+          STATE_PREFIX: 'license-activity/'
+          SNAPSHOT_BUCKET: !Ref AnalyticsBucketName
+          SNAPSHOT_PREFIX: 'license-activity/'
+          IDENTITY_REGION: !Ref IdentityRegion
+          ACTIVITY_REGIONS: !Ref ActivityRegions
+          UNUSED_THRESHOLD_DAYS: !Ref UnusedThresholdDays
+          CT_LOOKBACK_DAYS: !Ref CloudTrailLookbackDays
+          LOG_RETENTION_DAYS: !Ref LogRetentionDays
+      Events:
+        Daily:
+          Type: Schedule
+          Properties:
+            Name: !Sub '${ResourcePrefix}-daily'
+            Description: Daily license and activity scan at 04:30 UTC.
+            Schedule: !Ref DailySchedule
+            Input: '{"mode": "daily"}'
+      Tags:
+        Purpose: !Ref ResourcePrefix
+        ManagedBy: CloudFormation
+
+  CollectorErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ResourcePrefix}-collector-errors'
+      AlarmDescription: The license-activity collector reported an error. The scan may be partial.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - {Name: FunctionName, Value: !Ref CollectorFunction}
+      Statistic: Sum
+      Period: 900
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+Outputs:
+  FunctionName:
+    Value: !Ref CollectorFunction
+  RunNowCommand:
+    Value: !Sub 'aws lambda invoke --function-name ${CollectorFunction} --payload ''{"mode": "daily"}'' --cli-binary-format raw-in-base64-out --region ${AWS::Region} /dev/stdout'
+  SnapshotLocation:
+    Value: !Sub 's3://${AnalyticsBucketName}/license-activity/'
