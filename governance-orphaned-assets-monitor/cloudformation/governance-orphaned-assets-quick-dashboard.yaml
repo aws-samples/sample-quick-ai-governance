@@ -252,7 +252,7 @@ Resources:
     Properties:
       AwsAccountId: !Ref 'AWS::AccountId'
       DashboardId: !Sub '${ResourcePrefix}-dashboard'
-      Name: AWS Quick - asset ownership
+      Name: AWS Quick - Asset Ownership
       VersionDescription: Administrator dashboard - Overview, Findings, Ownership, History.
       DashboardPublishOptions:
         AdHocFilteringOption: {AvailabilityStatus: ENABLED}

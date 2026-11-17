@@ -802,7 +802,7 @@ Resources:
     Properties:
       AwsAccountId: !Ref 'AWS::AccountId'
       DashboardId: !Sub '${ResourcePrefix}-dashboard'
-      Name: AWS Quick - dataset lifecycle
+      Name: AWS Quick - Dataset Lifecycle
       VersionDescription: Administrator dashboard - Overview, Refresh health, Usage, Capacity and cost, History.
       DashboardPublishOptions:
         AdHocFilteringOption: {AvailabilityStatus: ENABLED}

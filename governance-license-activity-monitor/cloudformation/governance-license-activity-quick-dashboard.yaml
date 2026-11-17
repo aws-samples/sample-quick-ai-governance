@@ -385,7 +385,7 @@ Resources:
     Properties:
       AwsAccountId: !Ref 'AWS::AccountId'
       DashboardId: !Sub '${ResourcePrefix}-dashboard'
-      Name: AWS Quick - license and activity
+      Name: AWS Quick - License and Activity
       VersionDescription: Overview, Users, License fit, Evidence, History.
       DashboardPublishOptions:
         AdHocFilteringOption: {AvailabilityStatus: ENABLED}

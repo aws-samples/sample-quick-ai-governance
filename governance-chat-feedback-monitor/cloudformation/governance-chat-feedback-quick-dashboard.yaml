@@ -377,7 +377,7 @@ Resources:
     Properties:
       AwsAccountId: !Ref 'AWS::AccountId'
       DashboardId: !Sub '${ResourcePrefix}-dashboard'
-      Name: AWS Quick - chat and feedback
+      Name: AWS Quick - Chat and Feedback
       VersionDescription: Administrator dashboard - Overview, Users, Agents, Quality, Events (metadata only).
       DashboardPublishOptions:
         AdHocFilteringOption: {AvailabilityStatus: ENABLED}

@@ -242,7 +242,7 @@ Resources:
     Properties:
       AwsAccountId: !Ref 'AWS::AccountId'
       DashboardId: !Sub '${ResourcePrefix}-dashboard'
-      Name: AWS Quick - agent hours usage
+      Name: AWS Quick - Agent Hours Usage
       VersionDescription: Administrator dashboard - Overview, Users, Features and automations, Events.
       DashboardPublishOptions:
         AdHocFilteringOption: {AvailabilityStatus: ENABLED}
